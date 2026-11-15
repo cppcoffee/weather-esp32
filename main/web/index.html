@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>连接 WiFi</title>
+    <style>{{STYLE}}</style>
+</head>
+<body>
+    <main>
+        <p class="kick">E-Paper Weather Panel</p>
+        <h1>连接 WiFi</h1>
+        <p class="sub">选一个网络，屏上就会显示当地天气。</p>
+        <hr>
+        <form method="post" action="/save">
+            <div class="f">
+                <span class="row">
+                    <span>可用网络</span>
+                    <a class="ghost" id="rescan" href="/">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round">
+                            <path d="M12 3a9 9 0 1 1-6.4 2.6" />
+                        </svg>
+                        重新扫描
+                    </a>
+                </span>
+                <div class="sel"><select name="ssid">{{OPTIONS}}</select></div>
+            </div>
+            <details>
+                <summary>找不到？手动输入名称</summary>
+                <div class="f">
+                    <input type="text" name="ssid2" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="WiFi 名称">
+                </div>
+            </details>
+            <div class="f">
+                <span>密码</span>
+                <div class="pw">
+                    <input id="pw" type="password" name="pass" autocomplete="off" placeholder="开放网络留空">
+                    <button class="eye" type="button" id="eye" aria-label="显示密码">
+                        <svg class="show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+                            <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z" />
+                            <circle cx="12" cy="12" r="3.1" />
+                        </svg>
+                        <svg class="hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+                            <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z" />
+                            <circle cx="12" cy="12" r="3.1" />
+                            <path d="M4 4l16 16" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            <button class="send" type="submit">保存并连接</button>
+        </form>
+        <script>{{SCRIPT}}</script>
+        <footer>扫到 {{COUNT}} 个网络 · {{AP_URL}} · {{AP_SSID}}</footer>
+    </main>
+</body>
+</html>
