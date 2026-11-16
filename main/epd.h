@@ -36,8 +36,8 @@ void epd_fill_circle(int cx, int cy, int r, int color);
 void epd_text(int x, int y_baseline, const aafont *f, const char *s); // y = baseline
 int epd_text_w(const aafont *f, const char *s);
 void epd_refresh(void);
-// Partial waveform now, even when the periodic maintenance full refresh is due. A due full
-// refresh is deferred until the next ordinary epd_refresh() call.
-void epd_refresh_partial(void);
+// Page-switch refresh: switches 1..7 use the partial waveform; switch 8 uses a full refresh
+// (also consuming any due maintenance refresh) and restarts the switch count.
+void epd_refresh_page_switch(void);
 // Full waveform now, without consuming the periodic partial-refresh cadence.
 void epd_refresh_full(void);

@@ -1,5 +1,6 @@
 #include "audio.h"
 #include "button.h"
+#include "driver/gpio.h"
 #include "epd.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -17,6 +18,9 @@ static const char *TAG = "app";
 #define REFRESH_S          (30 * 60)
 #define RETRY_MIN_S        5
 #define RETRY_MAX_S        60
+
+// TEMPORARY LED diagnostic: 1 leaves every audio GPIO undriven (no I2S, no ES8311, no PA).
+#define LED_DIAG_SKIP_AUDIO 0
 
 typedef enum { VIEW_DAILY, VIEW_HOURLY } view_t;
 typedef enum { APP_PHASE_CONNECT, APP_PHASE_WEATHER } app_phase_t;
@@ -80,13 +84,13 @@ static void set_status(app_t *app, ui_status_t status, unsigned attempt, bool sh
     }
 }
 
-// Routine updates use the driver's partial-refresh cadence. Page switches explicitly use the
-// partial waveform so they cannot turn into a periodic maintenance full refresh.
+// Routine updates use the driver's partial-refresh cadence. Page switches use their own
+// 1..7 partial / 8th full cadence, so they do not advance the ordinary refresh count.
 static void present(app_t *app, bool page_switch)
 {
     draw_page(app);
     if (page_switch) {
-        epd_refresh_partial();
+        epd_refresh_page_switch();
     } else {
         epd_refresh();
     }
@@ -210,17 +214,31 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "boot");
     epd_init();
+#if LED_DIAG_SKIP_AUDIO
+    ESP_LOGW(TAG, "LED diagnostic: audio left uninitialized");
+    // The ESP32-S3-DevKitC-1 v1.1 RGB LED shares GPIO48. With audio disabled the line is
+    // otherwise floating, which lets a WS2812 latch noise. Hold it low (NeoPixel reset/black).
+    const gpio_config_t led_off = {
+        .pin_bit_mask = 1ULL << 48,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&led_off));
+    ESP_ERROR_CHECK(gpio_set_level(48, 0));
+#else
     esp_err_t audio_err = audio_init();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "audio unavailable: %s", esp_err_to_name(audio_err));
     }
+#endif
     net_init();
     button_init();
     // Voice stays idle until the network is up; it runs in its own task so a microphone
     // read or a chat turn never stalls the weather loop.
+#if !LED_DIAG_SKIP_AUDIO
     if (voice_init() != ESP_OK) {
         ESP_LOGW(TAG, "voice unavailable");
     }
+#endif
 
     app_t app = {0};
     app.view = VIEW_DAILY;

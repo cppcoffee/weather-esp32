@@ -85,11 +85,14 @@ CASES = {
     "provisioning_initial_failure": ("GSSS", 2, 7, 0),
     "connect_backoff": ("SSSS", 0, 11, 6),
     "button_toggle": ("SS", 0, 5, 0),
+    "button_switch_full": ("SS", 0, 11, 0),
     "button_retry": ("GS", 0, 4, 0),
 }
 # Presses are "cycle:milliseconds-after-the-update-frame"; each adds one redraw frame.
 PRESSES = {
     "button_toggle": "0:5000,0:15000",
+    # Switches 1..7 are partial; the 8th must use the full waveform.
+    "button_switch_full": "0:1000,0:2000,0:3000,0:4000,0:5000,0:6000,0:7000,0:8000",
     "button_retry": "0:2000",
 }
 GEO_URL = "http://ip-api.com/json/?fields=status,city,lat,lon"
@@ -303,7 +306,8 @@ static unsigned long expected_wait_ms(void) {
 }
 int gpio_config(const gpio_config_t *cfg) { (void)cfg; return 0; }
 static int dc_level = 1, last_cmd;
-static bool expect_switch_partial;
+static unsigned switch_count;
+static bool expect_switch_refresh;
 int gpio_set_level(int pin, int level) {
     if (pin == EPD_DC) dc_level = level;
     return 0;
@@ -341,8 +345,9 @@ void vTaskDelay(unsigned ms) {
     if (button_pressed_level) {
         if (wait_elapsed - press_started >= BTN_PRESS_MS) {
             button_pressed_level = false;
-            /* Page switches replace the canvas but use the partial waveform to avoid flashing. */
-            expect_switch_partial = true;
+            /* Page switches 1..7 are partial; the 8th is a full refresh. */
+            switch_count++;
+            expect_switch_refresh = true;
         }
     } else if (press_next < press_count && press_cycle[press_next] == cycle &&
                wait_elapsed >= press_at[press_next]) {
@@ -496,11 +501,12 @@ int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *t) {
         const unsigned char *p = t->tx_buffer;
         if (!dc_level) {
             last_cmd = p[0];
-        } else if (last_cmd == 0x22 && expect_switch_partial) {
-            expect_switch_partial = false;
-            if (p[0] != 0xC0) {
-                fprintf(stderr, "page switch used full update sequence 0x%02X; it must use the "
-                    "partial waveform (0xC0/0x0F) to avoid a full-screen flash\n", p[0]);
+        } else if (last_cmd == 0x22 && expect_switch_refresh) {
+            expect_switch_refresh = false;
+            unsigned expected = switch_count % 8 == 0 ? 0xC7 : 0xC0;
+            if (p[0] != expected) {
+                fprintf(stderr, "page switch %u used update sequence 0x%02X; expected 0x%02X "
+                    "(switches 1..7 partial, 8th full)\n", switch_count, p[0], expected);
                 exit(2);
             }
         }
@@ -1407,6 +1413,7 @@ int main(void)
             return 1;
         }
     }
+
     printf("ok\n");
     return 0;
 }
@@ -2293,7 +2300,7 @@ def main():
         if voice_audio:
             try:
                 check_voice_audio(voice_audio, work)
-                print("PASS voice_audio: left-channel downmix and stereo upmix", flush=True)
+                print("PASS voice_audio: left-channel downmix, stereo upmix", flush=True)
             except (AssertionError, ValueError, subprocess.SubprocessError) as error:
                 failure(error, "current/voice_audio")
         ui_count = 0

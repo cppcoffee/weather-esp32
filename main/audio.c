@@ -232,8 +232,14 @@ static esp_err_t init_codec(void)
     if (err != ESP_OK) {
         return err;
     }
-    // Keep the amplifier quiet until a caller explicitly starts playback.
-    return check_codec_result(esp_codec_dev_set_out_mute(s_codec, true), "mute speaker");
+    // esp_codec_dev_open() enables the codec and drives the PA enable pin high. Muting only
+    // gates the DAC, so drop the PA enable as well: an indicator LED on that net would
+    // otherwise stay lit while the device is idle.
+    err = check_codec_result(esp_codec_dev_set_out_mute(s_codec, true), "mute speaker");
+    if (err != ESP_OK) {
+        return err;
+    }
+    return check_codec_result(s_gpio_if->set(AUDIO_PA_EN_GPIO, false), "disable speaker amp");
 }
 
 esp_err_t audio_init(void)
@@ -317,5 +323,13 @@ esp_err_t audio_set_mute(bool muted)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
-    return check_codec_result(esp_codec_dev_set_out_mute(s_codec, muted), muted ? "mute speaker" : "unmute speaker");
+    // The codec mute only gates the DAC. Drive the PA enable too so the amplifier (and any
+    // LED sharing that net) is off whenever nothing is playing.
+    esp_err_t err =
+        check_codec_result(esp_codec_dev_set_out_mute(s_codec, muted), muted ? "mute speaker" : "unmute speaker");
+    if (err != ESP_OK) {
+        return err;
+    }
+    return check_codec_result(s_gpio_if->set(AUDIO_PA_EN_GPIO, !muted),
+                              muted ? "disable speaker amp" : "enable speaker amp");
 }

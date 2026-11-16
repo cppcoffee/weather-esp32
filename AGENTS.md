@@ -207,7 +207,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 | I²C SCL | 41 | ES8311 控制时钟 |
 | I²C SDA | 42 | ES8311 控制数据（接线名为 SCA） |
 
-- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，16 kHz / 16 bit / **双声道交错**，`MCLK_MULTIPLE_384`（ES8311 支持的整数时钟关系）。默认音量 60（0..100）、麦克风增益 18 dB；`audio_init()` 后功放**保持静音**，要播放先 `audio_set_mute(false)`。不要在 `audio.c` 之外自己启 I²S/I²C，也不要把双声道当成单声道。
+- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，16 kHz / 16 bit / **双声道交错**，`MCLK_MULTIPLE_384`（ES8311 支持的整数时钟关系）。默认音量 60（0..100）、麦克风增益 18 dB；`audio_init()` 后 DAC 静音且**功放使能脚 PA_EN 拉低**（`esp_codec_dev_open()` 会短暂拉高，初始化末尾显式关掉；该脚可能同时接板载 LED），要播放先 `audio_set_mute(false)`（同时打开 DAC 与 PA）。注意 `esp_codec_dev` 的音量是线性 dB 映射（0=−50 dB、100=0 dB），低音量值实际非常轻，做通路自检时不要用 `volume 30` 级别的设置。
 - 当前板卡 ESP32-S3-WROOM-1-N16R8 使用 8 MB Octal PSRAM，占用 GPIO33–37。音频已迁移为功放 EN=`GPIO2`、I²S DOUT=`GPIO47`、WS=`GPIO48`，其余 I²S/I²C 保持 GPIO38–42；GPIO47/48 在模块引脚区域相邻，适合缩短 PCB 走线。GPIO43/44 留作外接 UART，GPIO19/20 保留 USB-JTAG。`sdkconfig.defaults` 已启用 `CONFIG_SPIRAM`、`CONFIG_SPIRAM_MODE_OCT` 和 80 MHz PSRAM；刷板前必须核对 PCB 实际连线。固件在没有可用 PSRAM 时跳过唤醒初始化。
 - 栈与任务：语音跑独立任务，不要挤主任务（10 KB 栈已只为同步 HTTPS 留出）；若 keystore 的 NVS 操作在 PSRAM 栈上出问题，用 `esp_xiaozhi_nvs_ops_register` 把 NVS 转到 SRAM 任务。
 - 隐私边界：接上后麦克风音频和识别结果会上传到 xiaozhi.me，属于联网上传，不可写成“本地处理”。只在唤醒或明确触发后开麦，空闲时保持 `audio_set_mute` 静音、不发送音频。
@@ -233,8 +233,9 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - `0x01` 门线 `0x27,0x01,0x00`；`0x45` Y 结尾 `0x27,0x01`。不要改成 300 行的 `0x2B` 或 4800 字节：多出的 4 行会回绕，表现为右侧像素跑到左侧。
 - 全刷：复位 → 全量配置 → `0x32` 写 `ws_20_30` 前 153B，并写 6B 电压参数 → `0x24` 写 4736B → `0x22 0xC7` → `0x20`。
 - 局部：复位 → 基础寄存器 → `0x3C 0x80` → `0x32` 写 `ws_partial` 前 153B → `0x37` 写 10B → `0x22 0xC0` + `0x20` 预置 → `0x24` 写 4736B → `0x22 0x0F` + `0x20`。不能仅将全刷的 `0x22` 参数改为 `0xFF`。
-- `epd_refresh()` 在启动占位全刷之后从局刷开始；普通刷新计数每达到 `FULL_REFRESH_EVERY` 的倍数时做一次维护性全刷，其余使用局部波形。**状态帧、重试帧、天气更新和切页都走普通刷新接口**，因此不会因取数或切页主动触发全屏闪烁；计数取决于所有普通刷新调用。局部刷新仍传输完整帧缓冲，不是只传矩形区域。
-- `epd_refresh_full()` 强制全刷但不消耗普通刷新计数，应用只用于启动占位、首次进入配网或长按重置配网等需要清理断电残影/整页状态的场景。页面切换使用局部波形；如果长期局刷导致残影，驱动的周期性维护全刷负责恢复对比度。
+- `epd_refresh()` 在启动占位全刷之后从局刷开始；普通刷新计数每达到 `FULL_REFRESH_EVERY` 的倍数时做一次维护性全刷，其余使用局部波形。**状态帧、重试帧和天气更新走普通刷新接口**，计数取决于这些普通刷新调用；切页单独计数，不推进普通刷新计数。局部刷新仍传输完整帧缓冲，不是只传矩形区域。
+- **切页刷新规则：累计第 1–7 次切页只使用局部刷新；第 8 次切页执行一次全刷并清零切页计数。未满 8 次不得因切页主动全刷。** 第 8 次的全刷同时清理多次局刷积累的残影；若普通维护全刷已经到期，应在这次全刷中一并完成，避免紧接着再闪一次。普通维护全刷或 `epd_refresh_full()` 执行后也会清零切页计数。
+- `epd_refresh_full()` 强制全刷但不消耗普通刷新计数，应用只用于启动占位、首次进入配网或长按重置配网等需要清理断电残影/整页状态的场景。第 8 次切页由切页刷新接口执行一次全刷；若长期局刷导致残影，切页全刷和驱动的周期性维护全刷负责恢复对比度。
 - BUSY 高电平为忙，初始化等待 2s、刷新等待 15s；超时只打日志，不无限卡住。
 
 ## 排版与字模
@@ -254,11 +255,11 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 ## 回归要求与覆盖边界
 
 - 改驱动、布局或字模后至少运行 `python3 tools/test_app.py` 和 `python3 tools/preview_ui.py`。改 Weather Icons 映射、生成器或 `font_icons.c` 后还要核对 `third_party/weather-icons/README.md` 的许可/来源与预览。测试通过不代表实屏黑度、残影、刷新时序或网络可用性已验证。
-- `preview_ui.py` 覆盖按天页并生成逐时页预览；逐时 UI 在 `test_app.py` 中检查，切页由 `expected_view`、`button_toggle`、`button_retry` 等应用逻辑覆盖；按键另有去抖和 3 秒长按阈值测试。
+- `preview_ui.py` 覆盖按天页并生成逐时页预览；逐时 UI 在 `test_app.py` 中检查，切页由 `expected_view`、`button_toggle`、`button_switch_full`、`button_retry` 等应用逻辑覆盖；按键另有去抖和 3 秒长按阈值测试。
 - 改布局同步核对：`ui.c` 的日/小时列宽、网格起点和行锚点；`preview_ui.py` 的 `COL_W` / `GRID_X` / `DATE_BASE` / `ICON_TOP` / `DAILY_TEMP_BASE` / `PRECIP_BASE`、`icon_mask` / `expect_forecast`；`test_app.py` 的 `centers` / `boundaries` / `hour_centers`、图标字形、宽度及基线断言。不要只改断言以掩盖越界。
 - 主机解析测试广泛覆盖日数据、作用域、日期、非法值、缺项及截断 JSON；逐时有缺失/短数组/首日错位等用例，但 `validate_weather()` 尚未逐字段比较成功响应的 `hours`。改逐时解析时补对应断言，不假设现有用例已穷尽 DST 和数值边界。
 - 应用测试检查完整 SPI 帧、启动等待、退避、失败正文保留、状态角落隔离、首次对时和切页；网络为 stub，**不覆盖真实 `net.c` / `net_portal.c` / `portal_web.c` / `portal_dns.c` 的 NVS、WiFi、HTTP/TLS、DNS、网页、SNTP 或硬件阻塞时序**。
-- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换和 `button.c` 的短按/3 秒重配网动作。`main.c` 里的 `voice_*` 在 harness 中是 stub。改 `voice.c` 的时序或分帧仍需真机听感验证。
+- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/3 秒重配网动作。`main.c` 里的 `voice_*` 在 harness 中是 stub。改 `voice.c` 的时序或分帧仍需真机听感验证。
 - `partitions.csv` 分别为固件和 ESP-SR 模型分配分区。调整模型或依赖后，用构建输出核对 app 和模型镜像各自的大小。
 - `--baseline` 接受旧 `main/` 目录，用于比较请求、调用及完整帧；只有数据契约、布局和字模兼容的基线才有意义。`.cache/` 中历史快照不是运行依赖，不能直接套用旧的单日/旧切页结论。
 - `ABLATION.md` 的体积、帧像素与实机观察属于当时版本的实验，不是当前布局的测量；不要将旧数字或未经复测的残影结论写成当前保证。

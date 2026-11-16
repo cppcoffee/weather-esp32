@@ -344,33 +344,52 @@ int epd_text_w(const aafont *f, const char *s)
 // Routine updates use the partial waveform. Periodic full refreshes bound accumulated residue;
 // the boot placeholder is already a full refresh, so the first ordinary update starts partial.
 #define FULL_REFRESH_EVERY 5
+// Page switches have their own cadence: 1..7 stay partial, the 8th is full. Any full refresh
+// clears the accumulated switch count because it also clears the residue that count bounds.
+#define PAGE_SWITCH_FULL_EVERY 8
 
 static unsigned refreshes = 1;
+static unsigned page_switches;
 static bool maintenance_full_pending;
+
+// consume_ordinary merges a due ordinary maintenance slot into this full refresh, so the next
+// epd_refresh() does not immediately flash the panel again.
+static void full_refresh_done(bool consume_ordinary)
+{
+    refresh_full();
+    maintenance_full_pending = false;
+    page_switches = 0;
+    if (consume_ordinary) {
+        refreshes++;
+    }
+}
 
 void epd_refresh(void)
 {
     if (maintenance_full_pending || refreshes % FULL_REFRESH_EVERY == 0) {
-        refresh_full();
-        maintenance_full_pending = false;
+        full_refresh_done(true);
     } else {
         refresh_partial();
+        refreshes++;
     }
-    refreshes++;
 }
 
-void epd_refresh_partial(void)
+void epd_refresh_page_switch(void)
 {
+    if (++page_switches >= PAGE_SWITCH_FULL_EVERY) {
+        bool due = maintenance_full_pending || refreshes % FULL_REFRESH_EVERY == 0;
+        full_refresh_done(due);
+        return;
+    }
     refresh_partial();
     if (refreshes % FULL_REFRESH_EVERY == 0) {
         maintenance_full_pending = true;
     }
-    refreshes++;
 }
 
 // Used for the boot blank page and provisioning page. It does not consume the periodic
 // refresh slot; the counter starts at one so the first ordinary update after boot is partial.
 void epd_refresh_full(void)
 {
-    refresh_full();
+    full_refresh_done(false);
 }
