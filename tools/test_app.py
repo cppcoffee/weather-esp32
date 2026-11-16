@@ -46,7 +46,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-SOURCES = ("main.c", "button.c", "ui.c", "weather.c", "weather_json.c", "epd.c", "fonts_aa.c", "font_icons.c")
+SOURCES = ("main.c", "button.c", "ui.c", "weather.c", "weather_json.c", "epd.c", "fonts_aa.c", "font_clock.c", "font_icons.c", "voice_audio.c")
 # Independent WMO -> official Weather Icons name/codepoint oracle, not ui.c's enum.
 ICON_ORACLE = {
     "WI_SUN": ("wi-day-sunny", 0xF00D, (0, 1)),
@@ -103,6 +103,10 @@ WEATHER_URL = (
 HEADERS = {
     "esp_err.h": """#pragma once
 #define ESP_OK 0
+#define ESP_ERR_NOT_SUPPORTED -2
+#define ESP_ERR_INVALID_STATE -3
+typedef int esp_err_t;
+static inline const char *esp_err_to_name(esp_err_t err) { (void)err; return "stub"; }
 """,
     "esp_log.h": """#pragma once
 #include <assert.h>
@@ -254,7 +258,18 @@ HARNESS = r'''
 #include "ui.h"
 #include "fixtures.h"
 
+typedef int esp_err_t;
+#define ESP_OK 0
 void app_main(void);
+esp_err_t audio_init(void) { return ESP_OK; }
+/* voice.c needs the real esp_xiaozhi/opus stack, so the app harness links stubs. */
+esp_err_t voice_init(void) { return ESP_OK; }
+static bool weather_reserved;
+static unsigned weather_attempts;
+void voice_net_ready(void) { assert(!weather_reserved && weather_attempts > 0); }
+void voice_net_pause(void) {}
+bool voice_weather_begin(void) { assert(!weather_reserved); weather_reserved = true; return true; }
+void voice_weather_end(void) { assert(weather_reserved); weather_reserved = false; weather_attempts++; }
 static jmp_buf done;
 static const char *pattern;
 static unsigned cycle;
@@ -288,7 +303,7 @@ static unsigned long expected_wait_ms(void) {
 }
 int gpio_config(const gpio_config_t *cfg) { (void)cfg; return 0; }
 static int dc_level = 1, last_cmd;
-static bool expect_switch_full;
+static bool expect_switch_partial;
 int gpio_set_level(int pin, int level) {
     if (pin == EPD_DC) dc_level = level;
     return 0;
@@ -326,8 +341,8 @@ void vTaskDelay(unsigned ms) {
     if (button_pressed_level) {
         if (wait_elapsed - press_started >= BTN_PRESS_MS) {
             button_pressed_level = false;
-            /* Switching pages replaces the whole canvas, so it must use the full waveform. */
-            expect_switch_full = true;
+            /* Page switches replace the canvas but use the partial waveform to avoid flashing. */
+            expect_switch_partial = true;
         }
     } else if (press_next < press_count && press_cycle[press_next] == cycle &&
                wait_elapsed >= press_at[press_next]) {
@@ -415,8 +430,8 @@ static void check_app_frame(unsigned char *fb) {
             epd_text(174 - epd_text_w(&font_mid, label) / 2, 16, &font_mid, label);
         } else {
             /* Independent policy expectations for sample_weather's explicit fixture table. */
-            const char *advice[] = {"降水概率低", "今日带伞", "降水概率低", "雷雨注意安全",
-                                   "今日带伞", "今日带伞", "今日带伞"};
+            const char *advice[] = {"降水概率低", "降水概率低", "降水概率低", "雷雨注意安全",
+                                   "今日带伞", "降水概率低", "降水概率低"};
             const char *banner = advice[cycle % 7];
             epd_text(174 - epd_text_w(&font_mid, banner) / 2, 16, &font_mid, banner);
         }
@@ -424,7 +439,7 @@ static void check_app_frame(unsigned char *fb) {
         struct tm tm;
         localtime_r(&now, &tm);
         strftime(heading, sizeof(heading), "%H:%M", &tm);
-        epd_text(EPD_W - 8 - epd_text_w(&font_small, heading), 16, &font_small, heading);
+        epd_text(EPD_W - 8 - epd_text_w(&font_clock, heading), 16, &font_clock, heading);
     } else {
         attempt = button ? retries : retries + 1;
         unsigned delay = expected_retry_seconds(attempt);
@@ -481,11 +496,11 @@ int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *t) {
         const unsigned char *p = t->tx_buffer;
         if (!dc_level) {
             last_cmd = p[0];
-        } else if (last_cmd == 0x22 && expect_switch_full) {
-            expect_switch_full = false;
-            if (p[0] != 0xC7) {
-                fprintf(stderr, "page switch used update sequence 0x%02X; it must use the "
-                        "full waveform (0xC7) to clear the previous page\n", p[0]);
+        } else if (last_cmd == 0x22 && expect_switch_partial) {
+            expect_switch_partial = false;
+            if (p[0] != 0xC0) {
+                fprintf(stderr, "page switch used full update sequence 0x%02X; it must use the "
+                    "partial waveform (0xC0/0x0F) to avoid a full-screen flash\n", p[0]);
                 exit(2);
             }
         }
@@ -534,7 +549,7 @@ void net_portal(void) {
 const char *net_ap_ssid(void) { return "weather-123ABC"; }
 const char *net_ap_pass(void) { return "weather123ABC"; }
 void net_forget_creds(void) { puts("forget"); }
-void net_time_sync(void) { puts("time_sync"); }
+void net_time_sync(void) { assert(weather_reserved); puts("time_sync"); }
 void net_apply_tz(int offset) {
     assert(offset == 28800 || offset == 19800);
     printf("timezone:%d\n", offset);
@@ -542,6 +557,7 @@ void net_apply_tz(int offset) {
     tzset();
 }
 int net_http_get(const char *url, char *buf, size_t cap) {
+    assert(weather_reserved);
     assert(cycle < strlen(pattern));
     printf("request:%s\n", url);
     if (strstr(url, "ip-api.com")) {
@@ -728,7 +744,8 @@ void traced_text(int x, int y, const aafont *font, const char *text) {
         pen += glyph->adv;
     }
     const char *name = font == &font_mid ? "mid" : font == &font_temp ? "temp" :
-                       font == &font_small ? "small" : font == &font_huge ? "huge" :
+                       font == &font_small ? "small" : font == &font_clock ? "clock" :
+                       font == &font_huge ? "huge" :
                                               font == &font_icon_daily ? "icon_daily" : font == &font_icon ? "icon" : "other";
     printf("text:%d:%d:%d:%s:%d:%d:%d:%d:%s\n", x, y, epd_text_w(font, text), name,
         left, top, right, bottom, text);
@@ -773,6 +790,40 @@ int main(int argc, char **argv) {
             printf("]}");
         }
         puts("}");
+        return 0;
+    }
+    if (!strcmp(mode, "clock_metrics")) {
+        assert(font_clock.line_height == 16 && font_clock.data != font_small.data);
+        const aafont *fonts[] = {&font_small, &font_clock};
+        unsigned ink[2] = {0};
+        for (unsigned f = 0; f < 2; f++) {
+            const char *required = "0123456789:";
+            for (const char *p = required; *p; p++) {
+                const aaglyph *g = NULL;
+                for (unsigned i = 0; i < fonts[f]->n; i++)
+                    if (fonts[f]->cps[i] == (unsigned)*p) g = &fonts[f]->glyphs[i];
+                assert(g && g->w && g->h && g->adv);
+                assert(g->xoff >= 0 && g->xoff + g->w <= g->adv);
+                assert(16 + g->yoff >= 0 && 16 + g->yoff + g->h <= 22);
+                unsigned visible = 0;
+                for (unsigned row = 0; row < g->h; row++)
+                    for (unsigned col = 0; col < g->w; col++)
+                        visible += !!(fonts[f]->data[g->offset + row * ((g->w + 7) / 8) + col / 8]
+                                      & (0x80 >> (col & 7)));
+                assert(visible);
+                ink[f] += visible;
+            }
+        }
+        assert(ink[1] > ink[0]);
+        for (unsigned hour = 0; hour < 24; hour++) {
+            for (unsigned minute = 0; minute < 60; minute++) {
+                char text[6];
+                snprintf(text, sizeof(text), "%02u:%02u", hour, minute);
+                int width = epd_text_w(&font_clock, text);
+                assert(width > 0 && 292 - width >= 250);
+            }
+        }
+        printf("clock:1440:%u:%u\n", ink[0], ink[1]);
         return 0;
     }
     if (!strcmp(mode, "metrics")) {
@@ -1243,7 +1294,8 @@ static void feed(bool pressed, unsigned ms, const char *label) {
     for (unsigned t = 0; t < ms; t += BUTTON_POLL_MS) {
         button_event_t event = button_poll(BUTTON_POLL_MS);
         if (event != BUTTON_NONE) {
-            printf("event:%s@%s\n", event == BUTTON_TAP ? "tap" : "hold", label);
+            const char *name = event == BUTTON_TAP ? "tap" : "hold";
+            printf("event:%s@%s\n", name, label);
         }
     }
 }
@@ -1278,7 +1330,20 @@ def run(command, work, timeout):
     ).stdout
 
 
-def compile_app(compiler, source, cjson_dir, work, label):
+def locate_cjson(project):
+    root = project / "managed_components" / "espressif__cjson"
+    candidates = sorted(
+        path for path in root.rglob("cJSON.c")
+        if (path.parent / "cJSON.h").is_file()
+    )
+    require(
+        len(candidates) == 1,
+        "managed espressif/cjson is missing; run `idf.py reconfigure` or `idf.py build` first",
+    )
+    return candidates[0].parent, candidates[0]
+
+
+def compile_app(compiler, source, cjson_dir, cjson_source, work, label):
     sources = list(SOURCES)
     for name in sources:
         require((source / name).is_file(), f"missing source: {source / name}")
@@ -1287,19 +1352,19 @@ def compile_app(compiler, source, cjson_dir, work, label):
         compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",
         "-Wno-unused-parameter", "-Wno-unused-variable",
         "-I", work / "stubs", "-I", source, "-I", cjson_dir,
-        *(source / name for name in sources), cjson_dir / "cJSON.c", work / "harness.c",
+        *(source / name for name in sources), cjson_source, work / "harness.c",
         "-lm", "-o", executable,
     ], work, 60)
     return executable
 
 
-def compile_weather(compiler, source, cjson_dir, work):
+def compile_weather(compiler, source, cjson_dir, cjson_source, work):
     executable = work / "weather.out"
     run([
         compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",
         "-Wno-unused-parameter", "-Wno-unused-variable",
         "-I", work / "stubs", "-I", source, "-I", cjson_dir,
-        source / "weather.c", source / "weather_json.c", cjson_dir / "cJSON.c", work / "weather_harness.c",
+        source / "weather.c", source / "weather_json.c", cjson_source, work / "weather_harness.c",
         "-lm", "-o", executable,
     ], work, 60)
     return executable
@@ -1311,10 +1376,57 @@ def compile_ui(compiler, source, work):
         compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",
         "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
         "-I", work / "stubs", "-I", source,
-        work / "ui_wrapper.c", source / "epd.c", source / "fonts_aa.c", source / "font_icons.c",
+        work / "ui_wrapper.c", source / "epd.c", source / "fonts_aa.c", source / "font_clock.c", source / "font_icons.c",
         work / "ui_harness.c", "-lm", "-o", executable,
     ], work, 60)
     return executable
+
+
+VOICE_AUDIO_HARNESS = r'''
+#include <stdint.h>
+#include <stdio.h>
+#include "voice_audio.h"
+
+int main(void)
+{
+    /* The microphone is on the left channel, so the right channel must be dropped, not mixed. */
+    const int16_t stereo[6] = {1, 9, 2, 8, 3, 7};
+    int16_t mono[3] = {0};
+    voice_stereo_to_mono(stereo, mono, 3);
+    if (mono[0] != 1 || mono[1] != 2 || mono[2] != 3) {
+        printf("downmix %d %d %d\n", mono[0], mono[1], mono[2]);
+        return 1;
+    }
+
+    /* Playback needs interleaved stereo again: both channels carry the same sample. */
+    int16_t out[6] = {0};
+    voice_mono_to_stereo(mono, out, 3);
+    for (int i = 0; i < 3; i++) {
+        if (out[i * 2] != mono[i] || out[i * 2 + 1] != mono[i]) {
+            printf("upmix index %d\n", i);
+            return 1;
+        }
+    }
+    printf("ok\n");
+    return 0;
+}
+'''
+
+
+def compile_voice_audio(compiler, source, work):
+    (work / "voice_audio_harness.c").write_text(VOICE_AUDIO_HARNESS, encoding="utf-8")
+    executable = work / "voice_audio.out"
+    run([
+        compiler, "-std=c11", "-Wall", "-Wextra", "-I", source,
+        source / "voice_audio.c", work / "voice_audio_harness.c", "-o", executable,
+    ], work, 60)
+    return executable
+
+
+def check_voice_audio(executable, work):
+    """Stereo/mono conversion of the real voice_audio.c."""
+    out = run([executable], work, 10).decode("utf-8").strip()
+    require(out == "ok", f"voice_audio: expected ok, got {out!r}")
 
 
 def compile_button(compiler, source, work):
@@ -1331,8 +1443,7 @@ def check_button(executable, work):
     """Debounce and hold timing of the real button state machine."""
     trace = run([executable], work, 10).decode("utf-8").splitlines()
     require(trace == ["event:hold@hold", "event:tap@tap-release", "event:tap@below-release"],
-            f"button: expected one hold at 3 s, a tap on release and a tap below the threshold; "
-            f"got {trace}")
+            f"button: expected a hold at 3 s, taps on shorter releases and no events during bounce; got {trace}")
 
 
 def validate_weather(trace, case, expected):
@@ -1431,11 +1542,11 @@ def expected_advice(code, probability, available=True):
         return "预报待更新"
     if code in (95, 96, 99):
         return "雷雨注意安全"
-    precipitation_codes = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67,
-                           71, 73, 75, 77, 80, 81, 82, 85, 86}
-    if code in precipitation_codes or math.floor(probability + 0.5) >= 50:
+    if (math.floor(probability + 0.5) >= 51):
         return "今日带伞"
-    if code in (0, 1, 2, 3, 45, 48):
+    known_codes = {0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67,
+                   71, 73, 75, 77, 80, 81, 82, 85, 86}
+    if code in known_codes:
         return "降水概率低"
     return "预报待更新"
 
@@ -1486,7 +1597,11 @@ def check_icon_fonts(executable, work, source):
 
 def check_ui(executable, work, source):
     """Assert the public layout bands, not a duplicate implementation of the icons."""
-    count = 0
+    count = 1
+    clock_metrics = run([executable, "clock_metrics"], work, 10).decode("ascii").strip().split(":")
+    require(len(clock_metrics) == 4 and clock_metrics[:2] == ["clock", "1440"] and
+            int(clock_metrics[3]) > int(clock_metrics[2]),
+            "ui: all 1440 clock times must fit; bold clock glyphs must have more ink than regular")
     centers = [18 + 26 + i * 52 for i in range(5)]
     boundaries = [18 + i * 52 for i in range(6)]
     metrics = json.loads(run([executable, "metrics"], work, 10))
@@ -1527,9 +1642,11 @@ def check_ui(executable, work, source):
         else:
             require(city == ("Chengdu" if available else "无数据"),
                     f"ui: unexpected normal/no-forecast city: {city!r}")
-        require(any(e["text"] == clock and e["font"] == "small" and e["y"] == 16 and
-                    e["x"] + e["width"] == 292 for e in entries),
-                "ui: clock text, font and right-aligned header position must stay unchanged")
+        require(any(e["text"] == clock and e["font"] == "clock" and e["y"] == 16 and
+                    e["x"] + e["width"] == 292 and e["x"] >= 250 and
+                    250 <= e["bounds"][0] <= e["bounds"][2] < 292 and
+                    0 <= e["bounds"][1] <= e["bounds"][3] < 22 for e in entries),
+                "ui: clock text must use the bold clock font and stay right-aligned")
 
     def capture(mode, day=None, value=None):
         nonlocal count
@@ -1746,16 +1863,19 @@ def check_ui(executable, work, source):
     # capture helper's oracle. Future days include a 100% thunderstorm on purpose.
     policy_cases = []
     for code in (0, 1, 2, 3, 45, 48):
-        policy_cases += [(code, 49.4, "降水概率低"), (code, 49.6, "今日带伞")]
+        policy_cases += [(code, 49.4, "降水概率低"), (code, 49.6, "降水概率低"),
+                         (code, 50.4, "降水概率低"), (code, 50.5, "今日带伞")]
     policy_cases += [(0, 0, "降水概率低"), (0, 39.6, "降水概率低"),
-                     (0, 49.5, "今日带伞"), (0, 50, "今日带伞")]
+                     (0, 49.5, "降水概率低"), (0, 50, "降水概率低"),
+                     (0, 50.4, "降水概率低"), (0, 50.5, "今日带伞"), (0, 51, "今日带伞")]
     for code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86):
-        policy_cases.append((code, 0, "今日带伞"))
+        policy_cases += [(code, 0, "降水概率低"), (code, 41, "降水概率低"),
+                         (code, 49.6, "降水概率低"), (code, 50.5, "今日带伞")]
     for code in (95, 96, 99):
         policy_cases += [(code, value, "雷雨注意安全") for value in (0, 39.4, 49.6, 100)]
     for code in (4, 44, 49, 52, 54, 58, 62, 64, 68, 72, 74, 76, 78, 83, 84, 87, 97, 98, 100, -1):
         policy_cases += [(code, 0, "预报待更新"), (code, 39.6, "预报待更新"),
-                         (code, 49.6, "今日带伞")]
+                         (code, 49.6, "预报待更新"), (code, 50.5, "今日带伞")]
     for code in (0, 45, 61, 71, 95, 96, 99, 4):
         policy_cases += [(code, value, "预报待更新")
                          for value in (float("nan"), float("inf"), -0.1, 100.1)]
@@ -1849,6 +1969,7 @@ def check_ui(executable, work, source):
     # Hourly page: ten equal columns, one row per quantity, ink never leaves the grid.
     count += 1
     hourly = ui_capture(executable, work, "hourly")
+    header(hourly, "未来10小时")
     hour_centers = [8 + 14 + i * 28 for i in range(10)]
     labels = [e for e in hourly["texts"] if e["y"] == DATE_BASE]
     require([e["text"] for e in labels] == [f"{(8 + i) % 24:02d}" for i in range(10)],
@@ -2088,8 +2209,10 @@ def main():
     require(compiler, "no host C compiler found; install clang or cc")
     project = Path(__file__).resolve().parents[1]
     source = project / "main"
-    cjson_dir = project / "components" / "cjson" / "cJSON"
     baseline_source = args.baseline.resolve() if args.baseline else None
+    cjson_dir = cjson_source = None
+    if args.only in ("all", "app", "weather") or baseline_source:
+        cjson_dir, cjson_source = locate_cjson(project)
     with tempfile.TemporaryDirectory(prefix="weather-test-app-") as directory:
         work = Path(directory)
         for name, text in HEADERS.items():
@@ -2102,13 +2225,15 @@ def main():
         (work / "ui_wrapper.c").write_text(UI_WRAPPER, encoding="utf-8")
         (work / "ui_harness.c").write_text(UI_HARNESS, encoding="utf-8")
         (work / "button_harness.c").write_text(BUTTON_HARNESS, encoding="utf-8")
-        current = (compile_app(compiler, source, cjson_dir, work, "current")
+        current = (compile_app(compiler, source, cjson_dir, cjson_source, work, "current")
                    if args.only in ("all", "app") else None)
-        weather = compile_weather(compiler, source, cjson_dir, work) if args.only in ("all", "weather") else None
+        weather = compile_weather(compiler, source, cjson_dir, cjson_source, work) if args.only in ("all", "weather") else None
         ui = compile_ui(compiler, source, work) if args.only in ("all", "ui") else None
         button = (compile_button(compiler, source, work)
                   if args.only in ("all", "app") else None)
-        baseline = (compile_app(compiler, baseline_source, cjson_dir, work, "baseline")
+        voice_audio = (compile_voice_audio(compiler, source, work)
+                       if args.only in ("all", "app") else None)
+        baseline = (compile_app(compiler, baseline_source, cjson_dir, cjson_source, work, "baseline")
                     if baseline_source else None)
         failures = []
 
@@ -2162,9 +2287,15 @@ def main():
         if button:
             try:
                 check_button(button, work)
-                print("PASS button: debounced tap and the 3 s hold threshold", flush=True)
+                print("PASS button: debounced tap and the 3 s reset hold", flush=True)
             except (AssertionError, ValueError, subprocess.SubprocessError) as error:
                 failure(error, "current/button")
+        if voice_audio:
+            try:
+                check_voice_audio(voice_audio, work)
+                print("PASS voice_audio: left-channel downmix and stereo upmix", flush=True)
+            except (AssertionError, ValueError, subprocess.SubprocessError) as error:
+                failure(error, "current/voice_audio")
         ui_count = 0
         if ui:
             try:

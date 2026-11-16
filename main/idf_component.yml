@@ -1,0 +1,6 @@
+dependencies:
+  espressif/cjson: ^1.7.19
+  espressif/esp_codec_dev: ~1.6.2
+  espressif/esp-sr: '2.4.7'
+  espressif/esp_xiaozhi: ^0.1.4
+  esphome/micro-opus: ^0.4.1

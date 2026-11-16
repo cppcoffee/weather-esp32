@@ -36,6 +36,8 @@ void epd_fill_circle(int cx, int cy, int r, int color);
 void epd_text(int x, int y_baseline, const aafont *f, const char *s); // y = baseline
 int epd_text_w(const aafont *f, const char *s);
 void epd_refresh(void);
-// Full waveform now, without consuming the periodic full-refresh slot: the panel is left with
-// the strongest contrast, and the next epd_refresh() is still a full one.
+// Partial waveform now, even when the periodic maintenance full refresh is due. A due full
+// refresh is deferred until the next ordinary epd_refresh() call.
+void epd_refresh_partial(void);
+// Full waveform now, without consuming the periodic partial-refresh cadence.
 void epd_refresh_full(void);

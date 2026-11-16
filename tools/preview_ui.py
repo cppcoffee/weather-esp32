@@ -218,7 +218,7 @@ void epd_text(int x, int y, const aafont *f, const char *text) {
             }
             if (weather_scene && y == 16) {
                 assert(top >= 0 && bottom <= 22);
-                if (f == &font_small) assert(left >= 230 && right <= 292);
+                if (f == &font_clock) assert(left >= 230 && right <= 292);
                 else if (x == 8) assert(left >= 8 && right <= 104);
                 else assert(left >= 126 && right <= 222);
             }
@@ -417,7 +417,8 @@ static void check_hints(const weather_t *demo) {
     const struct { float value; int displayed; } probabilities[] = {
         {NAN,-1}, {INFINITY,-1}, {-INFINITY,-1}, {-0.1f,-1}, {100.1f,-1},
         {FLT_MAX,-1}, {-FLT_MAX,-1}, {0,0}, {0.49f,0}, {0.5f,1},
-        {39.49f,39}, {39.5f,40}, {40,40}, {49.4f,49}, {49.5f,50}, {49.6f,50}, {50,50},
+        {39.49f,39}, {39.5f,40}, {40,40}, {49.4f,49}, {49.5f,50}, {49.6f,50},
+        {50,50}, {50.4f,50}, {50.5f,51}, {51,51},
         {99.49f,99}, {99.5f,100}, {100,100},
     };
     for (int code = -2; code <= 101; ++code) {
@@ -430,7 +431,7 @@ static void check_hints(const weather_t *demo) {
             const char *hint;
             if (rounded < 0) hint = "预报待更新";
             else if (family >= 10) hint = "雷雨注意安全";
-            else if (family >= 5 || rounded >= 50) hint = "今日带伞";
+            else if (rounded >= 51) hint = "今日带伞";
             else if (family > 0) hint = "降水概率低";
             else hint = "预报待更新";
             centered(174, 16, &font_mid, hint);
@@ -571,7 +572,7 @@ int main(void) {
     unsigned char unknown[FRAME_BYTES], saved[FRAME_BYTES];
     render(&w, NULL);
     expect(8, 16, &font_mid, "Chengdu");
-    expect(EPD_W - 8 - epd_text_w(&font_small, "08:30"), 16, &font_small, "08:30");
+    expect(EPD_W - 8 - epd_text_w(&font_clock, "08:30"), 16, &font_clock, "08:30");
     expect(46, 124, &font_mid, "--.- °C");
     expect(146, 124, &font_mid, "-- %");
     expect(8, 124, &font_mid, "温度");
@@ -786,7 +787,7 @@ def capture_frames(compiler, sanitize=False):
         binary = temporary / "preview"
         subprocess.run(compiler + flags + includes + [
             str(harness), str(ROOT / "main/ui.c"), str(ROOT / "main/fonts_aa.c"),
-                        str(ROOT / "main/font_icons.c"),
+                        str(ROOT / "main/font_clock.c"), str(ROOT / "main/font_icons.c"),
             str(epd_object), "-lm", "-o", str(binary),
         ], check=True, timeout=60)
         result = subprocess.run([str(binary)], check=True, capture_output=True, timeout=30)

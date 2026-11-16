@@ -78,8 +78,9 @@ static bool load_creds(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
 static bool sta_connect(const char *ssid, const char *pass, int timeout_ms)
 {
     wifi_config_t cfg = {.sta = {.threshold.authmode = WIFI_AUTH_OPEN}}; // 扫到啥就连啥，开放热点也要能用
-    snprintf((char *)cfg.sta.ssid, sizeof(cfg.sta.ssid), "%s", ssid);
-    snprintf((char *)cfg.sta.password, sizeof(cfg.sta.password), "%s", pass);
+    // NVS strings include a terminator. The zeroed STA fields can also hold full-width credentials.
+    memcpy(cfg.sta.ssid, ssid, strnlen(ssid, sizeof(cfg.sta.ssid)));
+    memcpy(cfg.sta.password, pass, strnlen(pass, sizeof(cfg.sta.password)));
 
     xEventGroupClearBits(s_events, GOT_IP);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));

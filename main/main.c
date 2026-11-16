@@ -1,3 +1,4 @@
+#include "audio.h"
 #include "button.h"
 #include "epd.h"
 #include "esp_err.h"
@@ -6,6 +7,7 @@
 #include "freertos/task.h"
 #include "net.h"
 #include "ui.h"
+#include "voice.h"
 #include "weather.h"
 
 static const char *TAG = "app";
@@ -25,7 +27,6 @@ typedef struct {
     weather_t shown; // last good forecast, kept because weather_update resets w on failure
     sensor_reading_t sensor;
     bool have_weather;
-    bool painted; // a real forecast has been drawn at least once
     bool retrying;
     unsigned retry_attempt;
     unsigned retry_delay;
@@ -79,16 +80,13 @@ static void set_status(app_t *app, ui_status_t status, unsigned attempt, bool sh
     }
 }
 
-// A page switch replaces the whole screen, so it needs the full waveform to remove the
-// previous page's glyphs. Routine updates use the periodic full-refresh policy in epd.c.
-static void present(app_t *app, bool force_full)
+// Routine updates use the driver's partial-refresh cadence. Page switches explicitly use the
+// partial waveform so they cannot turn into a periodic maintenance full refresh.
+static void present(app_t *app, bool page_switch)
 {
     draw_page(app);
-    const weather_t *w = current_weather(app);
-    bool full = force_full || (w->ok && !app->painted);
-    app->painted = app->painted || w->ok;
-    if (full) {
-        epd_refresh_full();
+    if (page_switch) {
+        epd_refresh_partial();
     } else {
         epd_refresh();
     }
@@ -101,10 +99,10 @@ static bool button_service(app_t *app, unsigned slice_ms)
     switch (button_poll(slice_ms)) {
     case BUTTON_HOLD:
         ESP_LOGW(TAG, "button held: erasing stored credentials");
+        voice_net_pause();
         net_forget_creds();
         ui_draw_portal_hint();
         epd_refresh_full();
-        app->painted = false;
         net_portal();
         return true;
 
@@ -151,6 +149,7 @@ static void run_connect_phase(app_t *app)
     }
 
     if (!net_has_stored()) {
+        voice_net_pause();
         ui_draw_portal_hint();
         epd_refresh_full();
         net_portal();
@@ -168,6 +167,13 @@ static void run_connect_phase(app_t *app)
 
 static void run_weather_phase(app_t *app)
 {
+    if (!voice_weather_begin()) {
+        if (wait_serviced(BUTTON_POLL_MS, app)) {
+            app->connect_attempt = 0;
+            app->phase = APP_PHASE_CONNECT;
+        }
+        return;
+    }
     set_status(app, UI_STATUS_FETCHING, 0, true);
     bool updated = weather_update(&app->w);
     unsigned wait_s = REFRESH_S;
@@ -191,6 +197,8 @@ static void run_weather_phase(app_t *app)
         ESP_LOGW(TAG, "update failed, retry #%u in %us", app->retry_attempt, app->retry_delay);
     }
 
+    voice_weather_end();
+    voice_net_ready();
     present(app, false);
     if (wait_serviced(wait_s * 1000u, app)) {
         app->connect_attempt = 0;
@@ -202,8 +210,17 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "boot");
     epd_init();
+    esp_err_t audio_err = audio_init();
+    if (audio_err != ESP_OK) {
+        ESP_LOGW(TAG, "audio unavailable: %s", esp_err_to_name(audio_err));
+    }
     net_init();
     button_init();
+    // Voice stays idle until the network is up; it runs in its own task so a microphone
+    // read or a chat turn never stalls the weather loop.
+    if (voice_init() != ESP_OK) {
+        ESP_LOGW(TAG, "voice unavailable");
+    }
 
     app_t app = {0};
     app.view = VIEW_DAILY;
@@ -211,9 +228,8 @@ void app_main(void)
     app.phase = APP_PHASE_CONNECT;
 
     // The glass keeps the last session's image, and the first forecast is seconds to minutes
-    // away, so paint the placeholder page now. One full refresh both scrubs the old image and
-    // leaves something readable; keeping the periodic counter untouched makes the first real
-    // forecast a full refresh too.
+    // away, so paint the placeholder page now. One full refresh scrubs the old image and leaves
+    // something readable; it does not force a full waveform for the later routine page updates.
     draw_page(&app);
     epd_refresh_full();
 

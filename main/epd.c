@@ -341,27 +341,35 @@ int epd_text_w(const aafont *f, const char *s)
     return w;
 }
 
-// The first frame (and periodic de-ghosting frames) use the full waveform. Routine
-// updates use the partial waveform, which changes pixels without the whole-panel flash.
-// Four partial refreshes between full ones bounds accumulated residue while keeping the
-// routine update path mostly flash-free. The first ordinary refresh is full as well.
+// Routine updates use the partial waveform. Periodic full refreshes bound accumulated residue;
+// the boot placeholder is already a full refresh, so the first ordinary update starts partial.
 #define FULL_REFRESH_EVERY 5
 
-static unsigned refreshes;
+static unsigned refreshes = 1;
+static bool maintenance_full_pending;
 
 void epd_refresh(void)
 {
-    if (refreshes == 0 || refreshes % FULL_REFRESH_EVERY == 0) {
+    if (maintenance_full_pending || refreshes % FULL_REFRESH_EVERY == 0) {
         refresh_full();
+        maintenance_full_pending = false;
     } else {
         refresh_partial();
     }
     refreshes++;
 }
 
-// Used for the boot blank page: a partial refresh off a freshly driven white screen reproduces
-// text with the weak partial waveform, which reads as washed-out grey. Leaving the counter at
-// zero makes the first weather frame a full refresh too, so the content is at full contrast.
+void epd_refresh_partial(void)
+{
+    refresh_partial();
+    if (refreshes % FULL_REFRESH_EVERY == 0) {
+        maintenance_full_pending = true;
+    }
+    refreshes++;
+}
+
+// Used for the boot blank page and provisioning page. It does not consume the periodic
+// refresh slot; the counter starts at one so the first ordinary update after boot is partial.
 void epd_refresh_full(void)
 {
     refresh_full();

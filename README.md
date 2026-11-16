@@ -15,6 +15,31 @@ ESP32-S3 + GYSDISPLAY 2.9" 墨水屏（物理 296×128，面板 RAM 128×296，S
 | VCC        | 3V3（不要 5V） |
 | GND        | GND    |
 
+### ES8311 + NS415B 音频
+
+当前固件使用 ESP-IDF 官方 `esp_codec_dev` 的 ES8311 驱动，I²S 以 ESP32-S3 为主机，默认 16 kHz、16 bit、双声道 Philips 格式；麦克风数据通过 `audio_read()` 获取，播放数据通过 `audio_write()` 发送。上电初始化后功放保持静音，不会自动回声或上传麦克风数据；调用 `audio_set_mute(false)` 后才打开播放输出。
+
+| 音频信号 | ESP32-S3 | 说明 |
+|------|----------|------|
+| NS415B EN | GPIO35 | 高电平使能功放，由 ES8311 驱动控制 |
+| ES8311 DO | GPIO36 | ESP32 → ES8311 DIN/SDIN（I²S 数据输出） |
+| ES8311 WS | GPIO37 | LRCK / WS |
+| ES8311 DI | GPIO38 | ES8311 DOUT/SDOUT → ESP32（麦克风输入） |
+| ES8311 BCK | GPIO39 | BCLK |
+| ES8311 MCN | GPIO40 | 按接线名称理解为 MCLK |
+| ES8311 SCL | GPIO41 | I²C 时钟 |
+| ES8311 SCA | GPIO42 | 按接线名称理解为 SDA/CDATA |
+| 音频 VCC | 依模块规格 | ES8311 逻辑电源通常为 3.3V；NS415B 功放电源按模块规格供电 |
+| 音频 GND | GND | 必须与 ESP32-S3 共地 |
+### 小智 AI 语音唤醒
+
+启用语音后，说「你好小智」触发一轮对话。固件通过 ESP-SR WakeNet 在本地识别唤醒词，命中后才向小智服务上传问句。首次激活码目前显示在串口日志。按键用于短按切页和长按 3 秒重新配网。
+
+ESP32-S3-WROOM-1-N16R8 的 8 MB Octal PSRAM 占用 GPIO35–37。上表的功放 EN、ES8311 DIN/SDIN 和 WS 接线需要避开这些引脚。确认实际接线后更新 `main/audio.h`，再启用 Octal PSRAM。当前默认配置尚未启用 PSRAM，语音任务会在启动时报告该状态。
+
+`idf.py build` 生成应用和 WakeNet 模型镜像。首次烧录用 `idf.py -p 实际串口 flash` 写入 `model` 分区。屏上对话状态和时间天气 MCP 工具仍待接入。
+
+
 改引脚只动 `main/epd.h` 顶部的 `#define`。
 
 画图坐标系是**逻辑横屏 300×128**（`EPD_W`×`EPD_H`），驱动在 `epd_pixel()` 里旋转 90° 映射到面板竖屏 RAM（`128×296`）。SSD1680 最多 296 条 gate，所以逻辑 `x >= 296` 会被裁掉；实际可见宽度是 296。画面上下颠倒就把 `EPD_ROT_CW` 改成 0。
@@ -53,19 +78,19 @@ idf.py -p /dev/cu.usbmodem* flash
 
 ## 屏幕布局与传感器预留
 
-- 顶部：城市、今天的出行提示与本次成功更新的当地时间；城市超宽时安全省略，失败时整行替换为无网络重试提示，不继续展示旧的带伞建议。
+- 顶部：城市、今天的出行提示与页面重绘时的当地时间；右上角时间使用独立的 **12px 粗体** 字模，保持原来的右对齐位置。城市超宽时安全省略，失败时整行替换为无网络重试提示，不继续展示旧的带伞建议。目前没有独立的每分钟时钟刷新，本次只调整字重，不改变刷新频率。
 - 主体：五列等宽的日期轴、Weather Icons 天气图标、单行 `最低°-最高°` 区间和降水概率，例如 `12°-21°`；第一列固定显示 `今天`（16px，汉字只在 `font_mid` 里），其余列为 `MM/DD`。每列 52px，五列整体在 296px 可见宽度内左右各留 18px 居中排列，列内元素水平居中。温度单位为摄氏度并带度数符号，区间保持最低温在前；`最低°-最高°` 在 16px 下是 53px 放不进 52px 列，所以温度行用 14px 字模（47px），更宽的负温或三位数区间再自动缩小字号，仍无法容纳或数据无效时显示 `--`。图标根据每天的 WMO 天气码映射到 Weather Icons 的 1bpp 子集，覆盖晴、多云、阴、雾、毛毛雨、雨、雪、阵雨、阵雪、雷雨和冰雹；无预报或未知码显示 `?`，不冒充晴天。
 - 底部：一行三块——传感器温度、湿度、右下角的当前状态。尚未接入硬件驱动时温湿度分别显示 `--.- °C` 和 `-- %`，不会用天气接口数值冒充现场读数，也不占用预报主体区域。状态是短文案：`正在联网` / `正在取数` / `同步时间` / `已更新` / `重试 #n`；取数和对时这种阻塞步骤会先刷一次状态，让人看到设备在做事。
 - `main/ui.h` 的 `sensor_reading_t` 预留 `temperature_c`、`humidity_percent` 和 `valid`。后续驱动可填入实际采样值，当前入口保持 `valid=false`。未知、非有限值或越界湿度使用占位；数值固定使用底栏字号，无法容纳时显示占位。当前刷新节奏仍由天气更新驱动，接入传感器后可按实际采样需求再调整。
 
 出门提示采用保守的全天参考规则，仅依据今天，不用明天的风险决定今天的建议：
 
-- 今天有雨雪类天气，或四舍五入后的降水概率达到 **50%**：显示 `今日带伞`。
+- 四舍五入后的降水概率达到 **51%**：显示 `今日带伞`；即使天气图标是雨雪类，低于 51% 也不显示带伞提示。
 - 雷雨或伴冰雹的雷雨：优先显示 `雷雨注意安全`，不把带伞当作雷电防护。
 - 已知的晴/多云/阴/雾等天气且概率低：显示 `降水概率低`，不保证不用带伞。
 - 没有有效预报、当天概率无效，或未知天气码且概率低：显示 `预报待更新`，未知概率显示 `--%`，不冒充 0%。
 
-`precipitation_probability_max` 是**当天各时段中的最高降水概率**，不是“现在正在下雨”，也不是某个出门时刻的分钟级预测。百分比显示和 50% 阈值判断使用相同的四舍五入结果；阈值是本项目的提醒策略，不是天气服务给出的确定结论。
+`precipitation_probability_max` 是**当天各时段中的最高降水概率**，不是“现在正在下雨”，也不是某个出门时刻的分钟级预测。百分比显示和 **51%** 阈值判断使用相同的四舍五入结果；阈值是本项目的提醒策略，不是天气服务给出的确定结论。
 
 生成与固件使用相同绘图代码、字模和单色帧缓存的布局预览（只需 Python 标准库和本机 C 编译器）：
 
@@ -82,14 +107,20 @@ python3 tools/preview_ui.py --sanitize
 保留 `main/`：这是 ESP-IDF 默认的应用源码目录。改成 `src/` 不会减少模块或依赖，反而需要显式注册目录，并修改字体生成工具的路径；本项目没有这层自定义配置的必要。
 
 - `main/epd.c` / `main/epd.h` — 驱动。ESP-IDF 核心 API：`driver/spi_master.h`（SPI2，4MHz，CS 手动拉低跨命令）、`driver/gpio.h`（RST/DC/BUSY）；4736 字节单色帧缓存；绘图原语（像素/线/填充矩形/实心圆/字体/全屏/局部刷新）。
-- `main/fonts_aa.c` + `main/fonts_aa.h` — **1bpp 单色文字字模**：拉丁字母来自 Roboto（Apache 2.0），界面上的汉字来自 Noto Sans SC（OFL），汉字只带 `main/main.c`、`main/ui.c` 和 `main/weather.c` 字符串里真用到的那些（`genfont.py` 自动扫，加文案不用改字表）；度符号 `°`（U+00B0）也由 `genfont.py` 补进所有字号。46px Bold / 16px Medium / 14px Medium（`font_temp`，五天温度行专用）/ 12px Regular。汉字只带在 16px 的 `font_mid` 里（12px 汉字掉笔画），所以中文一律用 `font_mid`。字模用 FreeType 的 mono 目标（`mode='1'`）栅格化，笔画网格对齐到整像素后再存 1bpp，屏上直接位图对位输出。
+- `main/fonts_aa.c` + `main/fonts_aa.h` — **1bpp 单色文字字模**：拉丁字母来自 Roboto（Apache 2.0），界面上的汉字来自 Noto Sans SC（OFL），汉字只带 `main/main.c`、`main/ui.c` 和 `main/weather.c` 字符串里真用到的那些（`genfont.py` 自动扫，加文案不用改字表）；度符号 `°`（U+00B0）也由 `genfont.py` 补进所有字号。46px Bold / 16px Medium / 14px Medium（`font_temp`，五天温度行专用）/ 12px Regular。汉字只带在 16px 的 `font_mid` 里（12px 汉字掉笔画），所以中文一律用 `font_mid`。右上角时间使用独立的 12px Bold `font_clock`（`main/font_clock.c`），不改变其他 12px 文本。字模用 FreeType 的 mono 目标（`mode='1'`）栅格化，笔画网格对齐到整像素后再存 1bpp，屏上直接位图对位输出。
 - `main/font_icons.c` + `main/font_icons.h` — **Weather Icons 1bpp 图标子集**：按天页使用 advance 40、cell 高 27 的 `font_icon_daily`，逐时页使用 advance 26、cell 高 23 的 `font_icon`；共 11 类天气图标，运行时不缩放，不在 `ui.c` 手绘图形。字体和生成位图使用 SIL OFL 1.1，来源、固定提交、SHA256 和完整许可见 `third_party/weather-icons/README.md`。
-- `tools/genfont.py` — 用 Pillow 从 TTF 重新生成 `fonts_aa.c`（换文字字体/字号改这里）。需要两个字体文件，不进仓库：
+- `tools/genfont.py` — 用 Pillow 从 TTF 重新生成 `fonts_aa.c`；`--only clock` 单独生成 `main/font_clock.c`，不需要 CJK 字体。生成输入文件不进仓库；Roboto 的许可证见 `third_party/roboto-clock/OFL.txt`。
 
   ```bash
   curl -LO 'https://github.com/google/fonts/raw/main/ofl/roboto/Roboto%5Bwdth,wght%5D.ttf'
   curl -LO 'https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf'
   FONT_TTF='Roboto[wdth,wght].ttf' FONT_CJK_TTF='NotoSansSC[wght].ttf' python3 tools/genfont.py
+  ```
+
+  只重新生成时钟（Roboto 3.015、SIL OFL 1.1；来源与固定版本见 `third_party/roboto-clock/README.md`）：
+
+  ```bash
+  FONT_TTF='.cache/fonts/Roboto[wdth,wght].ttf' python3 tools/genfont.py --only clock
   ```
 
 - `tools/genicons.swift` — 用固定提交的 Weather Icons TTF 生成 `main/font_icons.c`，不在固件运行时加载字体。需要 macOS Swift 的 CoreGraphics、CoreText、CryptoKit 和 ImageIO；字体文件放在 `.cache/weather-icons/`，来源、许可、SHA256 和图标映射见 `third_party/weather-icons/README.md`：
@@ -102,8 +133,9 @@ python3 tools/preview_ui.py --sanitize
       .cache/weather-icons/preview.png
   ```
 
-- `components/cjson/` — 固件和主机回归共用的 cJSON 组件源码（1.7.19~2）。
+- `managed_components/espressif__cjson/` — 由 ESP-IDF Component Manager 自动下载的 cJSON 组件（1.7.x）；固件和主机回归共用这份源码。首次运行主机解析回归前，先执行 `idf.py reconfigure` 或 `idf.py build`。
 - `main/main.c` — 应用入口：初始化、配网、取天气、对时和定时刷新，不包含绘图细节。
+- `main/audio.c` / `main/audio.h` — ES8311 + NS415B 音频初始化：GPIO35 功放使能、GPIO36/37/38/39/40 I²S、GPIO41/42 I²C；提供麦克风读取、扬声器播放、音量/增益和静音接口，使用官方 `esp_codec_dev` 组件。
 - `main/ui.c` / `main/ui.h` — 以五天天气图标、高低温及降水概率为主体，图标由 Weather Icons 字模按 WMO 码映射，顶部提供今日出行提示，传感器读数/占位放在单行底栏，另含配网和无网络重试提示；重试只覆盖顶部标题栏，保留旧正文。只修改帧缓冲，由入口决定何时刷新墨水屏。
 - `main/net.c` — WiFi 连接、SNTP、时区、HTTP(S) GET（`esp_crt_bundle` 校验证书）。
 - `main/net_portal.c` — SoftAP 配网生命周期：AP/IP 配置、WiFi 模式、DNS/HTTP 服务启停。
@@ -112,7 +144,7 @@ python3 tools/preview_ui.py --sanitize
 - `main/button.c` / `main/button.h` — 单个低电平按键：2 次采样去抖，短按切页，长按 3 秒清掉 NVS 里的 WiFi 凭据并回到配网页。
 - `components/dns_server/` — 复用 ESP-IDF captive portal 示例的 DNS server 组件，负责 DNS 协议处理和将 A 查询指向 SoftAP。
 - `main/portal_dns.c` / `main/portal_dns.h` — 配网 DNS 组件的设备特定启动配置，不自行实现 DNS 协议。
-- `main/weather.c` / `main/weather.h` — IP 定位 + 五天天气预报，使用项目内的 `components/cjson` 解析 JSON。只从 `daily.time`、`daily.weather_code`、`daily.temperature_2m_max`、`daily.temperature_2m_min` 和 `daily.precipitation_probability_max` 读取五天数据。逐日验证日期、数组长度、0–99 整数天气码、0–100% 有限降水概率、温度类型及高低温关系；必需数据缺失、为 `null`、日期不连续或响应截断时视为失败，不用后续字段冒充预报数据。
+- `main/weather.c` / `main/weather.h` — IP 定位 + 五天天气预报，使用 Component Manager 提供的 `espressif/cjson` 解析 JSON。只从 `daily.time`、`daily.weather_code`、`daily.temperature_2m_max`、`daily.temperature_2m_min` 和 `daily.precipitation_probability_max` 读取五天数据。逐日验证日期、数组长度、0–99 整数天气码、0–100% 有限降水概率、温度类型及高低温关系；必需数据缺失、为 `null`、日期不连续或响应截断时视为失败，不用后续字段冒充预报数据。
 - `main/weather_json.c` / `main/weather_json.h` — 天气解析使用的通用 cJSON 辅助函数：严格整段解析（拒绝尾部内容）、有限数值/整数、定长字符串、对象成员字符串与固定长度数组读取；日期连续性和值域等天气数据契约校验仍在 `weather.c`。
 
 ## 驱动要点（踩过的坑）
@@ -122,7 +154,7 @@ python3 tools/preview_ui.py --sanitize
 - BUSY **高电平 = 忙**；所有等待都有超时（初始化 2s、刷新 15s），超时只打日志不卡死。
 - 刷新序列：`0x24` 写 4736 字节 → `0x22 0xC7`（全刷）或 `0x20` → 等 BUSY。局部刷新按 Waveshare V2 官方流程：硬件复位 + `0x32` 下发 153 字节 partial LUT + `0x37`/`0x3C 0x80` + `0x22 0xC0` 预置 → 写图 → `0x22 0x0F` 显示。
 - 旋转只在 `epd_pixel()` 做一次，所有绘图原语、文字、图标都自动跟着横屏。
-- 上电先画占位页（`无数据` / `预报待更新` / `--`）并用 `epd_refresh_full()` 全刷：墨水屏断电后仍保留上次的画面，而第一帧天气要等连网和请求完成，所以不能留白屏。这一步不推进全刷周期，紧接着的第一帧真实天气也是全刷（局部波形黑度弱，会发灰）；连不上热点时每次重试只重画顶部提示，正文继续显示占位。每 8 次刷新做一次全刷去残影（30 分钟刷一次 ≈ 每 4 小时一次），其余刷新用官方 partial LUT 做局部刷新，不整屏黑白翻转，日常更新基本不闪。按键切页复用普通刷新路径。正常每 30 分钟取数并刷新；失败时刷新无网络提示和下一次重试序号，按 5、10、20、40、60 秒阶梯再尝试，每次尝试结束只刷新一帧，不做每秒倒计时。等待时间不包含 HTTP 请求、对时和刷屏耗时。恢复成功后重画正常界面，时间也随成功刷新更新；没有“数值相同就跳过”的判断。
+- 上电先画占位页（`无数据` / `预报待更新` / `--`）并用 `epd_refresh_full()` 全刷：墨水屏断电后仍保留上次的画面，而第一帧天气要等连网和请求完成，所以不能留白屏。这一步不消耗普通刷新计数，后续取数、状态、重试和按键切页均走局部刷新；驱动每 `FULL_REFRESH_EVERY` 次普通刷新做一次维护性全刷去残影，其余使用官方 partial LUT，不整屏黑白翻转，日常更新基本不闪。正常每 30 分钟取数并刷新；失败时刷新无网络提示和下一次重试序号，按 5、10、20、40、60 秒阶梯再尝试，每次尝试结束只刷新一帧，不做每秒倒计时。等待时间不包含 HTTP 请求、对时和刷屏耗时。恢复成功后重画正常界面，时间也随成功刷新更新；没有“数值相同就跳过”的判断。
 
 ## 回归验证
 
@@ -131,7 +163,7 @@ python3 tools/test_app.py
 python3 tools/test_portal.py
 ```
 
-只依赖 Python 标准库和本机 C 编译器，真实编译应用入口、UI、天气解析、绘图代码和 Weather Icons 字模，模拟网络与硬件输入。应用场景检查配网、开机 5 秒等待、连接阶梯退避（5/10/20/40/60 秒）、持续失败与恢复、重试次数、首次成功对时、完整帧及旧正文保留。直接解析测试覆盖五天全部日期/高低温、单位与作用域、跨月年/闰年、数组长度、无效数值与截断 JSON；UI 测试检查每列日期、Weather Icons 字形、WMO 映射、图标边界/隔离、高低温/降水概率、未知天气与概率、带伞建议和舍入阈值、雷雨优先级、今日与明日隔离、传感器底栏与预报主体隔离、字模和布局边界。可用 `--only weather`、`--only ui` 或 `--only app` 单独运行一组，生成物均放在系统临时目录。
+主机回归只需要 Python 标准库和本机 C 编译器，但天气解析和应用回归会直接编译 Component Manager 已下载的 cJSON 源码；首次运行前先执行 `idf.py reconfigure` 或 `idf.py build`。测试真实编译应用入口、UI、天气解析、绘图代码和 Weather Icons 字模，模拟网络与硬件输入。应用场景检查配网、开机 5 秒等待、连接阶梯退避（5/10/20/40/60 秒）、持续失败与恢复、重试次数、首次成功对时、完整帧及旧正文保留。直接解析测试覆盖五天全部日期/高低温、单位与作用域、跨月年/闰年、数组长度、无效数值与截断 JSON；UI 测试检查每列日期、Weather Icons 字形、WMO 映射、图标边界/隔离、高低温/降水概率、未知天气与概率、带伞建议和舍入阈值、雷雨优先级、今日与明日隔离、传感器底栏与预报主体隔离、字模和布局边界。可用 `--only weather`、`--only ui` 或 `--only app` 单独运行一组，生成物均放在系统临时目录。
 
 可用 `--baseline` 指定旧 `main/` 的源码目录，对两个版本的请求、时区调用和完整帧缓冲逐字节比较。比较时应保持五日数据契约、界面与字模一致；旧的单日/current 数据结构或旧重试行为不兼容当前回归。直接解析测试只针对当前版本运行。测试不覆盖真实 `net.c` / `net_portal.c` / `portal_web.c` / `portal_dns.c` 的 WiFi、网页、DNS、事件同步及硬件时序，这些仍需真机回归。
 

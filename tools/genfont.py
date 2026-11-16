@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -26,10 +27,15 @@ CJK = screen_chars()
 # name, px, weight, 是否带汉字
 # 12px 的汉字掉笔画看不懂，所以汉字只带在 16px 的 font_mid 里；需要汉字就用 font_mid。
 # 14px 只给五天温度行：`12°-25°` 在 16px 是 53px 放不进 52px 列，14px 是 47px。
+parser = argparse.ArgumentParser(description='Generate the bundled 1bpp text fonts.')
+parser.add_argument('--only', choices=('clock',), help='generate only font_clock.c; no CJK font required')
+args = parser.parse_args()
+
 SPECS = [('font_huge', 46, 'Bold', False),
          ('font_mid', 16, 'Medium', True),
          ('font_temp', 14, 'Medium', False),
-         ('font_small', 12, 'Regular', False)]
+         ('font_small', 12, 'Regular', False),
+         ('font_clock', 12, 'Bold', False)]
 
 
 def load(path, size, weight):
@@ -43,9 +49,13 @@ def load(path, size, weight):
 
 out = ['// Generated from Roboto + Noto Sans SC with PIL; 1bpp glyphs, FreeType mono rasterizer.',
        '#include "fonts_aa.h"', '', '']
-decls, tables = [], []
+outputs = {}
 
 for name, size, weight, cjk in SPECS:
+    if args.only and name != f'font_{args.only}':
+        continue
+    path = 'main/font_clock.c' if name == 'font_clock' else 'main/fonts_aa.c'
+    decls, tables = outputs.setdefault(path, ([], []))
     latin = load(LATIN_TTF, size, weight)
     han = load(CJK_TTF, size, weight) if cjk else None
     cps = list(range(0x20, 0x80))
@@ -83,4 +93,9 @@ for name, size, weight, cjk in SPECS:
     tables.append(f'const aafont {name} = {{{name}_data, {name}_glyphs, {name}_cps, {len(cps)}, {size + 4}}};')
     print(f'{name}: {len(cps)} glyphs, {len(data)} bytes', file=sys.stderr)
 
-open('main/fonts_aa.c', 'w').write('\n'.join(out + decls + [''] + tables + ['']))
+for path, (decls, tables) in outputs.items():
+    header = out if path == 'main/fonts_aa.c' else [
+        '// Generated from Roboto Variable Bold with PIL; 1bpp glyphs, FreeType mono rasterizer.',
+        '#include "fonts_aa.h"', '', '']
+    with open(path, 'w', encoding='utf-8') as output:
+        output.write('\n'.join(header + decls + [''] + tables + ['']))

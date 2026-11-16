@@ -110,20 +110,13 @@ static const char *today_hint(const weather_t *w)
     if (probability < 0) {
         return "预报待更新";
     }
-    // The daily maximum is an all-day precaution, not a current-rain observation.
     weather_icon_t icon = icon_for_code(w->days[0].code);
     switch (icon) {
     case ICON_THUNDER:
     case ICON_HAIL:
         return "雷雨注意安全";
-    case ICON_DRIZZLE:
-    case ICON_RAIN:
-    case ICON_SNOW:
-    case ICON_SHOWERS:
-    case ICON_SNOW_SHOWERS:
-        return "今日带伞";
     default:
-        if (probability >= 50) {
+        if (probability >= 51) {
             return "今日带伞";
         }
         return icon == ICON_UNKNOWN ? "预报待更新" : "降水概率低";
@@ -222,7 +215,7 @@ static void draw_header(const weather_t *w, const char *label)
     struct tm tm;
     localtime_r(&now, &tm);
     strftime(buf, sizeof(buf), "%H:%M", &tm);
-    epd_text(EPD_W - 8 - epd_text_w(&font_small, buf), 16, &font_small, buf);
+    epd_text(EPD_W - 8 - epd_text_w(&font_clock, buf), 16, &font_clock, buf);
     epd_hline(6, 22, EPD_W - 12, EPD_BLACK);
 }
 
