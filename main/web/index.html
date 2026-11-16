@@ -48,6 +48,39 @@
                     </button>
                 </div>
             </div>
+            <section class="voice" aria-labelledby="voice-title">
+                <h2 id="voice-title">小智语音</h2>
+                <div class="f">
+                    <label for="voice-mode">语音服务</label>
+                    <div class="sel">
+                        <select name="voice_mode" id="voice-mode" aria-describedby="voice-mode-help">
+                            <option value="official" {{VOICE_OFFICIAL_SELECTED}}>官方服务</option>
+                            <option value="custom" {{VOICE_CUSTOM_SELECTED}}>自建服务</option>
+                        </select>
+                    </div>
+                    <p class="hint" id="voice-mode-help">选择官方服务时，自建地址不生效。</p>
+                </div>
+                <fieldset id="voice-custom">
+                    <legend>自建服务地址</legend>
+                    <div class="f">
+                        <label for="voice-url">服务信息地址（OTA）</label>
+                        <input type="url" name="voice_url" id="voice-url" maxlength="255" value="{{VOICE_URL}}" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-url-help voice-host-help">
+                        <p class="hint" id="voice-url-help">全模块服务使用：
+                            <code>http://PC局域网IP:8002/xiaozhi/ota/</code>
+                            仅语音服务将端口改为 8003。
+                        </p>
+                    </div>
+                    <div class="f">
+                        <label for="voice-ws">WebSocket 地址（可选）</label>
+                        <input type="url" name="voice_ws" id="voice-ws" maxlength="255" value="{{VOICE_WS}}" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-ws-help voice-host-help">
+                        <p class="hint" id="voice-ws-help">留空时自动使用服务端下发的地址。手动填写示例：
+                            <code>ws://PC局域网IP:8000/xiaozhi/v1/</code>
+                        </p>
+                    </div>
+                    <p class="hint" id="voice-host-help">请将 PC局域网IP 换成运行服务的电脑的局域网 IP，设备不能填写 localhost。</p>
+                    <p class="hint">激活码仍从串口查看，请在自建服务控制台绑定设备。</p>
+                </fieldset>
+            </section>
             <button class="send" type="submit">保存并连接</button>
         </form>
         <script>{{SCRIPT}}</script>

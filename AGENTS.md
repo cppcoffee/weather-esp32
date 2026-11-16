@@ -4,7 +4,7 @@
 
 ESP32-S3 + 2.9" SSD1680 墨水屏天气面板，ESP-IDF/C。源码 `main/`，主机回归 `tools/`。两个页面：按天（5 列）和按小时（10 列，每小时一列），按键切换。接口获取 5 天 + 21 条逐时数据；逐时页只显示前 10 条，不要把请求条数和显示列数混用。
 
-产品同时要支持**小智 AI 语音对话**：语音问答时间、天气和温湿度，墨水屏作为常显与语音状态的反馈面。语音对话仅由 WakeNet 检测「你好小智」触发。协议层用乐鑫的 `espressif/esp_xiaozhi` 组件。接线和运行前置条件见「语音对话（小智 AI）」。屏上激活码、对话状态和时间天气 MCP 工具仍待接入。
+产品同时要支持**小智 AI 语音对话**：语音问答时间、天气和温湿度，墨水屏作为常显与语音状态的反馈面。语音对话仅由 WakeNet 检测「小鹿小鹿」触发。协议层用乐鑫的 `espressif/esp_xiaozhi` 组件，支持通过 SETUP-WIFI 选择官方或自建信息接口。接线和运行前置条件见「语音对话（小智 AI）」。屏上激活码、对话状态和时间天气 MCP 工具仍待接入。
 
 本文描述当前实现；修改行为时同步更新相关测试与说明。`README.md`、`ABLATION.md` 中部分内容是历史记录，尤其是“不保留旧天气快照”和“切页强制全刷”，不能直接当作当前约束。
 
@@ -15,7 +15,7 @@ ESP32-S3 + 2.9" SSD1680 墨水屏天气面板，ESP-IDF/C。源码 `main/`，主
 - 不要自行实现通用 DNS 协议、报文编解码、查询解析或网络基础设施；优先复用 ESP-IDF/lwIP、Component Manager 组件或成熟库。`portal_dns` 只有在现有 API 无法覆盖配网热点的设备特定强制解析行为时，才允许保留最小适配代码。
 - 自己实现的代码只负责业务规则、设备特定适配和库无法覆盖的边界；天气字段范围、日期连续性、刷新策略等业务校验仍由项目维护。若自动管理的组件缺少项目需要的严格校验，应在业务层补充最小必要规则，不修改下载目录中的第三方源码。
 - 准备新增通用工具前，先检查 ESP-IDF 内置组件、Component Manager 注册表和现有依赖。只有在没有合适组件，或组件的资源、许可证、平台兼容性不满足要求时，才在 `components/` 中实现最小必要本地组件；使用修改版第三方代码时记录上游版本、修改原因、许可证和测试范围。
-- 新增或调整依赖时同步更新 `idf_component.yml`、`dependencies.lock`、`CMakeLists.txt`、主机回归 harness、许可证和相关说明；固件与主机测试应尽量共用组件管理器下载的同一份源码。
+- 新增或调整依赖时同步更新 `idf_component.yml`、`dependencies.lock`、`CMakeLists.txt`、主机回归 harness、许可证和相关说明；固件与主机测试应尽量共用组件管理器下载的同一份源码。当前 `components/esp_xiaozhi/` 是基于上游 0.1.4 的单份本地修改版，Component Manager 使用 `override_path`；不要同时保留或修改 `managed_components/espressif__esp_xiaozhi/`。
 
 ## 常用命令
 
@@ -143,9 +143,10 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 | `main/net.c` / `.h` | NVS 凭据、STA 连接、SNTP/时区、HTTP(S) GET |
 | `main/audio.c` / `.h` | ES8311 + NS415B 的 I²C/I²S 初始化与 `audio_read`/`audio_write`/`audio_set_mute` 原语；上电静音 |
 | `main/voice.c` / `.h` | WakeNet 本地唤醒、`esp_xiaozhi` 会话、Opus 编解码；采集与会话分别运行在独立任务 |
+| `main/voice_settings.c` / `.h` | 小智官方/自建模式、信息地址和可选 WebSocket 地址的 NVS 保存及 URL 校验 |
 | `main/voice_audio.c` / `.h` | 纯函数：交错立体声→左声道单声道、单声道→立体声；不含 SDK 依赖，主机可测 |
 | `main/net_portal.c` | SoftAP 配网生命周期：AP/IP、WiFi 模式、DNS/网页服务启停 |
-| `main/portal_web.c` / `.h` | 网页配网：热点扫描、模板渲染、`/save` 保存与凭据事件 |
+| `main/portal_web.c` | 网页配网：热点扫描、模板渲染、WiFi 与小智服务设置 `/save` 保存与凭据事件 |
 | `components/dns_server/` | 复用 ESP-IDF captive portal 示例的 DNS server 组件 |
 | `main/portal_dns.c` / `.h` | 配网 DNS 的设备特定启动配置；协议处理由 `dns_server` 组件负责 |
 | `main/web/` | 独立维护配网页 HTML 模板、CSS、JS；编译时嵌入，响应时内联 |
@@ -154,6 +155,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 | `tools/preview_ui.py` | 用真实 UI/驱动渲染按天、逐时页 PNG，并检查布局与像素 |
 | `tools/genicons.swift` | 从固定 Weather Icons TTF 生成两套 1bpp 图标字模；字体文件不进仓库 |
 | `tools/test_portal.py` | 编译真实配网页渲染函数，stub 扫描和 HTTP；检查模板、转义与发送失败 |
+| `tools/test_voice_settings.py` | 编译真实语音设置/URL 校验，使用 ESP-IDF `http_parser` 和 stub NVS 回归 |
 | `tools/genfont.py` | 用 Pillow + TTF 生成文字字模；`--only clock` 只生成 `main/font_clock.c`，字体文件不进仓库 |
 
 保留 ESP-IDF 的 `main/` 约定，不为分层增加空接口或改成 `src/`。新增 C 源文件需同步 `main/CMakeLists.txt` 及相关主机编译 harness。C 格式遵循 `.clang-format`（4 空格、120 列、函数左花括号换行）；不要为局部修改重排整个字模文件。
@@ -187,18 +189,18 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 
 ## 语音对话（小智 AI）
 
-- 协议用 `espressif/esp_xiaozhi`（组件管理器，0.1.x，依赖 `esp_websocket_client`、`mcp-c-sdk`）连 xiaozhi.me；示例 `ai/xiaozhi_chat`，API 文档见 <https://docs.espressif.com/projects/esp-iot-solution/zh_CN/latest/ai/xiaozhi.html>。**不要在本项目重新实现 WebSocket、MQTT+UDP、hello/认证或 MCP**。
+- 协议用 `espressif/esp_xiaozhi`（上游 0.1.4 的本地 override，依赖 `esp_websocket_client`、`mcp-c-sdk`）连接官方或自建 Xiaozhi 服务；示例 `ai/xiaozhi_chat`，API 文档见 <https://docs.espressif.com/projects/esp-iot-solution/zh_CN/latest/ai/xiaozhi.html>。本地修改只增加带运行时 URL 的 info 请求入口；**不要在本项目重新实现 WebSocket、MQTT+UDP、hello/认证或 MCP**。来源、Apache-2.0 许可证和修改范围见 `components/esp_xiaozhi/LOCAL_PATCH.md`。
 - 典型顺序：`esp_xiaozhi_chat_init`（传音频/事件回调）→ `esp_xiaozhi_chat_get_info`（POST 板卡信息拿激活码，把 MQTT/WS 配置写 NVS）→ `chat_start` → `chat_open_audio_channel`（不发 message 时自动生成 hello）→ `chat_send_audio_data` 推二进制音频帧 → `chat_stop` / `chat_deinit`。事件回调只报协议事实（TTS 起停、识别文本、emoji、system cmd），设备状态机、UI、执行命令由应用决定。
-- 编解码用 `esphome/micro-opus`。本地检测使用 `espressif/esp-sr` 2.4.7 的 `wn9_nihaoxiaozhi_tts`。构建把模型打包到 `model` 分区，首次烧录要包含模型分区。依赖和许可由 ESP-IDF 组件管理器维护，见 ESP-SR 组件的 `LICENSE`。
+- 编解码用 `esphome/micro-opus`。本地检测使用 `espressif/esp-sr` 2.4.7 的 `wn9_xiaoluxiaolu_tts2`（「小鹿小鹿」）。构建把模型打包到 `model` 分区，首次烧录要包含模型分区。依赖和许可由 ESP-IDF 组件管理器维护，见 ESP-SR 组件的 `LICENSE`。
 - `voice_init()` 加载模型并创建音频任务。联网后获取小智配置并初始化会话，首次激活码输出到串口。唤醒前仅在本地检测。命中后采集任务缓存单声道问句，供会话任务打开音频通道后用 60 ms Opus 帧上传。收到 TTS 开始或到达录音时限后停止上传；会话任务从队列解码播放，播放完成后恢复检测。
 - 音频契约：hello 默认 `opus` / 16000 Hz / 1 声道 / 60 ms 帧。`main/audio.c` 现状是 16 kHz、16 bit、**双声道**（左声道为麦克风），需要在音频任务里做单声道转换和 60 ms 分帧；不要把双声道数据直接当单声道推给服务端。
 - 音频接线以 `main/audio.h` 顶部 `#define` 为真值，改线只改那一处；下表供阅读，不是第二份配置：
 
 | 信号 | GPIO | 说明 |
 | --- | --- | --- |
-| NS415B EN（功放） | 35 | 高电平使能，由 ES8311 驱动 `pa_pin` 控制 |
-| I²S DOUT | 36 | ESP32 → ES8311 DIN/SDIN |
-| I²S WS | 37 | LRCK / WS |
+| NS415B EN（功放） | 2 | 高电平使能，由 ES8311 驱动 `pa_pin` 控制 |
+| I²S DOUT | 47 | ESP32 → ES8311 DIN/SDIN |
+| I²S WS | 48 | LRCK / WS |
 | I²S DIN | 38 | ES8311 DOUT → ESP32（麦克风输入） |
 | I²S BCLK | 39 | BCLK |
 | I²S MCLK | 40 | 按接线名为 MCN |
@@ -206,7 +208,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 | I²C SDA | 42 | ES8311 控制数据（接线名为 SCA） |
 
 - 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，16 kHz / 16 bit / **双声道交错**，`MCLK_MULTIPLE_384`（ES8311 支持的整数时钟关系）。默认音量 60（0..100）、麦克风增益 18 dB；`audio_init()` 后功放**保持静音**，要播放先 `audio_set_mute(false)`。不要在 `audio.c` 之外自己启 I²S/I²C，也不要把双声道当成单声道。
-- 当前板卡 ESP32-S3-WROOM-1-N16R8 使用 Octal PSRAM，占用 GPIO33–37。现有功放 EN、I²S DOUT、WS 接在 GPIO35–37，须确认移线并更新 `main/audio.h` 后才能启用 `CONFIG_SPIRAM` 和 `CONFIG_SPIRAM_MODE_OCT`。固件在没有可用 PSRAM 时跳过唤醒初始化。
+- 当前板卡 ESP32-S3-WROOM-1-N16R8 使用 8 MB Octal PSRAM，占用 GPIO33–37。音频已迁移为功放 EN=`GPIO2`、I²S DOUT=`GPIO47`、WS=`GPIO48`，其余 I²S/I²C 保持 GPIO38–42；GPIO47/48 在模块引脚区域相邻，适合缩短 PCB 走线。GPIO43/44 留作外接 UART，GPIO19/20 保留 USB-JTAG。`sdkconfig.defaults` 已启用 `CONFIG_SPIRAM`、`CONFIG_SPIRAM_MODE_OCT` 和 80 MHz PSRAM；刷板前必须核对 PCB 实际连线。固件在没有可用 PSRAM 时跳过唤醒初始化。
 - 栈与任务：语音跑独立任务，不要挤主任务（10 KB 栈已只为同步 HTTPS 留出）；若 keystore 的 NVS 操作在 PSRAM 栈上出问题，用 `esp_xiaozhi_nvs_ops_register` 把 NVS 转到 SRAM 任务。
 - 隐私边界：接上后麦克风音频和识别结果会上传到 xiaozhi.me，属于联网上传，不可写成“本地处理”。只在唤醒或明确触发后开麦，空闲时保持 `audio_set_mute` 静音、不发送音频。
 - 与天气的关系：语音问答读取已有的 `app->shown` 快照和 `sensor_reading_t`，作为 MCP 工具或本地意图回答；不要为一次问答重跑 `weather_update()`，也不要绕过“失败保留旧快照”的语义。
@@ -220,7 +222,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - `portal_dns` 使用 ESP-IDF captive portal 示例的 `dns_server` 组件，将配网热点的所有 A 查询指向 `WIFI_AP_DEF` 地址；HTTP 重定向辅助触发系统配网页，不保证所有系统必弹窗。真实 WiFi、DNS、网页和 TLS 行为需真机验证。
 - 页面源文件在 `main/web/`：`index.html` 为配网页，`result.html` 为保存结果页，`style.css`、`app.js` 为样式与交互。通过 `main/CMakeLists.txt` 的 `EMBED_TXTFILES` 嵌入固件，无需文件系统、npm 或 CDN；改资源后需重新构建、烧录。
 - `portal_web.c` 的 `send_page()` 分块发送模板并替换 `{{TOKEN}}`，CSS/JS 在响应中内联，不另开静态资源路由。结果页必须自包含：保存后热点即将关闭，不能依赖后续请求加载样式。
-- 保留服务端同步扫描、刷新页面重新扫描及 `POST /save` 普通表单；字段 `ssid` / `ssid2` / `pass`，手填 `ssid2` 优先。此次提取不改变扫描阻塞、凭据保存或配网生命周期。
+- 保留服务端同步扫描、刷新页面重新扫描及 `POST /save` 普通表单；WiFi 字段为 `ssid` / `ssid2` / `pass`，手填 `ssid2` 优先；小智字段为 `voice_mode` / `voice_url` / `voice_ws`。服务设置与 WiFi 凭据在同一 `wifi` NVS 事务中保存，长按重配网只清 WiFi 凭据并保留服务设置。
 - 模板替换不自动转义，也不递归解析插入值。SSID 先经 `html_escape()` 再生成选项；结果页标题/消息仅传应用自己的固定文案，不直接传用户输入。新增 token 同步修改替换表及主机测试。
 - 改页面、模板发送或资源嵌入后运行 `python3 tools/test_portal.py` 和 ESP-IDF 构建。主机测试检查真实渲染函数、最大热点列表、特殊字符、空替换及发送错误；不执行 JS、不验证真实 HTTP 服务、WiFi/NVS、手机配网窗口或浏览器视觉效果。
 

@@ -21,9 +21,9 @@ ESP32-S3 + GYSDISPLAY 2.9" 墨水屏（物理 296×128，面板 RAM 128×296，S
 
 | 音频信号 | ESP32-S3 | 说明 |
 |------|----------|------|
-| NS415B EN | GPIO35 | 高电平使能功放，由 ES8311 驱动控制 |
-| ES8311 DO | GPIO36 | ESP32 → ES8311 DIN/SDIN（I²S 数据输出） |
-| ES8311 WS | GPIO37 | LRCK / WS |
+| NS415B EN | GPIO2 | 高电平使能功放，由 ES8311 驱动控制 |
+| ES8311 DO | GPIO47 | ESP32 → ES8311 DIN/SDIN（I²S 数据输出） |
+| ES8311 WS | GPIO48 | LRCK / WS |
 | ES8311 DI | GPIO38 | ES8311 DOUT/SDOUT → ESP32（麦克风输入） |
 | ES8311 BCK | GPIO39 | BCLK |
 | ES8311 MCN | GPIO40 | 按接线名称理解为 MCLK |
@@ -33,11 +33,47 @@ ESP32-S3 + GYSDISPLAY 2.9" 墨水屏（物理 296×128，面板 RAM 128×296，S
 | 音频 GND | GND | 必须与 ESP32-S3 共地 |
 ### 小智 AI 语音唤醒
 
-启用语音后，说「你好小智」触发一轮对话。固件通过 ESP-SR WakeNet 在本地识别唤醒词，命中后才向小智服务上传问句。首次激活码目前显示在串口日志。按键用于短按切页和长按 3 秒重新配网。
+启用语音后，说「小鹿小鹿」触发一轮对话。固件通过 ESP-SR WakeNet 在本地识别唤醒词，命中后才向小智服务上传问句。首次激活码目前显示在串口日志。按键用于短按切页和长按 3 秒重新配网。
 
-ESP32-S3-WROOM-1-N16R8 的 8 MB Octal PSRAM 占用 GPIO35–37。上表的功放 EN、ES8311 DIN/SDIN 和 WS 接线需要避开这些引脚。确认实际接线后更新 `main/audio.h`，再启用 Octal PSRAM。当前默认配置尚未启用 PSRAM，语音任务会在启动时报告该状态。
+ESP32-S3-WROOM-1-N16R8 的 8 MB Octal PSRAM 使用 GPIO33–37。音频已移到 `GPIO2`、`GPIO47` 和 `GPIO48`；其中 I²S 的两根迁移线在模块引脚区域相邻，便于 PCB 布线。GPIO43/44 继续留给外接 UART 调试，GPIO19/20 保留 USB-JTAG。默认配置已启用 Octal PSRAM（80 MHz），首次启用前仍需确认 PCB 实际连线与模块型号一致。
 
 `idf.py build` 生成应用和 WakeNet 模型镜像。首次烧录用 `idf.py -p 实际串口 flash` 写入 `model` 分区。屏上对话状态和时间天气 MCP 工具仍待接入。
+
+### 使用小智 AI
+
+1. 确认音频硬件按上面的接线表连接，尤其是 ES8311 麦克风输入、NS415B 功放和 `GPIO2`/`GPIO47`/`GPIO48`。Octal PSRAM 必须可用，WakeNet 模型必须写入 `model` 分区。
+2. 编译并完整烧录固件。烧录时使用实际串口，`flash` 会同时写入应用、分区表、bootloader 和 WakeNet 模型：
+
+   ```bash
+   idf.py build
+   idf.py -p 实际串口 flash
+   idf.py -p 实际串口 monitor
+   ```
+
+   也可以使用 USB Serial/JTAG 观察日志；不要用脚本反复读取 `/dev/cu.usbmodem*`，它可能在打开端口时复位设备。需要稳定的串口日志时，可使用 GPIO43/44 外接 USB-TTL。
+3. 首次启动时连接设备热点 `weather-XXXXXX`，打开 `192.168.1.1`，保存 WiFi。设备先完成第一次天气请求，随后才启动小智会话配置。
+4. 在串口日志中等待类似下面的内容：
+
+   ```text
+   activation code: ...... ...
+   chat ready
+   ```
+
+   按 `activation message` 的提示登录小智官方服务，在 xiaozhi.me 完成设备激活并输入日志中的激活码。激活码目前只打印在串口，不显示在墨水屏。激活后设备会自动重试获取会话配置，通常等待下一次重试即可；也可以重启设备。
+5. 当日志显示 `chat ready` 后，在设备附近说 **“小鹿小鹿”**。本地 WakeNet 检测到唤醒词后，设备会打开麦克风，把单声道 Opus 音频上传给小智；听到回答后通过 ES8311 和 NS415B 播放。自建服务时，服务端 `wakeup_words` 也要包含 `小鹿小鹿`。
+6. 每次唤醒对应一轮问答。当前单轮最多录音 15 秒；收到回答后自动停止播放并恢复等待下一次“小鹿小鹿”。空闲时不会上传麦克风音频。
+
+常见日志含义：
+
+- `voice unavailable`：语音任务没有启动，先检查 ES8311 初始化、PSRAM 和 `model` 分区。
+- `WakeNet requires PSRAM`：固件没有检测到可用 PSRAM，确认 `CONFIG_SPIRAM`、`CONFIG_SPIRAM_MODE_OCT` 和模块型号/焊接。
+- `server config unavailable`：设备还没有完成小智激活，或当前网络无法访问服务；激活后等待约 30 秒重试。
+- `wake word detected`：本地已经检测到“小鹿小鹿”，随后应看到 `listening`。
+- `user:` / `bot:`：串口收到识别文本或回答文本。
+
+当前版本的语音状态和激活码没有显示在墨水屏上；设备端 MCP 目前也没有注册天气、时间和现场温湿度工具，因此小智不能读取本项目的本地天气快照或传感器数据。短按按键仍然切换天气页面，长按 3 秒会清除 WiFi 凭据并进入配网，这会中断语音会话。
+
+在 PC 自建管理控制台和语音服务，见 [本地小智部署指南](LOCAL_XIAOZHI.md)，包含 Apple Silicon 镜像构建、服务配置、设备绑定和本固件的兼容性边界。使用本地服务时，直接在 `SETUP-WIFI` 页面选择“自建服务”并填写信息地址；不需要重新编译固件。
 
 
 改引脚只动 `main/epd.h` 顶部的 `#define`。
@@ -135,7 +171,7 @@ python3 tools/preview_ui.py --sanitize
 
 - `managed_components/espressif__cjson/` — 由 ESP-IDF Component Manager 自动下载的 cJSON 组件（1.7.x）；固件和主机回归共用这份源码。首次运行主机解析回归前，先执行 `idf.py reconfigure` 或 `idf.py build`。
 - `main/main.c` — 应用入口：初始化、配网、取天气、对时和定时刷新，不包含绘图细节。
-- `main/audio.c` / `main/audio.h` — ES8311 + NS415B 音频初始化：GPIO35 功放使能、GPIO36/37/38/39/40 I²S、GPIO41/42 I²C；提供麦克风读取、扬声器播放、音量/增益和静音接口，使用官方 `esp_codec_dev` 组件。
+- `main/audio.c` / `main/audio.h` — ES8311 + NS415B 音频初始化：GPIO2 功放使能、GPIO47/48/38/39/40 I²S、GPIO41/42 I²C；提供麦克风读取、扬声器播放、音量/增益和静音接口，使用官方 `esp_codec_dev` 组件。
 - `main/ui.c` / `main/ui.h` — 以五天天气图标、高低温及降水概率为主体，图标由 Weather Icons 字模按 WMO 码映射，顶部提供今日出行提示，传感器读数/占位放在单行底栏，另含配网和无网络重试提示；重试只覆盖顶部标题栏，保留旧正文。只修改帧缓冲，由入口决定何时刷新墨水屏。
 - `main/net.c` — WiFi 连接、SNTP、时区、HTTP(S) GET（`esp_crt_bundle` 校验证书）。
 - `main/net_portal.c` — SoftAP 配网生命周期：AP/IP 配置、WiFi 模式、DNS/HTTP 服务启停。

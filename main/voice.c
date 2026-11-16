@@ -1,4 +1,5 @@
 #include "voice.h"
+#include "voice_settings.h"
 
 #include <string.h>
 
@@ -16,11 +17,12 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "model_path.h"
+#include "nvs.h"
 #include "opus.h"
 #include "voice_audio.h"
 
 static const char *TAG = "voice";
-static const char *WAKE_WORD = "你好小智";
+static const char *WAKE_WORD = "小鹿小鹿";
 
 #define VOICE_SAMPLE_RATE         16000
 #define VOICE_FRAME_MS            60
@@ -206,18 +208,48 @@ static void close_session(void)
     audio_set_mute(true);
 }
 
+static esp_err_t apply_websocket_override(const voice_settings_t *settings)
+{
+    if (!settings->custom || settings->websocket_url[0] == '\0') {
+        return ESP_OK;
+    }
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("websocket", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_str(handle, "url", settings->websocket_url);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
 static esp_err_t open_session(void)
 {
     esp_xiaozhi_chat_config_t config = ESP_XIAOZHI_CHAT_DEFAULT_CONFIG();
     esp_xiaozhi_chat_info_t info = {0};
-    esp_err_t err = esp_xiaozhi_chat_get_info(&info);
+    voice_settings_t settings = {0};
+    esp_err_t err = voice_settings_load(&settings);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "voice settings unavailable: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = settings.custom ? esp_xiaozhi_chat_get_info_with_url(settings.info_url, &info)
+                          : esp_xiaozhi_chat_get_info(&info);
     if (err == ESP_OK) {
         if (info.activation_code != NULL) {
             ESP_LOGW(TAG, "activation code: %s %s", info.activation_code,
                      info.activation_message ? info.activation_message : "");
         }
-        config.has_mqtt_config = info.has_mqtt_config;
-        config.has_websocket_config = info.has_websocket_config;
+        err = apply_websocket_override(&settings);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "websocket override unavailable: %s", esp_err_to_name(err));
+        }
+        config.has_mqtt_config = settings.custom ? false : info.has_mqtt_config;
+        config.has_websocket_config = settings.custom ? (settings.websocket_url[0] != '\0' || info.has_websocket_config)
+                                                      : info.has_websocket_config;
     }
     esp_xiaozhi_chat_free_info(&info);
     if (err != ESP_OK || (!config.has_mqtt_config && !config.has_websocket_config)) {
@@ -444,7 +476,7 @@ esp_err_t voice_init(void)
     }
     esp_err_t err = ESP_ERR_NOT_FOUND;
     s_models = esp_srmodel_init("model");
-    const char *name = s_models ? esp_srmodel_filter(s_models, "wn9_nihaoxiaozhi_tts", NULL) : NULL;
+    const char *name = s_models ? esp_srmodel_filter(s_models, "wn9_xiaoluxiaolu_tts2", NULL) : NULL;
     s_wakenet = name ? esp_wn_handle_from_name(name) : NULL;
     if (s_wakenet == NULL) {
         goto failed;
@@ -456,8 +488,8 @@ esp_err_t voice_init(void)
     }
     s_wake_samples = s_wakenet->get_samp_chunksize(s_wake_model);
     if (s_wake_samples <= 0 || s_wake_samples > VOICE_FRAME_SAMPLES
-        || s_wakenet->get_samp_rate(s_wake_model) != VOICE_SAMPLE_RATE
-        || s_wakenet->get_channel_num(s_wake_model) != 1) {
+        || s_wakenet->get_samp_rate(s_wake_model) != VOICE_SAMPLE_RATE || s_wakenet->get_channel_num(s_wake_model) != 1)
+    {
         err = ESP_ERR_NOT_SUPPORTED;
         goto failed;
     }
@@ -514,7 +546,7 @@ void voice_net_pause(void)
 {
     if (s_events != NULL) {
         xEventGroupClearBits(s_events, VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_RECEIVING | VOICE_BIT_ARMED
-                            | VOICE_BIT_CAPTURE);
+                                           | VOICE_BIT_CAPTURE);
         xEventGroupSetBits(s_events, VOICE_BIT_RESET);
     }
 }

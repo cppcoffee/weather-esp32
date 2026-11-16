@@ -7,9 +7,11 @@
 
 // ES8311 + NS415B wiring on the ESP32-S3 board.
 // DO/DI use the ESP-IDF I2S convention: DO is ESP32 -> codec, DI is codec -> ESP32.
-#define AUDIO_PA_EN_GPIO    35
-#define AUDIO_I2S_DOUT_GPIO 36
-#define AUDIO_I2S_WS_GPIO   37
+// GPIO33-37 are reserved by the module's octal Flash/PSRAM interface.
+// Keep the moved I2S outputs on adjacent module pins 47/48 for a short PCB route.
+#define AUDIO_PA_EN_GPIO    2
+#define AUDIO_I2S_DOUT_GPIO 47
+#define AUDIO_I2S_WS_GPIO   48
 #define AUDIO_I2S_DIN_GPIO  38
 #define AUDIO_I2S_BCLK_GPIO 39
 #define AUDIO_I2S_MCLK_GPIO 40

@@ -51,11 +51,14 @@ STUBS = r'''
 #define ESP_FAIL -1
 #define SEND_ERROR -73
 #define HTTPD_RESP_USE_STRLEN -1
+#define HTTPD_400_BAD_REQUEST 400
 #define ESP_LOGE(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
 typedef int esp_err_t;
 typedef struct {
     char body[131072];
     size_t used;
+    int content_len;
     const char *status, *type;
     int calls, fail_at, finished;
 } httpd_req_t;
@@ -95,9 +98,32 @@ static esp_err_t httpd_resp_send_500(httpd_req_t *r)
     assert(!"Unexpected HTTP 500");
     return ESP_FAIL;
 }
+static __attribute__((unused)) esp_err_t httpd_resp_send_err(httpd_req_t *r, int error, const char *message)
+{
+    (void)r;
+    (void)error;
+    (void)message;
+    assert(!"Unexpected HTTP error");
+    return ESP_FAIL;
+}
+#define VOICE_URL_CAP 256
 '''
 
 SCAN_STUB = r'''
+typedef struct {
+    unsigned char custom;
+    char info_url[256];
+    char websocket_url[256];
+} voice_settings_t;
+static int voice_settings_load(voice_settings_t *settings)
+{
+    memset(settings, 0, sizeof(*settings));
+    return 0;
+}
+static __attribute__((unused)) int voice_settings_validate(const voice_settings_t *settings)
+{
+    return settings && settings->custom == 0 ? 0 : -1;
+}
 static int input_count;
 static char **input_ssids;
 static int scan_aps(scan_ap_t *out, int max)
@@ -230,7 +256,10 @@ class Page(HTMLParser):
 
 def check_assets(assets):
     expected = {
-        "index.html": {"STYLE", "SCRIPT", "OPTIONS", "COUNT", "AP_URL", "AP_SSID"},
+        "index.html": {
+                "STYLE", "SCRIPT", "OPTIONS", "COUNT", "AP_URL", "AP_SSID",
+                "VOICE_OFFICIAL_SELECTED", "VOICE_CUSTOM_SELECTED", "VOICE_URL", "VOICE_WS",
+            },
         "result.html": {"STYLE", "TITLE", "MESSAGE"},
         "style.css": set(), "app.js": set(),
     }
@@ -262,24 +291,28 @@ def check_root(executable, assets, ap_url, ssids):
     assert len(forms) == 1 and forms[0].get("method", "").lower() == "post"
     assert forms[0].get("action") == "/save"
     fields = {a.get("name"): (tag, a) for tag, a in page.elements if tag in {"input", "select"}}
-    assert set(fields) == {"ssid", "ssid2", "pass"}
+    assert set(fields) == {"ssid", "ssid2", "pass", "voice_mode", "voice_url", "voice_ws"}
     assert fields["ssid"][0] == "select"
-    assert fields["ssid2"][1].get("type") == "text"
-    assert fields["pass"][1].get("type") == "password"
+    assert(fields["ssid2"][1].get("type") == "text")
+    assert(fields["pass"][1].get("type") == "password")
+    assert(fields["voice_mode"][0] == "select")
+    assert(fields["voice_url"][1].get("type") == "url")
+    assert(fields["voice_ws"][1].get("type") == "url")
     assert any(tag == "button" and a.get("type") == "submit" for tag, a in page.elements)
+    wifi_options = [(attrs, text) for attrs, text in page.options if attrs.get("value") not in {"official", "custom"}]
     shown = [ssid for ssid in ssids if ssid != OWN]
     if shown:
-        assert [a.get("value") for a, _ in page.options] == shown
-        assert [text for _, text in page.options] == shown
-        assert [i for i, (a, _) in enumerate(page.options) if "selected" in a] == [0]
-        assert all("disabled" not in a for a, _ in page.options)
+        assert [a.get("value") for a, _ in wifi_options] == shown
+        assert [text for _, text in wifi_options] == shown
+        assert [i for i, (a, _) in enumerate(wifi_options) if "selected" in a] == [0]
+        assert all("disabled" not in a for a, _ in wifi_options)
         for ssid in shown:
             escaped = html.escape(ssid, quote=True).replace("&#x27;", "&#39;")
             assert f'value="{escaped}"' in body
             assert f'>{escaped}</option>' in body
     else:
-        assert len(page.options) == 1
-        attrs, text = page.options[0]
+        assert len(wifi_options) == 1
+        attrs, text = wifi_options[0]
         assert attrs.get("value") == "" and "selected" in attrs and "disabled" in attrs
         assert "没扫到网络" in text
 

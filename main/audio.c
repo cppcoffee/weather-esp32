@@ -5,7 +5,10 @@
 #if CONFIG_SPIRAM_MODE_OCT
 #define PSRAM_PIN_IN_USE(pin) ((pin) >= 33 && (pin) <= 37)
 _Static_assert(!PSRAM_PIN_IN_USE(AUDIO_PA_EN_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2S_DOUT_GPIO)
-               && !PSRAM_PIN_IN_USE(AUDIO_I2S_WS_GPIO), "Move audio wiring off GPIO33-37 before enabling octal PSRAM");
+                   && !PSRAM_PIN_IN_USE(AUDIO_I2S_WS_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2S_DIN_GPIO)
+                   && !PSRAM_PIN_IN_USE(AUDIO_I2S_BCLK_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2S_MCLK_GPIO)
+                   && !PSRAM_PIN_IN_USE(AUDIO_I2C_SCL_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2C_SDA_GPIO),
+               "Audio wiring overlaps GPIO33-37 reserved for octal PSRAM");
 #endif
 
 #include "driver/i2c_master.h"

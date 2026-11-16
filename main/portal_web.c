@@ -1,6 +1,7 @@
 #include "portal_web.h"
 
 #include "net.h"
+#include "voice_settings.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -251,10 +252,26 @@ static esp_err_t root_get(httpd_req_t *req)
     }
 
     char count[12];
+    char escaped_voice_url[VOICE_URL_CAP * 6], escaped_voice_ws[VOICE_URL_CAP * 6];
+    voice_settings_t settings = {0};
+    if (voice_settings_load(&settings) != ESP_OK) {
+        ESP_LOGW(TAG, "invalid saved voice settings; showing official mode");
+        memset(&settings, 0, sizeof(settings));
+    }
+    html_escape(settings.info_url, escaped_voice_url, sizeof(escaped_voice_url));
+    html_escape(settings.websocket_url, escaped_voice_ws, sizeof(escaped_voice_ws));
     snprintf(count, sizeof(count), "%d", n);
     const page_value_t values[] = {
-        {"{{STYLE}}", portal_style}, {"{{SCRIPT}}", portal_script}, {"{{OPTIONS}}", options},
-        {"{{COUNT}}", count},        {"{{AP_URL}}", NET_AP_URL},    {"{{AP_SSID}}", own},
+        {"{{STYLE}}", portal_style},
+        {"{{SCRIPT}}", portal_script},
+        {"{{OPTIONS}}", options},
+        {"{{COUNT}}", count},
+        {"{{AP_URL}}", NET_AP_URL},
+        {"{{AP_SSID}}", own},
+        {"{{VOICE_OFFICIAL_SELECTED}}", settings.custom ? "" : "selected"},
+        {"{{VOICE_CUSTOM_SELECTED}}", settings.custom ? "selected" : ""},
+        {"{{VOICE_URL}}", escaped_voice_url},
+        {"{{VOICE_WS}}", escaped_voice_ws},
     };
     esp_err_t err = send_page(req, portal_index, values, sizeof(values) / sizeof(values[0]));
     free(options);
@@ -277,18 +294,27 @@ static esp_err_t reply(httpd_req_t *req, const char *title, const char *msg, boo
 
 static esp_err_t save_post(httpd_req_t *req)
 {
-    char body[512];
-    int len = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (len <= 0) {
-        return httpd_resp_send_500(req);
+    enum { BODY_CAP = 4096 };
+    char body[BODY_CAP];
+    if (req->content_len <= 0 || req->content_len >= BODY_CAP) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "request body too large");
     }
-    body[len] = 0;
+    int total = 0;
+    while (total < req->content_len) {
+        int received = httpd_req_recv(req, body + total, req->content_len - total);
+        if (received <= 0) {
+            return httpd_resp_send_500(req);
+        }
+        total += received;
+    }
+    body[total] = 0;
 
     // 列表里选的和手动输入的二选一，手填的优先。
-    char ssid[33], manual[33], pass[65];
+    char ssid[33], manual[33], pass[65], mode[12];
     form_field(body, "ssid", ssid, sizeof(ssid));
     form_field(body, "ssid2", manual, sizeof(manual));
     form_field(body, "pass", pass, sizeof(pass));
+    form_field(body, "voice_mode", mode, sizeof(mode));
     if (manual[0]) {
         memcpy(ssid, manual, sizeof(ssid));
     }
@@ -300,10 +326,32 @@ static esp_err_t save_post(httpd_req_t *req)
     if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) {
         return httpd_resp_send_500(req);
     }
-    nvs_set_str(h, "ssid", ssid);
-    nvs_set_str(h, "pass", pass);
-    nvs_commit(h);
+    voice_settings_t settings = {0};
+    if (!strcmp(mode, "custom")) {
+        settings.custom = 1;
+        form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
+        form_field(body, "voice_ws", settings.websocket_url, sizeof(settings.websocket_url));
+    }
+    esp_err_t voice_err = voice_settings_validate(&settings);
+    if (voice_err != ESP_OK) {
+        nvs_close(h);
+        return reply(req, "语音地址无效", "请检查自建服务的信息地址和 WebSocket 地址。", false);
+    }
+    esp_err_t err = nvs_set_str(h, "ssid", ssid);
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "pass", pass);
+    }
+    if (err == ESP_OK) {
+        err = voice_settings_store(h, &settings);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
     nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to save portal settings: %s", esp_err_to_name(err));
+        return httpd_resp_send_500(req);
+    }
 
     ESP_LOGI(TAG, "stored credentials for %s", ssid);
     reply(req, "正在连接", "保存好了，屏幕稍后显示天气。", true);

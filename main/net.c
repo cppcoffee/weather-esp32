@@ -54,7 +54,14 @@ void net_forget_creds(void)
         ESP_LOGW(TAG, "no stored credentials to erase");
         return;
     }
-    nvs_erase_all(h);
+    esp_err_t ssid_err = nvs_erase_key(h, "ssid");
+    esp_err_t pass_err = nvs_erase_key(h, "pass");
+    if ((ssid_err != ESP_OK && ssid_err != ESP_ERR_NVS_NOT_FOUND)
+        || (pass_err != ESP_OK && pass_err != ESP_ERR_NVS_NOT_FOUND))
+    {
+        ESP_LOGW(TAG, "failed to erase WiFi credentials: %s / %s", esp_err_to_name(ssid_err),
+                 esp_err_to_name(pass_err));
+    }
     nvs_commit(h);
     nvs_close(h);
     ESP_LOGW(TAG, "stored credentials erased");
