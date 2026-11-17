@@ -131,8 +131,6 @@ details .f { margin: .9rem 0 0; }
     font: 600 20px/1.3 'Songti SC', 'Noto Serif CJK SC', Georgia, serif;
     margin: 0 0 1rem;
 }
-#voice-custom { min-width: 0; margin: 0; padding: 0; border: 0; }
-#voice-custom legend { padding: 0; margin-bottom: .8rem; font-size: 14px; color: var(--dim); }
 .hint { margin: .5rem 0 0; font-size: 13px; color: var(--dim); }
 .hint code {
     display: block;

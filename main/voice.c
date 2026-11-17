@@ -210,7 +210,7 @@ static void close_session(void)
 
 static esp_err_t apply_websocket_override(const voice_settings_t *settings)
 {
-    if (!settings->custom || settings->websocket_url[0] == '\0') {
+    if (settings->websocket_url[0] == '\0') {
         return ESP_OK;
     }
     nvs_handle_t handle;
@@ -236,8 +236,12 @@ static esp_err_t open_session(void)
         ESP_LOGW(TAG, "voice settings unavailable: %s", esp_err_to_name(err));
         return err;
     }
-    err = settings.custom ? esp_xiaozhi_chat_get_info_with_url(settings.info_url, &info)
-                          : esp_xiaozhi_chat_get_info(&info);
+    if (settings.info_url[0] == '\0') {
+        // 没有编译期默认地址：配网页未填写就不去连任何服务
+        ESP_LOGW(TAG, "service info URL not configured; open the setup page and fill it in");
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = esp_xiaozhi_chat_get_info_with_url(settings.info_url, &info);
     if (err == ESP_OK) {
         if (info.activation_code != NULL) {
             ESP_LOGW(TAG, "activation code: %s %s", info.activation_code,
@@ -247,13 +251,13 @@ static esp_err_t open_session(void)
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "websocket override unavailable: %s", esp_err_to_name(err));
         }
-        config.has_mqtt_config = settings.custom ? false : info.has_mqtt_config;
-        config.has_websocket_config = settings.custom ? (settings.websocket_url[0] != '\0' || info.has_websocket_config)
-                                                      : info.has_websocket_config;
+        // 只走 WebSocket：可选地址覆盖服务端下发的地址
+        config.has_mqtt_config = false;
+        config.has_websocket_config = settings.websocket_url[0] != '\0' || info.has_websocket_config;
     }
     esp_xiaozhi_chat_free_info(&info);
-    if (err != ESP_OK || (!config.has_mqtt_config && !config.has_websocket_config)) {
-        ESP_LOGW(TAG, "server config unavailable: %s; retry after activation/network recovery", esp_err_to_name(err));
+    if (err != ESP_OK || !config.has_websocket_config) {
+        ESP_LOGW(TAG, "server config unavailable: %s; retry after network recovery", esp_err_to_name(err));
         return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
     }
 

@@ -137,7 +137,7 @@ docker compose -f docker-compose_all.yml -f docker-compose.local.yml logs --tail
 
 ## 6. 让本项目固件连接 PC
 
-不需要重新编译来切换服务地址。烧录当前固件后，设备进入 `SETUP-WIFI` 页面，在“小智语音”中选择“官方服务”或“自建服务”。选择自建服务时填写：
+不需要重新编译来切换服务地址。烧录当前固件后，设备进入 `SETUP-WIFI` 页面，在“小智语音”里填写服务信息地址（必填，固件没有内置默认值）：
 
 - 全模块服务的信息地址：`http://PC局域网IP:8002/xiaozhi/ota/`
 - 仅语音 Server 的信息地址：`http://PC局域网IP:8003/xiaozhi/ota/`
@@ -145,7 +145,7 @@ docker compose -f docker-compose_all.yml -f docker-compose.local.yml logs --tail
 
 WebSocket 留空时，设备使用信息接口返回的地址；设备不会把模型 API Key 或 `server.secret` 保存到 NVS。设备不能填写 `localhost`，必须填写 PC 在家庭局域网中的地址。
 
-官方服务模式仍使用编译时的 `CONFIG_XIAOZHI_OTA_URL` 默认值。项目自身用 SNTP 和 `TZ` 管理时间，组件的 `XIAOZHI_SYNC_SYSTEM_TIME_FROM_SERVER` 保持默认也不会改变天气页面的时区设置；如果需要让项目 SNTP 作为唯一时间源，可以在 `menuconfig` 中关闭它。然后完整构建、烧录一次即可：
+固件只用配网页保存的地址，编译期 `CONFIG_XIAOZHI_OTA_URL` 已置空，`esp_xiaozhi_chat_get_info()` 不再提供默认服务器。项目自身用 SNTP 和 `TZ` 管理时间，组件的 `XIAOZHI_SYNC_SYSTEM_TIME_FROM_SERVER` 保持默认也不会改变天气页面的时区设置；如果需要让项目 SNTP 作为唯一时间源，可以在 `menuconfig` 中关闭它。然后完整构建、烧录一次即可：
 
 ```bash
 idf.py build
@@ -153,7 +153,7 @@ idf.py -p 实际串口 flash
 idf.py -p 实际串口 monitor
 ```
 
-当前固件通过信息接口获取激活信息和协议配置；自建模式下会使用配网页保存的信息地址，并强制选择 WebSocket。可选 WebSocket 地址会覆盖服务端下发的地址，令牌和协议版本仍由信息接口保存/下发。若使用本指南的 WebSocket 部署，不要在控制台配置 MQTT 网关。
+当前固件通过信息接口获取激活信息和协议配置；信息地址取自配网页，未配置时不会发起请求，并只走 WebSocket。可选 WebSocket 地址会覆盖服务端下发的地址，令牌和协议版本仍由信息接口保存/下发。若使用本指南的 WebSocket 部署，不要在控制台配置 MQTT 网关。
 
 ## 7. 绑定设备和验证问答
 

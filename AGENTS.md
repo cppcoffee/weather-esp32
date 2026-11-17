@@ -4,7 +4,7 @@
 
 ESP32-S3 + 2.9" SSD1680 墨水屏天气面板，ESP-IDF/C。源码 `main/`，主机回归 `tools/`。两个页面：按天（5 列）和按小时（10 列，每小时一列），按键切换。接口获取 5 天 + 21 条逐时数据；逐时页只显示前 10 条，不要把请求条数和显示列数混用。
 
-产品同时要支持**小智 AI 语音对话**：语音问答时间、天气和温湿度，墨水屏作为常显与语音状态的反馈面。语音对话仅由 WakeNet 检测「小鹿小鹿」触发。协议层用乐鑫的 `espressif/esp_xiaozhi` 组件，支持通过 SETUP-WIFI 选择官方或自建信息接口。接线和运行前置条件见「语音对话（小智 AI）」。屏上激活码、对话状态和时间天气 MCP 工具仍待接入。
+产品同时要支持**小智 AI 语音对话**：语音问答时间、天气和温湿度，墨水屏作为常显与语音状态的反馈面。语音对话仅由 WakeNet 检测「小鹿小鹿」触发。协议层用乐鑫的 `espressif/esp_xiaozhi` 组件，服务信息地址（OTA）由 SETUP-WIFI 页面逐台填写，固件没有内置默认服务器。接线和运行前置条件见「语音对话（小智 AI）」。屏上激活码、对话状态和时间天气 MCP 工具仍待接入。
 
 本文描述当前实现；修改行为时同步更新相关测试与说明。`README.md`、`ABLATION.md` 中部分内容是历史记录，尤其是“不保留旧天气快照”和“切页强制全刷”，不能直接当作当前约束。
 
@@ -222,7 +222,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - `portal_dns` 使用 ESP-IDF captive portal 示例的 `dns_server` 组件，将配网热点的所有 A 查询指向 `WIFI_AP_DEF` 地址；HTTP 重定向辅助触发系统配网页，不保证所有系统必弹窗。真实 WiFi、DNS、网页和 TLS 行为需真机验证。
 - 页面源文件在 `main/web/`：`index.html` 为配网页，`result.html` 为保存结果页，`style.css`、`app.js` 为样式与交互。通过 `main/CMakeLists.txt` 的 `EMBED_TXTFILES` 嵌入固件，无需文件系统、npm 或 CDN；改资源后需重新构建、烧录。
 - `portal_web.c` 的 `send_page()` 分块发送模板并替换 `{{TOKEN}}`，CSS/JS 在响应中内联，不另开静态资源路由。结果页必须自包含：保存后热点即将关闭，不能依赖后续请求加载样式。
-- 保留服务端同步扫描、刷新页面重新扫描及 `POST /save` 普通表单；WiFi 字段为 `ssid` / `ssid2` / `pass`，手填 `ssid2` 优先；小智字段为 `voice_mode` / `voice_url` / `voice_ws`。服务设置与 WiFi 凭据在同一 `wifi` NVS 事务中保存，长按重配网只清 WiFi 凭据并保留服务设置。
+- 保留服务端同步扫描、刷新页面重新扫描及 `POST /save` 普通表单；WiFi 字段为 `ssid` / `ssid2` / `pass`，手填 `ssid2` 优先；小智字段为 `voice_url`（必填） / `voice_ws`（可选）。服务设置与 WiFi 凭据在同一 `wifi` NVS 事务中保存，长按重配网只清 WiFi 凭据并保留服务设置。
 - 模板替换不自动转义，也不递归解析插入值。SSID 先经 `html_escape()` 再生成选项；结果页标题/消息仅传应用自己的固定文案，不直接传用户输入。新增 token 同步修改替换表及主机测试。
 - 改页面、模板发送或资源嵌入后运行 `python3 tools/test_portal.py` 和 ESP-IDF 构建。主机测试检查真实渲染函数、最大热点列表、特殊字符、空替换及发送错误；不执行 JS、不验证真实 HTTP 服务、WiFi/NVS、手机配网窗口或浏览器视觉效果。
 

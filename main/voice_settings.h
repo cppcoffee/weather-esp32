@@ -8,16 +8,15 @@
 
 #define VOICE_URL_CAP            256
 #define VOICE_SETTINGS_NAMESPACE "wifi"
-#define VOICE_SETTINGS_KEY       "voice_v1"
+#define VOICE_SETTINGS_KEY       "voice_v2"
 
 typedef struct {
-    uint8_t custom;
     char info_url[VOICE_URL_CAP];
     char websocket_url[VOICE_URL_CAP];
 } voice_settings_t;
 
-// Only a missing namespace/key yields zeroed official defaults. Other errors leave
-// settings unchanged: callers must not use official service settings after a failed load.
+// Only a missing namespace/key yields zeroed settings (未配置). Other errors leave
+// settings unchanged: callers must not use a half-configured service after a failed load.
 // A wrong blob size returns ESP_ERR_NVS_INVALID_LENGTH; invalid contents return
 // ESP_ERR_INVALID_ARG. Other NVS errors are propagated.
 esp_err_t voice_settings_load(voice_settings_t *settings);
@@ -26,6 +25,7 @@ esp_err_t voice_settings_load(voice_settings_t *settings);
 // owns the commit and close, including any WiFi credential writes in that transaction.
 esp_err_t voice_settings_store(nvs_handle_t handle, const voice_settings_t *settings);
 
-// ESP_ERR_INVALID_ARG for NULL, invalid mode, unterminated arrays or disallowed URLs.
-// Official mode requires empty URLs; custom mode requires info_url and permits an empty WS URL.
+// ESP_ERR_INVALID_ARG for NULL, unterminated arrays or disallowed URLs.
+// info_url is required: there is no built-in default OTA address. websocket_url may be
+// empty, in which case the address from the info response is used.
 esp_err_t voice_settings_validate(const voice_settings_t *settings);

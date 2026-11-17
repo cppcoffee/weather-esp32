@@ -111,7 +111,6 @@ static __attribute__((unused)) esp_err_t httpd_resp_send_err(httpd_req_t *r, int
 
 SCAN_STUB = r'''
 typedef struct {
-    unsigned char custom;
     char info_url[256];
     char websocket_url[256];
 } voice_settings_t;
@@ -122,7 +121,7 @@ static int voice_settings_load(voice_settings_t *settings)
 }
 static __attribute__((unused)) int voice_settings_validate(const voice_settings_t *settings)
 {
-    return settings && settings->custom == 0 ? 0 : -1;
+    return settings && settings->info_url[0] ? 0 : -1;
 }
 static int input_count;
 static char **input_ssids;
@@ -258,7 +257,7 @@ def check_assets(assets):
     expected = {
         "index.html": {
                 "STYLE", "SCRIPT", "OPTIONS", "COUNT", "AP_URL", "AP_SSID",
-                "VOICE_OFFICIAL_SELECTED", "VOICE_CUSTOM_SELECTED", "VOICE_URL", "VOICE_WS",
+                "VOICE_URL", "VOICE_WS",
             },
         "result.html": {"STYLE", "TITLE", "MESSAGE"},
         "style.css": set(), "app.js": set(),
@@ -291,15 +290,15 @@ def check_root(executable, assets, ap_url, ssids):
     assert len(forms) == 1 and forms[0].get("method", "").lower() == "post"
     assert forms[0].get("action") == "/save"
     fields = {a.get("name"): (tag, a) for tag, a in page.elements if tag in {"input", "select"}}
-    assert set(fields) == {"ssid", "ssid2", "pass", "voice_mode", "voice_url", "voice_ws"}
+    assert set(fields) == {"ssid", "ssid2", "pass", "voice_url", "voice_ws"}
     assert fields["ssid"][0] == "select"
     assert(fields["ssid2"][1].get("type") == "text")
     assert(fields["pass"][1].get("type") == "password")
-    assert(fields["voice_mode"][0] == "select")
     assert(fields["voice_url"][1].get("type") == "url")
+    assert "required" in fields["voice_url"][1]
     assert(fields["voice_ws"][1].get("type") == "url")
     assert any(tag == "button" and a.get("type") == "submit" for tag, a in page.elements)
-    wifi_options = [(attrs, text) for attrs, text in page.options if attrs.get("value") not in {"official", "custom"}]
+    wifi_options = [(attrs, text) for attrs, text in page.options]
     shown = [ssid for ssid in ssids if ssid != OWN]
     if shown:
         assert [a.get("value") for a, _ in wifi_options] == shown

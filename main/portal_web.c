@@ -255,7 +255,7 @@ static esp_err_t root_get(httpd_req_t *req)
     char escaped_voice_url[VOICE_URL_CAP * 6], escaped_voice_ws[VOICE_URL_CAP * 6];
     voice_settings_t settings = {0};
     if (voice_settings_load(&settings) != ESP_OK) {
-        ESP_LOGW(TAG, "invalid saved voice settings; showing official mode");
+        ESP_LOGW(TAG, "invalid saved voice settings; showing empty fields");
         memset(&settings, 0, sizeof(settings));
     }
     html_escape(settings.info_url, escaped_voice_url, sizeof(escaped_voice_url));
@@ -268,8 +268,6 @@ static esp_err_t root_get(httpd_req_t *req)
         {"{{COUNT}}", count},
         {"{{AP_URL}}", NET_AP_URL},
         {"{{AP_SSID}}", own},
-        {"{{VOICE_OFFICIAL_SELECTED}}", settings.custom ? "" : "selected"},
-        {"{{VOICE_CUSTOM_SELECTED}}", settings.custom ? "selected" : ""},
         {"{{VOICE_URL}}", escaped_voice_url},
         {"{{VOICE_WS}}", escaped_voice_ws},
     };
@@ -310,11 +308,10 @@ static esp_err_t save_post(httpd_req_t *req)
     body[total] = 0;
 
     // 列表里选的和手动输入的二选一，手填的优先。
-    char ssid[33], manual[33], pass[65], mode[12];
+    char ssid[33], manual[33], pass[65];
     form_field(body, "ssid", ssid, sizeof(ssid));
     form_field(body, "ssid2", manual, sizeof(manual));
     form_field(body, "pass", pass, sizeof(pass));
-    form_field(body, "voice_mode", mode, sizeof(mode));
     if (manual[0]) {
         memcpy(ssid, manual, sizeof(ssid));
     }
@@ -326,16 +323,14 @@ static esp_err_t save_post(httpd_req_t *req)
     if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) {
         return httpd_resp_send_500(req);
     }
+    // 信息地址必填：固件没有内置默认 OTA 地址
     voice_settings_t settings = {0};
-    if (!strcmp(mode, "custom")) {
-        settings.custom = 1;
-        form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
-        form_field(body, "voice_ws", settings.websocket_url, sizeof(settings.websocket_url));
-    }
+    form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
+    form_field(body, "voice_ws", settings.websocket_url, sizeof(settings.websocket_url));
     esp_err_t voice_err = voice_settings_validate(&settings);
     if (voice_err != ESP_OK) {
         nvs_close(h);
-        return reply(req, "语音地址无效", "请检查自建服务的信息地址和 WebSocket 地址。", false);
+        return reply(req, "语音地址无效", "请填写服务信息地址（OTA）和可选的 WebSocket 地址。", false);
     }
     esp_err_t err = nvs_set_str(h, "ssid", ssid);
     if (err == ESP_OK) {

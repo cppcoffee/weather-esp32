@@ -189,13 +189,10 @@ static bool valid_url(const char *url, bool websocket)
 
 esp_err_t voice_settings_validate(const voice_settings_t *settings)
 {
-    if (!settings || settings->custom > 1 || !memchr(settings->info_url, '\0', VOICE_URL_CAP)
+    if (!settings || !memchr(settings->info_url, '\0', VOICE_URL_CAP)
         || !memchr(settings->websocket_url, '\0', VOICE_URL_CAP))
     {
         return ESP_ERR_INVALID_ARG;
-    }
-    if (!settings->custom) {
-        return settings->info_url[0] == '\0' && settings->websocket_url[0] == '\0' ? ESP_OK : ESP_ERR_INVALID_ARG;
     }
     if (!valid_url(settings->info_url, false)
         || (settings->websocket_url[0] != '\0' && !valid_url(settings->websocket_url, true)))

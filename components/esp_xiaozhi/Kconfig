@@ -1,9 +1,11 @@
 menu "Xiaozhi Assistant"
     config XIAOZHI_OTA_URL
         string "Default OTA URL"
-        default "https://api.tenclass.net/xiaozhi/ota/"
+        default ""
         help
-            The application will access this URL to check for new firmwares and server address.
+            Only used by esp_xiaozhi_chat_get_info(). This firmware has no default OTA server:
+            the information URL is configured per device on the SETUP-WIFI page, and an empty
+            value makes esp_xiaozhi_chat_get_info() return ESP_ERR_INVALID_ARG.
 
     config XIAOZHI_INFO_TIMEOUT_MS
         int "Default information timeout (ms)"

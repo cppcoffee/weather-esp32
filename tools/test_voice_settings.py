@@ -61,9 +61,9 @@ HARNESS = r'''
 #include <string.h>
 
 _Static_assert(VOICE_URL_CAP == 256, "URL capacity is part of the storage contract");
-_Static_assert(sizeof(voice_settings_t) == 513, "Unexpected persisted layout");
-_Static_assert(offsetof(voice_settings_t, info_url) == 1, "Unexpected info_url layout");
-_Static_assert(offsetof(voice_settings_t, websocket_url) == 257, "Unexpected websocket_url layout");
+_Static_assert(sizeof(voice_settings_t) == 512, "Unexpected persisted layout");
+_Static_assert(offsetof(voice_settings_t, info_url) == 0, "Unexpected info_url layout");
+_Static_assert(offsetof(voice_settings_t, websocket_url) == 256, "Unexpected websocket_url layout");
 
 #define READ_HANDLE 19
 #define WRITE_HANDLE 23
@@ -114,7 +114,7 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *value, size_t
 {
     ++reads;
     assert(handle == READ_HANDLE && read_open);
-    assert(strcmp(key, "voice_v1") == 0 && length);
+    assert(strcmp(key, "voice_v2") == 0 && length);
     if (get_error != ESP_OK) {
         // Even a failed read which touched its buffer must not mutate the caller's output.
         if (value && *length >= 4) {
@@ -142,7 +142,7 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *value, size_t
 esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, size_t length)
 {
     ++sets;
-    assert(strcmp(key, "voice_v1") == 0 && value);
+    assert(strcmp(key, "voice_v2") == 0 && value);
     assert(length == sizeof(voice_settings_t));
     if (handle != WRITE_HANDLE || !write_open) {
         return ESP_ERR_NVS_INVALID_HANDLE;
@@ -181,9 +181,9 @@ void nvs_close(nvs_handle_t handle)
     }
 }
 
-static voice_settings_t custom_settings(const char *info, const char *websocket)
+static voice_settings_t make_settings(const char *info, const char *websocket)
 {
-    voice_settings_t settings = {.custom = 1};
+    voice_settings_t settings = {0};
     assert(strlen(info) < VOICE_URL_CAP && strlen(websocket) < VOICE_URL_CAP);
     strcpy(settings.info_url, info);
     strcpy(settings.websocket_url, websocket);
@@ -195,8 +195,8 @@ static void expect_validation(const voice_settings_t *settings, esp_err_t expect
     voice_settings_t before = *settings;
     esp_err_t actual = voice_settings_validate(settings);
     if (actual != expected) {
-        fprintf(stderr, "validate custom=%u info='%s' ws='%s': got %x, expected %x\n",
-                settings->custom, settings->info_url, settings->websocket_url, actual, expected);
+        fprintf(stderr, "validate info='%s' ws='%s': got %x, expected %x\n",
+                settings->info_url, settings->websocket_url, actual, expected);
     }
     assert(actual == expected);
     assert(memcmp(&before, settings, sizeof(before)) == 0);
@@ -205,7 +205,7 @@ static void expect_validation(const voice_settings_t *settings, esp_err_t expect
 
 static void expect_url(const char *url, bool websocket, bool valid)
 {
-    voice_settings_t settings = custom_settings(websocket ? "https://voice.example/info" : url,
+    voice_settings_t settings = make_settings(websocket ? "https://voice.example/info" : url,
                                                websocket ? url : "");
     expect_validation(&settings, valid ? ESP_OK : ESP_ERR_INVALID_ARG);
 }
@@ -280,18 +280,14 @@ static void test_urls(void)
 
 static void test_settings_and_bounds(void)
 {
-    voice_settings_t official = {0};
-    expect_validation(&official, ESP_OK);
-    official.custom = 2;
-    expect_validation(&official, ESP_ERR_INVALID_ARG);
-    official.custom = 255;
-    expect_validation(&official, ESP_ERR_INVALID_ARG);
-    official.custom = 0;
-    strcpy(official.info_url, "https://voice.example/info");
-    expect_validation(&official, ESP_ERR_INVALID_ARG);
-    memset(official.info_url, 0, sizeof(official.info_url));
-    strcpy(official.websocket_url, "wss://voice.example/ws");
-    expect_validation(&official, ESP_ERR_INVALID_ARG);
+    // 没有内置默认地址：空 info_url 一律拒绝
+    voice_settings_t bounds = {0};
+    expect_validation(&bounds, ESP_ERR_INVALID_ARG);
+    strcpy(bounds.info_url, "https://voice.example/info");
+    expect_validation(&bounds, ESP_OK);
+    memset(bounds.info_url, 0, sizeof(bounds.info_url));
+    strcpy(bounds.websocket_url, "wss://voice.example/ws");
+    expect_validation(&bounds, ESP_ERR_INVALID_ARG);
 
     struct {
         unsigned char before[8];
@@ -299,14 +295,12 @@ static void test_settings_and_bounds(void)
         unsigned char after[8];
     } guarded;
     memset(&guarded, 0xa5, sizeof(guarded));
-    guarded.settings.custom = 1;
     memset(guarded.settings.info_url, 'x', VOICE_URL_CAP);
     strcpy(guarded.settings.websocket_url, "ws://voice.example/ws");
     assert(voice_settings_validate(&guarded.settings) == ESP_ERR_INVALID_ARG);
     strcpy(guarded.settings.info_url, "https://voice.example/info");
     memset(guarded.settings.websocket_url, 'x', VOICE_URL_CAP);
     assert(voice_settings_validate(&guarded.settings) == ESP_ERR_INVALID_ARG);
-    guarded.settings.custom = 0;
     guarded.settings.info_url[0] = '\0';
     assert(voice_settings_validate(&guarded.settings) == ESP_ERR_INVALID_ARG);
     for (size_t i = 0; i < sizeof(guarded.before); ++i) {
@@ -315,7 +309,7 @@ static void test_settings_and_bounds(void)
     checks += 3;
 
     for (int field = 0; field < 2; ++field) {
-        voice_settings_t settings = custom_settings("https://voice.example/info", "");
+        voice_settings_t settings = make_settings("https://voice.example/info", "");
         char *url = field ? settings.websocket_url : settings.info_url;
         const char *prefix = field ? "wss://voice.example/" : "https://voice.example/";
         memset(url, 'a', VOICE_URL_CAP);
@@ -344,7 +338,7 @@ static void seed_blob(const voice_settings_t *settings)
 
 static void expect_failed_load(esp_err_t expected)
 {
-    voice_settings_t output = custom_settings("http://192.168.1.2:8000/ota/", "ws://192.168.1.2:8000/ws");
+    voice_settings_t output = make_settings("http://192.168.1.2:8000/ota/", "ws://192.168.1.2:8000/ws");
     voice_settings_t before = output;
     assert(voice_settings_load(&output) == expected);
     assert(memcmp(&output, &before, sizeof(output)) == 0);
@@ -354,20 +348,20 @@ static void expect_failed_load(esp_err_t expected)
 
 static void test_load(void)
 {
-    const voice_settings_t official = {0};
+    const voice_settings_t zeroed = {0};
     voice_settings_t output;
     reset_nvs();
     namespace_present = false;
     memset(&output, 0xa5, sizeof(output));
     assert(voice_settings_load(&output) == ESP_OK);
-    assert(memcmp(&output, &official, sizeof(output)) == 0);
+    assert(memcmp(&output, &zeroed, sizeof(output)) == 0);
     assert(opens == 1 && reads == 0 && closes == 0 && sets == 0 && commits == 0);
     ++checks;
 
     reset_nvs();
     memset(&output, 0xa5, sizeof(output));
     assert(voice_settings_load(&output) == ESP_OK);
-    assert(memcmp(&output, &official, sizeof(output)) == 0);
+    assert(memcmp(&output, &zeroed, sizeof(output)) == 0);
     assert(opens == 1 && reads == 1 && closes == 1 && sets == 0 && commits == 0);
     ++checks;
 
@@ -386,7 +380,7 @@ static void test_load(void)
         expect_failed_load(get_error);
         assert(opens == 1 && reads >= 1 && closes == 1);
     }
-    // Every truncated size, plus oversized data, must fail rather than select official mode.
+    // Every truncated size, plus oversized data, must fail rather than zero the settings.
     for (size_t length = 0; length < sizeof(blob); ++length) {
         if (length == sizeof(voice_settings_t)) {
             continue;
@@ -399,19 +393,19 @@ static void test_load(void)
     }
     for (int delta = -1; delta <= 1; delta += 2) {
         reset_nvs();
-        seed_blob(&official);
-        reported_length = (size_t)((int)sizeof(official) + delta);
+        seed_blob(&zeroed);
+        reported_length = (size_t)((int)sizeof(zeroed) + delta);
         expect_failed_load(ESP_ERR_NVS_INVALID_LENGTH);
     }
     for (int corruption = 0; corruption < 6; ++corruption) {
         reset_nvs();
-        voice_settings_t invalid = custom_settings("https://voice.example/info", "wss://voice.example/ws");
+        voice_settings_t invalid = make_settings("https://voice.example/info", "wss://voice.example/ws");
         switch (corruption) {
         case 0:
-            invalid.custom = 2;
+            invalid.info_url[0] = '\0';
             break;
         case 1:
-            invalid.custom = 0;
+            strcpy(invalid.info_url, "ws://voice.example/info");
             break;
         case 2:
             memset(invalid.info_url, 'a', VOICE_URL_CAP);
@@ -435,9 +429,8 @@ static void test_load(void)
 static void test_store(void)
 {
     const voice_settings_t cases[] = {
-        {0},
-        {.custom = 1, .info_url = "https://voice.example/info"},
-        {.custom = 1, .info_url = "http://192.168.1.8:8000/ota/?x=a%20b",
+        {.info_url = "https://voice.example/info"},
+        {.info_url = "http://192.168.1.8:8000/ota/?x=a%20b",
          .websocket_url = "ws://192.168.1.8:8000/ws?token=a%23b"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
@@ -464,7 +457,7 @@ static void test_store(void)
     reset_nvs();
     nvs_handle_t handle;
     assert(nvs_open("wifi", NVS_READWRITE, &handle) == ESP_OK);
-    voice_settings_t saved = custom_settings("https://voice.example/info", "wss://voice.example/ws");
+    voice_settings_t saved = make_settings("https://voice.example/info", "wss://voice.example/ws");
     assert(voice_settings_store(handle, &saved) == ESP_OK);
     assert(nvs_commit(handle) == ESP_OK);
     voice_settings_t invalid = saved;
@@ -474,7 +467,7 @@ static void test_store(void)
     const esp_err_t write_errors[] = {ESP_FAIL, ESP_ERR_NVS_NOT_ENOUGH_SPACE, ESP_ERR_NVS_INVALID_HANDLE};
     for (size_t i = 0; i < sizeof(write_errors) / sizeof(write_errors[0]); ++i) {
         set_error = write_errors[i];
-        voice_settings_t replacement = {0};
+        voice_settings_t replacement = make_settings("https://voice.example/other", "");
         assert(voice_settings_store(handle, &replacement) == set_error);
         assert(commits == 1 && closes == 0 && write_open);
         assert(memcmp(blob, &saved, sizeof(saved)) == 0 && !pending_present);
@@ -493,7 +486,7 @@ static void test_store(void)
 int main(void)
 {
     assert(strcmp(VOICE_SETTINGS_NAMESPACE, "wifi") == 0);
-    assert(strcmp(VOICE_SETTINGS_KEY, "voice_v1") == 0);
+    assert(strcmp(VOICE_SETTINGS_KEY, "voice_v2") == 0);
     test_urls();
     test_settings_and_bounds();
     test_load();
