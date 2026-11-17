@@ -22,37 +22,11 @@
 #include "nvs.h"
 #include "opus.h"
 #include "voice_audio.h"
+#include "voice_capture.h"
+#include "voice_internal.h"
 
 static const char *TAG = "voice";
 static const char *WAKE_WORD = "小鹿小鹿";
-
-#define VOICE_SAMPLE_RATE            16000
-#define VOICE_FRAME_MS               60
-#define VOICE_FRAME_SAMPLES          (VOICE_SAMPLE_RATE / 1000 * VOICE_FRAME_MS)
-#define VOICE_TX_OPUS_MAX            512
-#define VOICE_RX_OPUS_MAX            1400
-#define VOICE_RX_QUEUE_LEN           8
-#define VOICE_TASK_STACK             8192
-#define VOICE_TASK_PRIO              5
-#define VOICE_TURN_TIMEOUT_MS        15000
-#define VOICE_RESPONSE_TIMEOUT_MS    30000
-#define VOICE_FIRST_AUDIO_TIMEOUT_MS 90000
-#define VOICE_RETRY_MS               30000
-#define VOICE_POLL_MS                100
-#define WAKE_TASK_STACK              4096
-#define WAKE_BUFFER_BYTES            (VOICE_SAMPLE_RATE * sizeof(int16_t) * 12)
-
-#define VOICE_BIT_NET         (1 << 0)
-#define VOICE_BIT_TRIGGER     (1 << 1)
-#define VOICE_BIT_TTS_STARTED (1 << 2)
-#define VOICE_BIT_TTS_STOPPED (1 << 3)
-#define VOICE_BIT_ERROR       (1 << 4)
-#define VOICE_BIT_RECEIVING   (1 << 5)
-#define VOICE_BIT_RESET       (1 << 6)
-#define VOICE_BIT_ARMED       (1 << 7)
-#define VOICE_BIT_CAPTURE     (1 << 8)
-#define VOICE_BIT_HANGUP      (1 << 9)
-#define VOICE_TURN_BITS       (VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_ERROR)
 
 typedef struct {
     int len;
@@ -62,7 +36,6 @@ typedef struct {
 static EventGroupHandle_t s_events;
 static SemaphoreHandle_t s_network_lock;
 static QueueHandle_t s_rx_queue;
-static StreamBufferHandle_t s_microphone;
 static srmodel_list_t *s_models;
 static const esp_wn_iface_t *s_wakenet;
 static model_iface_data_t *s_wake_model;
@@ -72,6 +45,8 @@ static esp_mcp_t *s_mcp;
 static bool s_cleanup_pending;
 static OpusEncoder *s_encoder;
 static OpusDecoder *s_decoder;
+static StreamBufferHandle_t s_reference;
+static StreamBufferHandle_t s_microphone;
 
 // Only voice_task touches Opus and PCM. Encoding and decoding therefore share one
 // per-task Opus pseudostack, as well as these PCM buffers.
@@ -79,54 +54,10 @@ static int16_t s_mono[VOICE_FRAME_SAMPLES];
 static int16_t s_stereo[VOICE_FRAME_SAMPLES * 2];
 static uint8_t s_tx_opus[VOICE_TX_OPUS_MAX];
 static voice_packet_t s_packet;
-static int16_t s_capture_stereo[VOICE_FRAME_SAMPLES * 2];
-static int16_t s_capture_mono[VOICE_FRAME_SAMPLES];
 
 static bool network_ready(void)
 {
-    EventBits_t bits = xEventGroupGetBits(s_events);
-    return (bits & (VOICE_BIT_NET | VOICE_BIT_RESET)) == VOICE_BIT_NET;
-}
-
-static void capture_task(void *arg)
-{
-    (void)arg;
-    const size_t stereo_bytes = s_wake_samples * 2 * sizeof(int16_t);
-    const size_t mono_bytes = s_wake_samples * sizeof(int16_t);
-    for (;;) {
-        xEventGroupWaitBits(s_events, VOICE_BIT_ARMED | VOICE_BIT_CAPTURE, pdFALSE, pdFALSE, portMAX_DELAY);
-        if (!network_ready()) {
-            vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
-            continue;
-        }
-        size_t read = 0;
-        esp_err_t err = audio_read(s_capture_stereo, stereo_bytes, &read);
-        EventBits_t bits = xEventGroupGetBits(s_events);
-        if (err != ESP_OK || read != stereo_bytes) {
-            if (bits & VOICE_BIT_CAPTURE) {
-                xEventGroupSetBits(s_events, VOICE_BIT_ERROR);
-            }
-            s_wakenet->clean(s_wake_model);
-            vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
-            continue;
-        }
-        voice_stereo_to_mono(s_capture_stereo, s_capture_mono, s_wake_samples);
-        if (bits & VOICE_BIT_CAPTURE) {
-            // Preserve the start of the question while the chat audio channel opens.
-            if (xStreamBufferSpacesAvailable(s_microphone) < mono_bytes) {
-                xEventGroupClearBits(s_events, VOICE_BIT_CAPTURE);
-                xEventGroupSetBits(s_events, VOICE_BIT_ERROR);
-            } else {
-                xStreamBufferSend(s_microphone, s_capture_mono, mono_bytes, 0);
-            }
-        } else if ((bits & VOICE_BIT_ARMED) && s_wakenet->detect(s_wake_model, s_capture_mono) == WAKENET_DETECTED) {
-            s_wakenet->clean(s_wake_model);
-            xEventGroupClearBits(s_events, VOICE_BIT_ARMED);
-            xStreamBufferReset(s_microphone);
-            xEventGroupSetBits(s_events, VOICE_BIT_CAPTURE | VOICE_BIT_TRIGGER);
-            ESP_LOGI(TAG, "wake word detected");
-        }
-    }
+    return VOICE_NETWORK_READY(xEventGroupGetBits(s_events));
 }
 
 static void on_audio(const uint8_t *data, int len, void *ctx)
@@ -354,77 +285,129 @@ static esp_err_t play_response(void)
 {
     TickType_t last_audio = xTaskGetTickCount();
     bool received_audio = false;
+    esp_err_t err = ESP_ERR_TIMEOUT;
+
+    xQueueReset(s_rx_queue);
+    xStreamBufferReset(s_reference);
+    // Only the echo canceller makes it safe to keep WakeNet armed while the speaker plays;
+    // without it the assistant's own voice would interrupt every reply.
+    if (voice_capture_has_aec()) {
+        xEventGroupSetBits(s_events, VOICE_BIT_ARMED);
+    }
     // Tool discovery + LLM/tool rounds + first TTS have a bounded 75 s server budget.
     // Once playback starts, retain the shorter gap limit rather than extending every gap.
     while (xTaskGetTickCount() - last_audio
            < pdMS_TO_TICKS(received_audio ? VOICE_RESPONSE_TIMEOUT_MS : VOICE_FIRST_AUDIO_TIMEOUT_MS))
     {
         if (!network_ready() || (xEventGroupGetBits(s_events) & VOICE_BIT_ERROR)) {
-            return ESP_FAIL;
+            err = ESP_FAIL;
+            break;
         }
-        if (xQueueReceive(s_rx_queue, &s_packet, pdMS_TO_TICKS(VOICE_POLL_MS)) == pdTRUE) {
+        if (xEventGroupGetBits(s_events) & VOICE_BIT_INTERRUPT) {
+            // Stop accepting the aborted reply: its remaining packets must not reach the new turn.
+            xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING);
+            xQueueReset(s_rx_queue);
+            err = ESP_OK;
+            break;
+        }
+        if (xQueueReceive(s_rx_queue, &s_packet, pdMS_TO_TICKS(VOICE_PLAYBACK_POLL_MS)) == pdTRUE) {
             int samples = opus_decode(s_decoder, s_packet.data, s_packet.len, s_mono, VOICE_FRAME_SAMPLES, 0);
             if (samples <= 0) {
                 ESP_LOGW(TAG, "opus decode failed: %d", samples);
-                return ESP_FAIL;
+                err = ESP_FAIL;
+                break;
             }
             voice_mono_to_stereo(s_mono, s_stereo, (size_t)samples);
             size_t written = 0;
-            esp_err_t err = audio_set_mute(false);
+            err = audio_set_mute(false);
             if (err == ESP_OK) {
                 err = audio_write(s_stereo, (size_t)samples * 4, &written);
             }
             if (err != ESP_OK || written != (size_t)samples * 4) {
-                return ESP_FAIL;
+                err = ESP_FAIL;
+                break;
             }
+            xStreamBufferSend(s_reference, s_mono, (size_t)samples * sizeof(int16_t), 0);
             received_audio = true;
             last_audio = xTaskGetTickCount();
         } else if (xEventGroupGetBits(s_events) & VOICE_BIT_TTS_STOPPED) {
             // TTS stop can arrive before the worker drains the queued audio.
-            return ESP_OK;
+            err = ESP_OK;
+            break;
         }
     }
-    return ESP_ERR_TIMEOUT;
+    // Leave arming to the turn owner: it re-arms WakeNet once this turn is finished.
+    xEventGroupClearBits(s_events, VOICE_BIT_ARMED);
+    xStreamBufferReset(s_reference);
+    return err;
 }
 
 static esp_err_t run_turn(void)
 {
-    xQueueReset(s_rx_queue);
-    if (xEventGroupGetBits(s_events) & VOICE_BIT_ERROR) {
-        return ESP_FAIL;
-    }
-    opus_encoder_ctl(s_encoder, OPUS_RESET_STATE);
-    opus_decoder_ctl(s_decoder, OPUS_RESET_STATE);
-    esp_xiaozhi_chat_audio_t audio = {
+    const esp_xiaozhi_chat_audio_t audio = {
         .format = "opus",
         .sample_rate = VOICE_SAMPLE_RATE,
         .channels = 1,
         .frame_duration = VOICE_FRAME_MS,
     };
-    esp_err_t err = esp_xiaozhi_chat_open_audio_channel(s_chat, &audio, NULL, 0);
-    if (err != ESP_OK) {
-        return err;
+    bool channel_open = false;
+    esp_err_t err = ESP_OK;
+
+    xQueueReset(s_rx_queue);
+    if (xEventGroupGetBits(s_events) & VOICE_BIT_ERROR) {
+        return ESP_FAIL;
     }
-    xEventGroupSetBits(s_events, VOICE_BIT_RECEIVING);
-    err = esp_xiaozhi_chat_send_wake_word(s_chat, WAKE_WORD);
-    if (err == ESP_OK) {
+    // A barge-in restarts listening on the same channel instead of rebuilding the session.
+    for (;;) {
+        xQueueReset(s_rx_queue);
+        xEventGroupClearBits(s_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_INTERRUPT);
+        opus_encoder_ctl(s_encoder, OPUS_RESET_STATE);
+        opus_decoder_ctl(s_decoder, OPUS_RESET_STATE);
+        if (!channel_open) {
+            err = esp_xiaozhi_chat_open_audio_channel(s_chat, &audio, NULL, 0);
+            if (err != ESP_OK) {
+                break;
+            }
+            channel_open = true;
+            xEventGroupSetBits(s_events, VOICE_BIT_RECEIVING);
+            err = esp_xiaozhi_chat_send_wake_word(s_chat, WAKE_WORD);
+            if (err != ESP_OK) {
+                break;
+            }
+        } else {
+            err =
+                esp_xiaozhi_chat_send_abort_speaking(s_chat, ESP_XIAOZHI_CHAT_ABORT_SPEAKING_REASON_WAKE_WORD_DETECTED);
+            if (err != ESP_OK) {
+                break;
+            }
+            // Accept downstream audio again only after the server was told to stop talking.
+            xEventGroupSetBits(s_events, VOICE_BIT_RECEIVING);
+            ESP_LOGI(TAG, "reply aborted, listening again");
+        }
         err = esp_xiaozhi_chat_send_start_listening(s_chat, ESP_XIAOZHI_CHAT_LISTENING_MODE_AUTO);
-    }
-    if (err == ESP_OK) {
+        if (err != ESP_OK) {
+            break;
+        }
         ESP_LOGI(TAG, "listening");
         err = stream_microphone();
         xEventGroupClearBits(s_events, VOICE_BIT_CAPTURE);
-        esp_err_t stop_err = esp_xiaozhi_chat_send_stop_listening(s_chat);
         if (err == ESP_OK) {
-            err = stop_err;
+            err = esp_xiaozhi_chat_send_stop_listening(s_chat);
         }
         if (err == ESP_OK) {
             err = play_response();
         }
+        if (err != ESP_OK || !(xEventGroupGetBits(s_events) & VOICE_BIT_INTERRUPT)) {
+            break;
+        }
+        ESP_LOGI(TAG, "barge-in: answering the new question");
     }
-    xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING);
-    esp_xiaozhi_chat_close_audio_channel(s_chat);
+    xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING | VOICE_BIT_ARMED | VOICE_BIT_INTERRUPT);
+    if (channel_open) {
+        esp_xiaozhi_chat_close_audio_channel(s_chat);
+    }
     xQueueReset(s_rx_queue);
+    xStreamBufferReset(s_reference);
     audio_set_mute(true);
     return err;
 }
@@ -551,6 +534,12 @@ esp_err_t voice_init(void)
         goto failed;
     }
     err = ESP_ERR_NO_MEM;
+    s_reference = xStreamBufferCreateWithCaps(VOICE_REF_BYTES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_reference == NULL) {
+        goto failed;
+    }
+    // Without AEC the previous behavior stands: no wake detection while a reply plays.
+    err = ESP_ERR_NO_MEM;
     s_events = xEventGroupCreate();
     if (s_events != NULL) {
         ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_SERVER_GOODBYE,
@@ -560,15 +549,21 @@ esp_err_t voice_init(void)
     s_rx_queue = xQueueCreate(VOICE_RX_QUEUE_LEN, sizeof(voice_packet_t));
     s_microphone = xStreamBufferCreateWithCaps(WAKE_BUFFER_BYTES, sizeof(s_mono), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_events && s_network_lock && s_rx_queue && s_microphone) {
-        TaskHandle_t capture = NULL;
-        if (xTaskCreate(capture_task, "wake", WAKE_TASK_STACK, NULL, VOICE_TASK_PRIO, &capture) == pdPASS) {
+        err =
+            voice_capture_start(s_events, s_microphone, s_reference, s_models, s_wakenet, s_wake_model, s_wake_samples);
+        if (err == ESP_OK) {
             if (xTaskCreate(voice_task, "voice", VOICE_TASK_STACK, NULL, VOICE_TASK_PRIO, NULL) == pdPASS) {
                 return ESP_OK;
             }
-            vTaskDelete(capture);
+            err = ESP_ERR_NO_MEM;
         }
     }
 failed:
+    voice_capture_stop();
+    if (s_reference != NULL) {
+        vStreamBufferDeleteWithCaps(s_reference);
+        s_reference = NULL;
+    }
     if (s_microphone != NULL) {
         vStreamBufferDeleteWithCaps(s_microphone);
         s_microphone = NULL;
@@ -607,7 +602,7 @@ void voice_net_pause(void)
 {
     if (s_events != NULL) {
         xEventGroupClearBits(s_events, VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_RECEIVING | VOICE_BIT_ARMED
-                                           | VOICE_BIT_CAPTURE);
+                                           | VOICE_BIT_CAPTURE | VOICE_BIT_INTERRUPT);
         xEventGroupSetBits(s_events, VOICE_BIT_RESET);
     }
 }

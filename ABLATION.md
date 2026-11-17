@@ -63,6 +63,30 @@ python3 tools/test_app.py --baseline .cache/layout-baseline
 - `epd`：统一帧缓冲、旋转映射、字体绘制和 SSD1680 时序，避免界面了解硬件细节。
 - 热点扫描、HTML 转义、HTTPS 证书校验、重连、超时和中文缺字检查：都有真实需求，不属于可随意消融的冗余。
 
+## AEC 打断的首轮精简（2026-11-17）
+
+`main/voice.c` 的 AEC 打断先按最小面实现，再对自己的代码做一次消融：只删没有第二调用方的包装层和默认关闭的死代码，不改音频数据路径。对照两侧使用同一份 ESP-IDF v6.0.2 / ESP32-S3 配置，判据是构建尺寸、主机回归和喂帧逻辑是否等价。
+
+| 变动 | 对照 | 精简后 | 结论 |
+| --- | --- | --- | --- |
+| 删除 `reference_push()` / `reference_reset()` | 两个只做 NULL 检查和转发的包装 | `play_response()` / `run_turn()` 直接调用 `xStreamBufferSend` / `xStreamBufferReset` | `voice_init()` 在 `s_reference` 为 NULL 时不会启动任务，NULL 检查是死代码 |
+| 把 `pop_reference()` / `afe_drain()` 合进 `afe_process()` | 两个各只有一个调用方的辅助函数 | 参考取样与 fetch 排空内联到喂帧循环 | 少两层跨函数状态传递，交错喂帧的时序完全相同 |
+| 删除 `VOICE_AEC_REF_DELAY_MS` 预填静音分支 | 默认 0，`#if` 在编译期就移除了的调参入口 | 参考按写入顺序直接喂给 AEC | 默认路径无行为差异；真机若回声抑制不足，先调 AEC filter length |
+| 删除 `on_wake_word()` 的前置声明 | 该函数定义在唯一调用者之前 | 只保留 `route_microphone()` / `afe_process()` 的声明 | 声明只为满足 `test_voice_lifecycle.py` 的抽取边界，不是设计需要 |
+
+固件尺寸没有变化：两侧 `weather_esp32.bin` 都是 `0x1b6c80`，3 MB app 分区余 43%。被删掉的都是单调用方、编译器本来就会内联的函数，收益在审阅面而不是体积。本轮删掉 4 个函数、约 40 行，本轮结束时 `voice.c` 858 行（基线 625 行）。
+
+之后采集任务连同 AFE、WakeNet 和参考取样一起搬到了 `voice_capture.c`，共享常量与事件位放在 `voice_internal.h`；本节的结论是关于那批辅助函数，不随文件拆分改变。
+
+保留的抽象及理由：
+
+- `route_microphone()`：有两个调用方（AFE 输出和无 AEC 回退路径），去掉会把路由和 WakeNet 分块逻辑复制两遍。
+- `afe_process()`：保住“麦克风与参考同帧交错”这一条不变量，并把参考取样、对齐和 fetch 排空放在一处。
+- `s_ref_scratch`：参考来自流缓冲，必须先取出再写入交错数组，无法直接映射到 stride 2。
+- `init_afe()`：集中 AFE 配置、参数校验和各失败分支的清理。
+
+验证：`python3 tools/test_voice_lifecycle.py`（18 个场景）、`python3 tools/test_app.py`（16 应用场景 + 2089 解析 + 854 UI）通过，`clang-format --dry-run --Werror main/voice.c` 无差异，ESP-IDF 构建通过。这些都不覆盖回声抑制效果、参考对齐和打断延迟，仍需真机确认。
+
 ## 为什么保留 `main/`
 
 `main/` 是 ESP-IDF 默认应用目录，当前根 `CMakeLists.txt` 直接遵循这个约定。改成 `src/` 虽然可行，但需要显式注册目录、核对依赖，并同步 `tools/genfont.py` 的扫描和输出路径以及文档。

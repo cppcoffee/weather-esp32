@@ -144,7 +144,9 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - `main/weather_json.c` / `.h` | 使用 Component Manager 提供的 cJSON 完成严格整段解析、数值/整数/定长字符串/对象成员数组读取；不含天气业务校验
 | `main/net.c` / `.h` | NVS 凭据、STA 连接、SNTP/时区、HTTP(S) GET |
 | `main/audio.c` / `.h` | ES8311 + NS415B 的 I²C/I²S 初始化与 `audio_read`/`audio_write`/`audio_set_mute` 原语；上电静音 |
-| `main/voice.c` / `.h` | WakeNet 本地唤醒、`esp_xiaozhi` 会话、Opus 编解码；采集与会话分别运行在独立任务 |
+| `main/voice.c` / `.h` | 会话任务：小智会话生命周期、单轮对话、Opus 编解码、AEC 打断后的重新聆听 |
+| `main/voice_capture.c` / `.h` | 采集任务：I2S 读取、AEC 前端、WakeNet 检测与打断信号；只操作事件组和两个流缓冲 |
+| `main/voice_internal.h` | 两个语音任务共享的音频格式、缓冲尺寸与事件位契约 |
 | `main/voice_settings.c` / `.h` | 小智官方/自建模式、信息地址和可选 WebSocket 地址的 NVS 保存及 URL 校验 |
 | `main/voice_audio.c` / `.h` | 纯函数：交错立体声→左声道单声道、单声道→立体声；不含 SDK 依赖，主机可测 |
 | `main/device_mcp.c` / `.h` | 发布屏幕同源的成功天气/传感器快照；用 managed MCP SDK 注册当前时间、5天+21小时预报、本地温湿度三个只读工具 |
@@ -216,9 +218,10 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - 隐私边界：接上后麦克风音频和识别结果会上传到 xiaozhi.me，属于联网上传，不可写成“本地处理”。只在唤醒或明确触发后开麦，空闲时保持 `audio_set_mute` 静音、不发送音频。
 - 与天气的关系：`device_mcp_publish()` 发布已有的 `app->shown` 快照和 `sensor_reading_t`，由 managed SDK 提供 `self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading` 三个无参数只读工具。不要为一次问答重跑 `weather_update()`，也不要绕过“失败保留旧快照”的语义。天气包含5天+21小时、抓取时间、单调缓存年龄、陈旧与重试状态；未对时抓取时间为null。传感器未接入时必须available=false，不能冒用预报。当前时间仅在SNTP成功、时钟合理且天气UTC偏移已知时synchronized=true。配套Rust服务端用官方rmcp发现与调用工具，云模型须支持tool_calls。
 - 等待预算：设备首音频等待90秒、播放中断流等待30秒；配套Rust文本回合正常首音频65秒、含失败提示75秒、总回合180秒（不包含ASR）。不要只改一端的超时。WS stop失败时保留chat/MCP/Opus，释放应用网络锁后由voice任务重试清理，禁止新会话；成功stop后deinit消费句柄。
+- AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考）做回声消除，参考信号是 `play_response()` 实际写入 I2S 的 PCM（`s_reference` 流缓冲，按写入顺序喂入，不加人为延迟）。WakeNet 仍在 AFE 之外，检测的是 AEC 输出；播放期间保持 `ARMED`，命中唤醒词置 `VOICE_BIT_INTERRUPT`，由 `voice.c` 的 `run_turn()` 同一任务静音、丢弃被中止回复的音频，发送 `abort`(wake_word_detected) 并在同一通道重新 `listen start`，不重建会话。AFE 初始化失败时回退为“播放期间不检测唤醒”。两个语音任务只通过 `voice_internal.h` 的事件位和两个流缓冲通信；真实回声抑制量、`aec_filter_length` 与端到端打断延迟必须真机验证。
 - 屏上反馈：语音状态（连接、聆听、说话、失败）沿用现有状态角落与文案机制，且**新增中文文案必须重跑 `tools/genfont.py`**（中文只在 `font_mid`）。**M1 尚未加语音文案和激活码页**，配对码只能从串口看；补屏上反馈时要一次把状态词和配对页做完，别分两次重生成字模。
 - 按键语义：短按切页，长按 3 秒重配网。
-- 音频回调把下行包送入有界队列。采集任务和播放任务共用 ES8311，播放期间暂停唤醒检测和录音。
+- 音频回调把下行包送入有界队列。采集任务和播放任务共用 ES8311：播放时仍持续采集供 AEC 消除回声，启用 AEC 时唤醒检测保持开启以便打断；未启用 AEC 时播放期间暂停唤醒检测和录音。
 
 ## 配网页维护
 
@@ -263,7 +266,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - 改布局同步核对：`ui.c` 的日/小时列宽、网格起点和行锚点；`preview_ui.py` 的 `COL_W` / `GRID_X` / `DATE_BASE` / `ICON_TOP` / `DAILY_TEMP_BASE` / `PRECIP_BASE`、`icon_mask` / `expect_forecast`；`test_app.py` 的 `centers` / `boundaries` / `hour_centers`、图标字形、宽度及基线断言。不要只改断言以掩盖越界。
 - 主机解析测试广泛覆盖日数据、作用域、日期、非法值、缺项及截断 JSON；逐时有缺失/短数组/首日错位等用例，但 `validate_weather()` 尚未逐字段比较成功响应的 `hours`。改逐时解析时补对应断言，不假设现有用例已穷尽 DST 和数值边界。
 - 应用测试检查完整 SPI 帧、启动等待、退避、失败正文保留、状态角落隔离、首次对时和切页；网络为 stub，**不覆盖真实 `net.c` / `net_portal.c` / `portal_web.c` / `portal_dns.c` 的 NVS、WiFi、HTTP/TLS、DNS、网页、SNTP 或硬件阻塞时序**。
-- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/3 秒重配网动作；`test_device_mcp.py` 编译真实工具及managed cJSON，使用SDK公开头和stub注册API/时钟/RTOS，覆盖数据、失败快照保留、分配失败、并发，不验证MCP协议或真实SNTP。`test_voice_lifecycle.py` 抽取未经改写的网络状态/会话清理/voice主循环函数，stub RTOS与协议调用，覆盖停止失败资源保留、挂起唤醒、重配网后重新ARMED，不覆盖整个voice.c或真实SDK停止时序。`main.c` 里的 `voice_*` 和发布调用在 harness 中是 stub；发布断言检查与UI同源。改 `voice.c` 的时序或分帧仍需真机听感验证。
+- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/3 秒重配网动作；`test_device_mcp.py` 编译真实工具及managed cJSON，使用SDK公开头和stub注册API/时钟/RTOS，覆盖数据、失败快照保留、分配失败、并发，不验证MCP协议或真实SNTP。`test_voice_lifecycle.py` 抽取未经改写的网络状态/会话清理/voice主循环函数，stub RTOS与协议调用，覆盖停止失败资源保留、挂起唤醒、重配网后重新ARMED，不覆盖整个voice.c或真实SDK停止时序。AEC 路径（`voice_capture.c` 的 `init_afe`/`afe_process`/`route_microphone` 与 `voice.c` 里打断后的重启）不在主机覆盖内，回声抑制量和打断延迟只能真机听感验证。`main.c` 里的 `voice_*` 和发布调用在 harness 中是 stub；发布断言检查与UI同源。改 `voice.c` 的时序或分帧仍需真机听感验证。
 - `partitions.csv` 分别为固件和 ESP-SR 模型分配分区。调整模型或依赖后，用构建输出核对 app 和模型镜像各自的大小。
 - `--baseline` 接受旧 `main/` 目录，用于比较请求、调用及完整帧；只有数据契约、布局和字模兼容的基线才有意义。`.cache/` 中历史快照不是运行依赖，不能直接套用旧的单日/旧切页结论。
 - `ABLATION.md` 的体积、帧像素与实机观察属于当时版本的实验，不是当前布局的测量；不要将旧数字或未经复测的残影结论写成当前保证。

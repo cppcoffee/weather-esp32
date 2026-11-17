@@ -3,11 +3,13 @@
 
 Extracts close_session, voice_task, voice_net_pause, and the tiny network_ready /
 voice_net_ready helpers using exact signatures and known next-function boundaries;
-also extracts VOICE_BIT_*, VOICE_TURN_BITS, VOICE_POLL_MS and VOICE_RETRY_MS.
+VOICE_BIT_*, VOICE_TURN_BITS, VOICE_NETWORK_READY, VOICE_POLL_MS and VOICE_RETRY_MS
+come from main/voice_internal.h, the header the capture and session tasks share.
 Extraction fails closed if these boundaries change. No lifecycle body is copied
 or rewritten. This is NOT a build/test of all voice.c: open_session and run_turn,
 RTOS, protocol, audio and Opus are stubs. In particular it does not validate real
-SDK stop timing, audio, capture/WakeNet detection, provisioning, or concurrency.
+SDK stop timing, audio, the voice_capture.c task, WakeNet detection, provisioning,
+or concurrency.
 
 Only Python stdlib and a host cc/clang/gcc are needed. Generated C/executables are
 confined to TemporaryDirectory. Event waits inject a finite per-iteration script;
@@ -29,7 +31,7 @@ import tempfile
 
 
 BOUNDARIES = (
-    ("static bool network_ready(void)", "static void capture_task(void *arg)"),
+    ("static bool network_ready(void)", "static void on_audio(const uint8_t *data, int len, void *ctx)"),
     ("static void close_session(void)", "static esp_err_t open_session(void)"),
     ("static void voice_task(void *arg)", "esp_err_t voice_init(void)"),
     ("void voice_net_ready(void)", "void voice_net_pause(void)"),
@@ -42,7 +44,7 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def extract(source, path):
+def extract(source, macros_source, path):
     fragments = []
     ranges = []
 
@@ -67,19 +69,19 @@ def extract(source, path):
     # Match the entire known contiguous macro block, not arbitrary C fragments.
     match = re.search(
         r"^#define VOICE_BIT_NET[^\n]*\n(?:#define VOICE_BIT_[A-Z_]+[^\n]*\n)*"
-        r"#define VOICE_TURN_BITS[^\n]*\n(?=\ntypedef struct \{)",
-        source, re.MULTILINE,
+        r"#define VOICE_TURN_BITS[^\n]*\n(?=\n// Both tasks use the same rule)",
+        macros_source, re.MULTILINE,
     )
     require(match, "VOICE_BIT/VOICE_TURN_BITS macro boundary changed")
     macro_block = match.group()
     require(
-        len(re.findall(r"^#define VOICE_BIT_", source, re.MULTILINE))
+        len(re.findall(r"^#define VOICE_BIT_", macros_source, re.MULTILINE))
         == len(re.findall(r"^#define VOICE_BIT_", macro_block, re.MULTILINE)),
         "VOICE_BIT definitions outside expected block",
     )
     macros = [macro_block]
-    for name in ("VOICE_POLL_MS", "VOICE_RETRY_MS"):
-        matches = list(re.finditer(r"^#define " + name + r"[ \t]+[0-9]+\n", source, re.MULTILINE))
+    for name in ("VOICE_NETWORK_READY", "VOICE_POLL_MS", "VOICE_RETRY_MS"):
+        matches = list(re.finditer(r"^#define " + name + r"[ \t(][^\n]*\n", macros_source, re.MULTILINE))
         require(len(matches) == 1, f"constant definition changed: {name}")
         macros.append(matches[0].group())
     return "\n".join(macros), "\n".join(fragments), ranges
@@ -462,7 +464,10 @@ def main():
     compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
     require(compiler, "no host C compiler found (cc/clang/gcc)")
     source = Path(__file__).resolve().parents[1] / "main" / "voice.c"
-    macros, functions, ranges = extract(source.read_text(encoding="utf-8"), source)
+    internal = Path(__file__).resolve().parents[1] / "main" / "voice_internal.h"
+    macros, functions, ranges = extract(
+        source.read_text(encoding="utf-8"), internal.read_text(encoding="utf-8"), source
+    )
     print("Extracting unchanged source (not the whole voice.c):", flush=True)
     for entry in ranges:
         print(f"  {entry}", flush=True)
