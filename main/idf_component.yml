@@ -1,5 +1,6 @@
 dependencies:
   espressif/cjson: ^1.7.19
+  espressif/mcp-c-sdk: '2.0.2'
   espressif/esp_codec_dev: ~1.6.2
   espressif/esp-sr: '2.4.7'
   espressif/esp_xiaozhi:

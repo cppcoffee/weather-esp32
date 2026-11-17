@@ -1,5 +1,6 @@
 #include "net.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,7 @@
 
 static const char *TAG = "net";
 static EventGroupHandle_t s_events; // 仅 GOT_IP；配网握手由 portal_web.c 管理
+static atomic_bool s_time_synced;
 #define GOT_IP BIT0
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -134,9 +136,21 @@ void net_apply_tz(int off)
     ESP_LOGI(TAG, "tz %s", tz);
 }
 
+static void on_time_sync(struct timeval *tv)
+{
+    (void)tv;
+    atomic_store(&s_time_synced, true);
+}
+
+bool net_time_is_synced(void)
+{
+    return atomic_load(&s_time_synced);
+}
+
 void net_time_sync(void)
 {
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    cfg.sync_cb = on_time_sync;
     if (esp_netif_sntp_init(&cfg) != ESP_OK) {
         ESP_LOGW(TAG, "sntp init failed");
         return;

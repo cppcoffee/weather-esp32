@@ -259,6 +259,7 @@ HARNESS = r'''
 #include "epd.h"
 #include "net.h"
 #include "ui.h"
+#include "device_mcp.h"
 #include "fixtures.h"
 
 typedef int esp_err_t;
@@ -556,6 +557,22 @@ const char *net_ap_ssid(void) { return "weather-123ABC"; }
 const char *net_ap_pass(void) { return "weather123ABC"; }
 void net_forget_creds(void) { puts("forget"); }
 void net_time_sync(void) { assert(weather_reserved); puts("time_sync"); }
+void device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying, bool updated) {
+    static weather_t previous;
+    static bool published;
+    assert(weather_reserved && sensor && !sensor->valid);
+    assert(updated == (pattern[cycle] == 'S'));
+    assert(retrying == !updated);
+    if (updated) {
+        assert(weather && weather->ok);
+        previous = *weather;
+        published = true;
+    } else if (published) {
+        assert(weather && memcmp(weather, &previous, sizeof(previous)) == 0);
+    } else {
+        assert(weather == NULL);
+    }
+}
 void net_apply_tz(int offset) {
     assert(offset == 28800 || offset == 19800);
     printf("timezone:%d\n", offset);

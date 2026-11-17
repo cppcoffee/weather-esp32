@@ -53,36 +53,43 @@ esp_err_t esp_xiaozhi_mcp_handle_message(esp_mcp_mgr_handle_t mgr_handle,
     uint16_t outlen = 0;
     esp_err_t ret = esp_mcp_mgr_req_handle(mgr_handle, ep_name, (const uint8_t *)payload, payload_len, &outbuf, &outlen);
     if (outbuf && outlen > 0) {
+        /* A manager error may still carry a valid JSON-RPC error reply. Deliver
+         * it normally; only local processing/delivery failures fail the chat. */
         cJSON *response_root = cJSON_CreateObject();
-        if (response_root) {
-            if (session_id) {
-                cJSON_AddStringToObject(response_root, "session_id", session_id);
-            }
-            cJSON_AddStringToObject(response_root, "type", "mcp");
-            cJSON *response_payload = cJSON_Parse((char *)outbuf);
-            if (response_payload) {
-                cJSON_AddItemToObject(response_root, "payload", response_payload);
-                char *json_str = cJSON_PrintUnformatted(response_root);
-                if (json_str) {
-                    esp_xiaozhi_transport_send_text(mcp_item->transport_handle, json_str);
-                    cJSON_free(json_str);
-                } else {
-                    ESP_LOGE(TAG, "Failed to print MCP response");
-                }
-            } else {
-                ESP_LOGE(TAG, "Failed to parse MCP response payload");
-            }
-            cJSON_Delete(response_root);
-        } else {
-            ESP_LOGE(TAG, "Failed to allocate MCP response");
+        cJSON *response_payload = NULL;
+        char *json_str = NULL;
+        ret = ESP_ERR_NO_MEM;
+        if (!response_root ||
+            (session_id && !cJSON_AddStringToObject(response_root, "session_id", session_id)) ||
+            !cJSON_AddStringToObject(response_root, "type", "mcp")) {
+            goto response_done;
         }
+        response_payload = cJSON_ParseWithLength((const char *)outbuf, outlen);
+        if (!response_payload) {
+            ret = ESP_ERR_INVALID_RESPONSE;
+            goto response_done;
+        }
+        if (!cJSON_AddItemToObject(response_root, "payload", response_payload)) {
+            goto response_done;
+        }
+        response_payload = NULL; /* Owned by response_root. */
+        json_str = cJSON_PrintUnformatted(response_root);
+        if (json_str) {
+            ret = esp_xiaozhi_transport_send_text(mcp_item->transport_handle, json_str);
+        }
+response_done:
+        cJSON_free(json_str);
+        cJSON_Delete(response_payload);
+        cJSON_Delete(response_root);
+    }
+    if (outbuf) {
         esp_mcp_mgr_req_destroy_response(mgr_handle, outbuf);
     }
-    if (ret != ESP_ERR_NOT_FOUND && ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to process MCP message: %s", esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to process or send MCP message: %s", esp_err_to_name(ret));
     }
 
-    return ESP_OK;
+    return ret;
 }
 
 esp_err_t esp_xiaozhi_mcp_get_handle(esp_mcp_mgr_handle_t mgr_handle, esp_xiaozhi_transport_handle_t *transport_handle)
@@ -122,7 +129,7 @@ static esp_err_t esp_xiaozhi_mcp_deinit(esp_mcp_transport_handle_t handle)
     esp_xiaozhi_mcp_item_t *mcp_item = (esp_xiaozhi_mcp_item_t *)handle;
     ESP_RETURN_ON_FALSE(mcp_item, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
-    esp_xiaozhi_transport_deinit(mcp_item->transport_handle);
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_transport_deinit(mcp_item->transport_handle), TAG, "Failed to deinit transport");
     mcp_item->handle = 0;
     mcp_item->config = NULL;
     if (s_xiaozhi_mcp == mcp_item) {
@@ -194,7 +201,7 @@ static esp_err_t esp_xiaozhi_mcp_stop(esp_mcp_transport_handle_t handle)
 
     esp_xiaozhi_mcp_item_t *mcp_item = (esp_xiaozhi_mcp_item_t *)handle;
 
-    esp_xiaozhi_transport_stop(mcp_item->transport_handle);
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_transport_stop(mcp_item->transport_handle), TAG, "Failed to stop transport");
     mcp_item->config = NULL;
 
     ESP_LOGD(TAG, "MCP transport stopped");

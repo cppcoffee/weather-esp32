@@ -1,5 +1,6 @@
 #include "audio.h"
 #include "button.h"
+#include "device_mcp.h"
 #include "driver/gpio.h"
 #include "epd.h"
 #include "esp_err.h"
@@ -201,6 +202,7 @@ static void run_weather_phase(app_t *app)
         ESP_LOGW(TAG, "update failed, retry #%u in %us", app->retry_attempt, app->retry_delay);
     }
 
+    device_mcp_publish(app->have_weather ? &app->shown : NULL, &app->sensor, app->retrying, updated);
     voice_weather_end();
     voice_net_ready();
     present(app, false);

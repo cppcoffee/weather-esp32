@@ -38,7 +38,7 @@ esp_err_t esp_xiaozhi_transport_deinit(esp_xiaozhi_transport_handle_t handle)
 
     esp_xiaozhi_transport_ctx_t *ctx = (esp_xiaozhi_transport_ctx_t *)handle;
     if (ctx->started) {
-        esp_xiaozhi_transport_stop(handle);
+        ESP_RETURN_ON_ERROR(esp_xiaozhi_transport_stop(handle), TAG, "Failed to stop before deinit");
     }
     free(ctx);
     return ESP_OK;
@@ -113,8 +113,9 @@ esp_err_t esp_xiaozhi_transport_stop(esp_xiaozhi_transport_handle_t handle)
         esp_xiaozhi_mqtt_stop(ctx->mqtt_handle);
         esp_xiaozhi_mqtt_deinit(ctx->mqtt_handle);
     } else {
-        esp_xiaozhi_websocket_stop(ctx->websocket_handle);
-        esp_xiaozhi_websocket_deinit(ctx->websocket_handle);
+        ESP_RETURN_ON_ERROR(esp_xiaozhi_websocket_stop(ctx->websocket_handle), TAG, "Failed to stop WebSocket");
+        ESP_RETURN_ON_ERROR(esp_xiaozhi_websocket_deinit(ctx->websocket_handle), TAG, "Failed to deinit WebSocket");
+        ctx->websocket_handle = 0;
     }
     ctx->started = false;
 

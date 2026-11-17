@@ -153,6 +153,6 @@ direct_dependencies:
 - espressif/mcp-c-sdk
 - espressif/mqtt
 - idf
-manifest_hash: f9278b0db25954791de8bcf2a10cd3b4020d5bb77e46a343f461f84fecf89886
+manifest_hash: 67f959b8e605c60059bb131f33a2099c9d2917862ffe1f4fa452c240c23441ab
 target: esp32s3
 version: 3.0.0

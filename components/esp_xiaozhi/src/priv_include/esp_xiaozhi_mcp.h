@@ -34,10 +34,10 @@ typedef struct {
 extern const esp_mcp_transport_t esp_mcp_transport_xiaozhi;
 
 /**
- * @brief  Handle incoming MQTT message for MCP
+ * @brief  Handle an incoming MCP message over the active transport.
  *
- *         This function should be called when a MCP message is received via MQTT.
- *         It processes the MCP message and sends the response back via MQTT.
+ * A JSON-RPC error reply delivered successfully counts as ESP_OK. Local response
+ * wrapping or send errors are returned to chat and reported via CHAT_ERROR.
  *
  * @param[in] mgr_handle   MCP manager handle
  * @param[in] ep_name     Endpoint name
@@ -48,7 +48,7 @@ extern const esp_mcp_transport_t esp_mcp_transport_xiaozhi;
  * @return
  *       - ESP_OK   On success
  *       - ESP_ERR_INVALID_ARG   Invalid arguments
- *       - ESP_FAIL              Failed to process message
+ *       - Other                 Manager, response wrapping, or transport send error
  */
 esp_err_t esp_xiaozhi_mcp_handle_message(esp_mcp_mgr_handle_t mgr_handle,
                                          const char *ep_name,

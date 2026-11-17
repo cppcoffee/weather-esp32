@@ -12,8 +12,8 @@ endif()
 
 set(EXTRA_COMPONENT_DIRS "${idf_test_components}"
                          "$ENV{IDF_PATH}/examples/common_components/protocol_examples_common"
-                         "../../esp_xiaozhi"
-                         "../../mcp-c-sdk")
+                         "../../esp_xiaozhi")
+# mcp-c-sdk and the WebSocket SDK are resolved by the local component's manifest.
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(esp_xiaozhi_test)

@@ -4,7 +4,7 @@
 
 ESP32-S3 + 2.9" SSD1680 墨水屏天气面板，ESP-IDF/C。源码 `main/`，主机回归 `tools/`。两个页面：按天（5 列）和按小时（10 列，每小时一列），按键切换。接口获取 5 天 + 21 条逐时数据；逐时页只显示前 10 条，不要把请求条数和显示列数混用。
 
-产品同时要支持**小智 AI 语音对话**：语音问答时间、天气和温湿度，墨水屏作为常显与语音状态的反馈面。语音对话仅由 WakeNet 检测「小鹿小鹿」触发。协议层用乐鑫的 `espressif/esp_xiaozhi` 组件，服务信息地址（OTA）由 SETUP-WIFI 页面逐台填写，固件没有内置默认服务器。接线和运行前置条件见「语音对话（小智 AI）」。屏上激活码、对话状态和时间天气 MCP 工具仍待接入。
+产品同时要支持**小智 AI 语音对话**：语音问答时间、天气和温湿度，墨水屏作为常显与语音状态的反馈面。语音对话仅由 WakeNet 检测「小鹿小鹿」触发。协议层用乐鑫的 `espressif/esp_xiaozhi` 组件，服务信息地址（OTA）由 SETUP-WIFI 页面逐台填写，固件没有内置默认服务器。接线和运行前置条件见「语音对话（小智 AI）」。时间、天气和本地温湿度 MCP 工具已接入，屏上激活码与对话状态仍待接入。
 
 本文描述当前实现；修改行为时同步更新相关测试与说明。`README.md`、`ABLATION.md` 中部分内容是历史记录，尤其是“不保留旧天气快照”和“切页强制全刷”，不能直接当作当前约束。
 
@@ -24,6 +24,8 @@ ESP32-S3 + 2.9" SSD1680 墨水屏天气面板，ESP-IDF/C。源码 `main/`，主
 ```bash
 python3 tools/test_app.py                 # 应用、解析、按键、UI 全量回归
 python3 tools/test_portal.py              # 配网页模板、转义及 HTTP 分块发送回归
+python3 tools/test_device_mcp.py          # 设备工具、快照、不可用状态、分配失败与并发回归
+python3 tools/test_voice_lifecycle.py     # 抽取真实状态函数，检查停止失败重试、挂起唤醒与重配网恢复
 python3 tools/test_app.py --only weather  # 仅天气解析
 python3 tools/test_app.py --only ui       # 仅 UI
 python3 tools/test_app.py --only app      # 仅应用流程
@@ -145,6 +147,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 | `main/voice.c` / `.h` | WakeNet 本地唤醒、`esp_xiaozhi` 会话、Opus 编解码；采集与会话分别运行在独立任务 |
 | `main/voice_settings.c` / `.h` | 小智官方/自建模式、信息地址和可选 WebSocket 地址的 NVS 保存及 URL 校验 |
 | `main/voice_audio.c` / `.h` | 纯函数：交错立体声→左声道单声道、单声道→立体声；不含 SDK 依赖，主机可测 |
+| `main/device_mcp.c` / `.h` | 发布屏幕同源的成功天气/传感器快照；用 managed MCP SDK 注册当前时间、5天+21小时预报、本地温湿度三个只读工具 |
 | `main/net_portal.c` | SoftAP 配网生命周期：AP/IP、WiFi 模式、DNS/网页服务启停 |
 | `main/portal_web.c` | 网页配网：热点扫描、模板渲染、WiFi 与小智服务设置 `/save` 保存与凭据事件 |
 | `components/dns_server/` | 复用 ESP-IDF captive portal 示例的 DNS server 组件 |
@@ -189,7 +192,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 
 ## 语音对话（小智 AI）
 
-- 协议用 `espressif/esp_xiaozhi`（上游 0.1.4 的本地 override，依赖 `esp_websocket_client`、`mcp-c-sdk`）连接官方或自建 Xiaozhi 服务；示例 `ai/xiaozhi_chat`，API 文档见 <https://docs.espressif.com/projects/esp-iot-solution/zh_CN/latest/ai/xiaozhi.html>。本地修改只增加带运行时 URL 的 info 请求入口；**不要在本项目重新实现 WebSocket、MQTT+UDP、hello/认证或 MCP**。来源、Apache-2.0 许可证和修改范围见 `components/esp_xiaozhi/LOCAL_PATCH.md`。
+- 协议用 `espressif/esp_xiaozhi`（上游 0.1.4 的本地 override，依赖 `esp_websocket_client`、`mcp-c-sdk`）连接官方或自建 Xiaozhi 服务；示例 `ai/xiaozhi_chat`，API 文档见 <https://docs.espressif.com/projects/esp-iot-solution/zh_CN/latest/ai/xiaozhi.html>。本地修改包含运行时 URL 的 info 请求入口、有界 WebSocket 发送、MCP 发送错误传播与安全 stop/deinit；**不要在本项目重新实现 WebSocket、MQTT+UDP、hello/认证或 MCP**。来源、Apache-2.0 许可证和修改范围见 `components/esp_xiaozhi/LOCAL_PATCH.md`。
 - 典型顺序：`esp_xiaozhi_chat_init`（传音频/事件回调）→ `esp_xiaozhi_chat_get_info`（POST 板卡信息拿激活码，把 MQTT/WS 配置写 NVS）→ `chat_start` → `chat_open_audio_channel`（不发 message 时自动生成 hello）→ `chat_send_audio_data` 推二进制音频帧 → `chat_stop` / `chat_deinit`。事件回调只报协议事实（TTS 起停、识别文本、emoji、system cmd），设备状态机、UI、执行命令由应用决定。
 - 编解码用 `esphome/micro-opus`。本地检测使用 `espressif/esp-sr` 2.4.7 的 `wn9_xiaoluxiaolu_tts2`（「小鹿小鹿」）。构建把模型打包到 `model` 分区，首次烧录要包含模型分区。依赖和许可由 ESP-IDF 组件管理器维护，见 ESP-SR 组件的 `LICENSE`。
 - `voice_init()` 加载模型并创建音频任务。联网后获取小智配置并初始化会话，首次激活码输出到串口。唤醒前仅在本地检测。命中后采集任务缓存单声道问句，供会话任务打开音频通道后用 60 ms Opus 帧上传。收到 TTS 开始或到达录音时限后停止上传；会话任务从队列解码播放，播放完成后恢复检测。
@@ -211,7 +214,8 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - 当前板卡 ESP32-S3-WROOM-1-N16R8 使用 8 MB Octal PSRAM，占用 GPIO33–37。音频已迁移为功放 EN=`GPIO2`、I²S DOUT=`GPIO47`、WS=`GPIO48`，其余 I²S/I²C 保持 GPIO38–42；GPIO47/48 在模块引脚区域相邻，适合缩短 PCB 走线。GPIO43/44 留作外接 UART，GPIO19/20 保留 USB-JTAG。`sdkconfig.defaults` 已启用 `CONFIG_SPIRAM`、`CONFIG_SPIRAM_MODE_OCT` 和 80 MHz PSRAM；刷板前必须核对 PCB 实际连线。固件在没有可用 PSRAM 时跳过唤醒初始化。
 - 栈与任务：语音跑独立任务，不要挤主任务（10 KB 栈已只为同步 HTTPS 留出）；若 keystore 的 NVS 操作在 PSRAM 栈上出问题，用 `esp_xiaozhi_nvs_ops_register` 把 NVS 转到 SRAM 任务。
 - 隐私边界：接上后麦克风音频和识别结果会上传到 xiaozhi.me，属于联网上传，不可写成“本地处理”。只在唤醒或明确触发后开麦，空闲时保持 `audio_set_mute` 静音、不发送音频。
-- 与天气的关系：语音问答读取已有的 `app->shown` 快照和 `sensor_reading_t`，作为 MCP 工具或本地意图回答；不要为一次问答重跑 `weather_update()`，也不要绕过“失败保留旧快照”的语义。
+- 与天气的关系：`device_mcp_publish()` 发布已有的 `app->shown` 快照和 `sensor_reading_t`，由 managed SDK 提供 `self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading` 三个无参数只读工具。不要为一次问答重跑 `weather_update()`，也不要绕过“失败保留旧快照”的语义。天气包含5天+21小时、抓取时间、单调缓存年龄、陈旧与重试状态；未对时抓取时间为null。传感器未接入时必须available=false，不能冒用预报。当前时间仅在SNTP成功、时钟合理且天气UTC偏移已知时synchronized=true。配套Rust服务端用官方rmcp发现与调用工具，云模型须支持tool_calls。
+- 等待预算：设备首音频等待90秒、播放中断流等待30秒；配套Rust文本回合正常首音频65秒、含失败提示75秒、总回合180秒（不包含ASR）。不要只改一端的超时。WS stop失败时保留chat/MCP/Opus，释放应用网络锁后由voice任务重试清理，禁止新会话；成功stop后deinit消费句柄。
 - 屏上反馈：语音状态（连接、聆听、说话、失败）沿用现有状态角落与文案机制，且**新增中文文案必须重跑 `tools/genfont.py`**（中文只在 `font_mid`）。**M1 尚未加语音文案和激活码页**，配对码只能从串口看；补屏上反馈时要一次把状态词和配对页做完，别分两次重生成字模。
 - 按键语义：短按切页，长按 3 秒重配网。
 - 音频回调把下行包送入有界队列。采集任务和播放任务共用 ES8311，播放期间暂停唤醒检测和录音。
@@ -259,7 +263,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - 改布局同步核对：`ui.c` 的日/小时列宽、网格起点和行锚点；`preview_ui.py` 的 `COL_W` / `GRID_X` / `DATE_BASE` / `ICON_TOP` / `DAILY_TEMP_BASE` / `PRECIP_BASE`、`icon_mask` / `expect_forecast`；`test_app.py` 的 `centers` / `boundaries` / `hour_centers`、图标字形、宽度及基线断言。不要只改断言以掩盖越界。
 - 主机解析测试广泛覆盖日数据、作用域、日期、非法值、缺项及截断 JSON；逐时有缺失/短数组/首日错位等用例，但 `validate_weather()` 尚未逐字段比较成功响应的 `hours`。改逐时解析时补对应断言，不假设现有用例已穷尽 DST 和数值边界。
 - 应用测试检查完整 SPI 帧、启动等待、退避、失败正文保留、状态角落隔离、首次对时和切页；网络为 stub，**不覆盖真实 `net.c` / `net_portal.c` / `portal_web.c` / `portal_dns.c` 的 NVS、WiFi、HTTP/TLS、DNS、网页、SNTP 或硬件阻塞时序**。
-- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/3 秒重配网动作。`main.c` 里的 `voice_*` 在 harness 中是 stub。改 `voice.c` 的时序或分帧仍需真机听感验证。
+- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/3 秒重配网动作；`test_device_mcp.py` 编译真实工具及managed cJSON，使用SDK公开头和stub注册API/时钟/RTOS，覆盖数据、失败快照保留、分配失败、并发，不验证MCP协议或真实SNTP。`test_voice_lifecycle.py` 抽取未经改写的网络状态/会话清理/voice主循环函数，stub RTOS与协议调用，覆盖停止失败资源保留、挂起唤醒、重配网后重新ARMED，不覆盖整个voice.c或真实SDK停止时序。`main.c` 里的 `voice_*` 和发布调用在 harness 中是 stub；发布断言检查与UI同源。改 `voice.c` 的时序或分帧仍需真机听感验证。
 - `partitions.csv` 分别为固件和 ESP-SR 模型分配分区。调整模型或依赖后，用构建输出核对 app 和模型镜像各自的大小。
 - `--baseline` 接受旧 `main/` 目录，用于比较请求、调用及完整帧；只有数据契约、布局和字模兼容的基线才有意义。`.cache/` 中历史快照不是运行依赖，不能直接套用旧的单日/旧切页结论。
 - `ABLATION.md` 的体积、帧像素与实机观察属于当时版本的实验，不是当前布局的测量；不要将旧数字或未经复测的残影结论写成当前保证。

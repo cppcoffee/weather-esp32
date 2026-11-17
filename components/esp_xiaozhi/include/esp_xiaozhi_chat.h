@@ -231,6 +231,24 @@ esp_err_t esp_xiaozhi_chat_init(esp_xiaozhi_chat_config_t *config, esp_xiaozhi_c
  * will stop runtime resources first. The MCP engine is destroyed only when
  * `config.owns_mcp_engine` was set to true during init.
  *
+ * Do not call from a transport/event callback. Serialize teardown with all other
+ * chat API calls on an application task. SDK stop joins the transport task and has
+ * no public timed-join API, so this is not a hard-deadline operation.
+ *
+ * WebSocket two-phase teardown contract (including MCP SDK 2.0.2):
+ * - First call esp_xiaozhi_chat_stop(). On failure, retain the chat handle, external
+ *   MCP engine and callback/audio resources; defer retry without starting/sending a
+ *   new session. A failed stop may have partially closed the old session.
+ * - Once stop returns ESP_OK, and with no intervening restart or concurrent API
+ *   calls, deinit consumes the chat handle even if it reports a cleanup error.
+ *   Clear the caller's handle after this call; do not retry deinit on it. With
+ *   owns_mcp_engine=false the external engine is not destroyed by either function.
+ *
+ * Without a previously successful stop, a non-ESP_OK deinit return is NOT a generic
+ * "handle still valid" indication: transport-stop failure retains it, whereas an
+ * error from owned-engine cleanup is returned after the chat itself is freed.
+ * MQTT/UDP teardown has additional paths; do not generalize this WS contract.
+ *
  * @param[in]  chat_hd  Handle to the chat instance
  *
  * @return
@@ -256,7 +274,17 @@ esp_err_t esp_xiaozhi_chat_start(esp_xiaozhi_chat_handle_t chat_hd);
  * @brief  Stop the chat session
  *
  * Stops the active chat runtime, including audio channel and MCP manager resources, but
- * does not destroy the configured MCP engine.
+ * does not destroy the configured MCP engine or the chat handle. Call from an
+ * application task, not from a transport/event callback, and serialize with other
+ * chat API calls. On the WebSocket path, ESP_OK means transport callbacks have
+ * finished and the MCP manager/transport are torn down. Repeated stop is safe.
+ *
+ * On failure keep the chat, external MCP engine and callback/audio resources alive
+ * for a later stop retry; do not start/send a new session meanwhile. Application
+ * callbacks may still run until stop succeeds. Release application locks between
+ * retries, and never hold a lock needed by a callback while waiting for stop/join.
+ * Application-owned worker tasks and queued events must be quiesced separately;
+ * joining WebSocket does not join them. See deinit's handle-consumption contract.
  *
  * @param[in]  chat_hd  Handle to the chat instance
  *

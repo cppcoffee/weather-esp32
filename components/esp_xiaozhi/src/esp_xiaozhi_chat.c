@@ -593,6 +593,14 @@ static esp_err_t esp_xiaozhi_chat_mcp_handler(esp_xiaozhi_chat_t *xiaozhi_chat, 
 
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to process MCP message: %s", esp_err_to_name(ret));
+        xiaozhi_chat->error_occurred = true;
+        if (xiaozhi_chat->event_callback) {
+            esp_xiaozhi_chat_error_info_t info = {
+                .code = ret,
+                .source = "mcp",
+            };
+            xiaozhi_chat->event_callback(ESP_XIAOZHI_CHAT_EVENT_CHAT_ERROR, &info, xiaozhi_chat->event_callback_ctx);
+        }
     }
 
     return ret;
@@ -753,9 +761,7 @@ static esp_err_t esp_xiaozhi_chat_connected_handler(esp_xiaozhi_transport_handle
 
     xiaozhi_chat->chat_connected = true;
 
-    esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_CONNECTED, NULL, 0, portMAX_DELAY);
-
-    return ESP_OK;
+    return esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_CONNECTED, NULL, 0, 0);
 }
 
 static esp_err_t esp_xiaozhi_chat_disconnected_handler(esp_xiaozhi_transport_handle_t handle)
@@ -765,9 +771,8 @@ static esp_err_t esp_xiaozhi_chat_disconnected_handler(esp_xiaozhi_transport_han
 
     xiaozhi_chat->chat_connected = false;
 
-    esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_DISCONNECTED, NULL, 0, portMAX_DELAY);
-
-    return ESP_OK;
+    /* Never block the WebSocket task (and its stop/join) on a full app event queue. */
+    return esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_DISCONNECTED, NULL, 0, 0);
 }
 
 static esp_err_t esp_xiaozhi_chat_transport_error_handler(esp_xiaozhi_transport_handle_t handle, esp_err_t err)
@@ -963,9 +968,9 @@ static esp_err_t esp_xiaozhi_chat_stop_runtime(esp_xiaozhi_chat_t *xiaozhi_chat)
         step_ret = esp_mcp_mgr_stop(xiaozhi_chat->mcp_mgr_handle);
         if (step_ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to stop MCP manager during stop: %s", esp_err_to_name(step_ret));
-            if (ret == ESP_OK) {
-                ret = step_ret;
-            }
+            /* The manager's deinit ignores transport teardown errors. Keep it
+             * and the chat alive if stop could not join the transport task. */
+            return step_ret;
         }
 
         step_ret = esp_mcp_mgr_deinit(xiaozhi_chat->mcp_mgr_handle);
@@ -1404,6 +1409,9 @@ esp_err_t esp_xiaozhi_chat_deinit(esp_xiaozhi_chat_handle_t chat_hd)
     ret = esp_xiaozhi_chat_stop_runtime(xiaozhi_chat);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to stop chat runtime during deinit: %s", esp_err_to_name(ret));
+        if (xiaozhi_chat->mcp_mgr_handle != 0) {
+            return ret; /* Still live: retry deinit from a non-callback task. */
+        }
     }
 
     if (xiaozhi_chat->udp != NULL && xiaozhi_chat->udp->audio_receive_events != NULL) {
@@ -1618,7 +1626,7 @@ esp_err_t esp_xiaozhi_chat_close_audio_channel(esp_xiaozhi_chat_handle_t chat_hd
     memset(xiaozhi_chat->session_id, 0, sizeof(xiaozhi_chat->session_id));
     esp_xiaozhi_chat_audio_close(xiaozhi_chat);
 
-    esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_AUDIO_CHANNEL_CLOSED, NULL, 0, portMAX_DELAY);
+    esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_AUDIO_CHANNEL_CLOSED, NULL, 0, 0);
 
     return ESP_OK;
 }

@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <esp_websocket_client.h>
 #include <esp_crt_bundle.h>
+#include <limits.h>
 
 #include "esp_xiaozhi_keystore.h"
 #include "esp_xiaozhi_board.h"
@@ -20,6 +21,7 @@ typedef struct esp_xiaozhi_websocket_s {
     char protocol_version[16];
     char headers[ESP_XIAOZHI_WEBSOCKET_MAX_HEADER_SIZE];
     bool websocket_connected;
+    bool client_started;
 
     esp_websocket_client_handle_t websocket_client;
     esp_xiaozhi_transport_handle_t transport_handle; /*!< Passed to callbacks so chat can resolve by transport handle */
@@ -30,6 +32,18 @@ typedef struct esp_xiaozhi_websocket_s {
 } esp_xiaozhi_websocket_t;
 
 static const char *TAG = "ESP_XIAOZHI_WEBSOCKET";
+
+#define WEBSOCKET_BUFFER_SIZE    4096
+#define WEBSOCKET_SEND_BUDGET_MS 5000
+
+static TickType_t esp_xiaozhi_websocket_send_timeout(size_t len)
+{
+    /* The SDK reuses timeout for the TX lock and each fragment; IDF's WS transport
+     * also uses it separately for poll, header and payload writes. Budget those
+     * waits together, rather than allowing 5 s for every 1 KB fragment. */
+    size_t fragments = len ? 1 + (len - 1) / WEBSOCKET_BUFFER_SIZE : 1;
+    return pdMS_TO_TICKS(WEBSOCKET_SEND_BUDGET_MS) / (1 + 3 * fragments);
+}
 
 static esp_err_t esp_xiaozhi_websocket_map_missing_config_error(esp_err_t err, const char *field_name)
 {
@@ -207,11 +221,14 @@ esp_err_t esp_xiaozhi_websocket_deinit(esp_xiaozhi_websocket_handle_t handle)
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
     esp_xiaozhi_websocket_t *websocket = (esp_xiaozhi_websocket_t *)handle;
-    esp_xiaozhi_payload_clear(&websocket->payload);
+    /* Join before releasing payload/callback state. SDK destroy alone ignores a
+     * failed stop (notably when called from its own event callback). */
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_websocket_stop(handle), TAG, "Failed to stop before destroy");
     if (websocket->websocket_client) {
-        esp_websocket_client_destroy(websocket->websocket_client);
+        ESP_RETURN_ON_ERROR(esp_websocket_client_destroy(websocket->websocket_client), TAG, "Failed to destroy client");
         websocket->websocket_client = NULL;
     }
+    esp_xiaozhi_payload_clear(&websocket->payload);
 
     free(websocket);
     return ESP_OK;
@@ -245,10 +262,14 @@ esp_err_t esp_xiaozhi_websocket_start(esp_xiaozhi_websocket_handle_t handle)
         .disable_auto_reconnect = false,
         .enable_close_reconnect = true,
         .reconnect_timeout_ms = 5000,
+        .network_timeout_ms = WEBSOCKET_SEND_BUDGET_MS,
+        .buffer_size = WEBSOCKET_BUFFER_SIZE,
     };
 
     if (websocket->websocket_client) {
-        esp_websocket_client_destroy(websocket->websocket_client);
+        ESP_RETURN_ON_ERROR(esp_xiaozhi_websocket_stop(handle), TAG, "Failed to stop previous client");
+        ESP_RETURN_ON_ERROR(esp_websocket_client_destroy(websocket->websocket_client), TAG,
+                            "Failed to destroy previous client");
         websocket->websocket_client = NULL;
     }
 
@@ -258,8 +279,10 @@ esp_err_t esp_xiaozhi_websocket_start(esp_xiaozhi_websocket_handle_t handle)
     ret = esp_websocket_register_events(websocket->websocket_client, WEBSOCKET_EVENT_ANY, esp_xiaozhi_websocket_event, websocket);
     ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Failed to register websocket events: %s", esp_err_to_name(ret));
 
+    websocket->client_started = true;
     ret = esp_websocket_client_start(websocket->websocket_client);
     if (ret) {
+        websocket->client_started = false;
         ESP_LOGE(TAG, "Failed to start websocket client: %s", esp_err_to_name(ret));
         esp_websocket_client_destroy(websocket->websocket_client);
         websocket->websocket_client = NULL;
@@ -278,8 +301,11 @@ esp_err_t esp_xiaozhi_websocket_stop(esp_xiaozhi_websocket_handle_t handle)
         return ESP_OK;
     }
 
-    esp_err_t ret = esp_websocket_client_stop(websocket->websocket_client);
-    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Failed to stop websocket client: %s", esp_err_to_name(ret));
+    if (websocket->client_started) {
+        esp_err_t ret = esp_websocket_client_stop(websocket->websocket_client);
+        ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Failed to stop websocket client: %s", esp_err_to_name(ret));
+        websocket->client_started = false;
+    }
     websocket->websocket_connected = false;
     esp_xiaozhi_payload_clear(&websocket->payload);
     websocket->payload_opcode = 0;
@@ -296,8 +322,11 @@ esp_err_t esp_xiaozhi_websocket_send_text(esp_xiaozhi_websocket_handle_t handle,
     ESP_RETURN_ON_FALSE(websocket->websocket_client, ESP_ERR_INVALID_STATE, TAG, "Websocket client not initialized");
     ESP_RETURN_ON_FALSE(websocket->websocket_connected, ESP_ERR_INVALID_STATE, TAG, "Websocket is not connected");
 
-    int sent = esp_websocket_client_send_text(websocket->websocket_client, text, strlen(text), portMAX_DELAY);
-    if (sent < 0) {
+    size_t len = strlen(text);
+    ESP_RETURN_ON_FALSE(len <= INT_MAX, ESP_ERR_INVALID_SIZE, TAG, "Text too large");
+    int sent = esp_websocket_client_send_text(websocket->websocket_client, text, (int)len,
+                                             esp_xiaozhi_websocket_send_timeout(len));
+    if (sent < 0 || (size_t)sent != len) {
         websocket->websocket_connected = false;
         if (websocket->callbacks.on_disconnected_callback) {
             websocket->callbacks.on_disconnected_callback((esp_xiaozhi_transport_handle_t)websocket->transport_handle);
@@ -318,8 +347,10 @@ esp_err_t esp_xiaozhi_websocket_send_binary(esp_xiaozhi_websocket_handle_t handl
     ESP_RETURN_ON_FALSE(websocket->websocket_client, ESP_ERR_INVALID_STATE, TAG, "Websocket client not initialized");
     ESP_RETURN_ON_FALSE(websocket->websocket_connected, ESP_ERR_INVALID_STATE, TAG, "Websocket is not connected");
 
-    int sent = esp_websocket_client_send_bin(websocket->websocket_client, (const char *)data, data_len, portMAX_DELAY);
-    if (sent < 0) {
+    ESP_RETURN_ON_FALSE(data_len <= INT_MAX, ESP_ERR_INVALID_SIZE, TAG, "Binary data too large");
+    int sent = esp_websocket_client_send_bin(websocket->websocket_client, (const char *)data, (int)data_len,
+                                            esp_xiaozhi_websocket_send_timeout(data_len));
+    if (sent < 0 || (size_t)sent != data_len) {
         websocket->websocket_connected = false;
         if (websocket->callbacks.on_disconnected_callback) {
             websocket->callbacks.on_disconnected_callback((esp_xiaozhi_transport_handle_t)websocket->transport_handle);

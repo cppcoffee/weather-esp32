@@ -1,4 +1,5 @@
 #include "voice.h"
+#include "device_mcp.h"
 #include "voice_settings.h"
 
 #include <string.h>
@@ -25,20 +26,21 @@
 static const char *TAG = "voice";
 static const char *WAKE_WORD = "小鹿小鹿";
 
-#define VOICE_SAMPLE_RATE         16000
-#define VOICE_FRAME_MS            60
-#define VOICE_FRAME_SAMPLES       (VOICE_SAMPLE_RATE / 1000 * VOICE_FRAME_MS)
-#define VOICE_TX_OPUS_MAX         512
-#define VOICE_RX_OPUS_MAX         1400
-#define VOICE_RX_QUEUE_LEN        8
-#define VOICE_TASK_STACK          8192
-#define VOICE_TASK_PRIO           5
-#define VOICE_TURN_TIMEOUT_MS     15000
-#define VOICE_RESPONSE_TIMEOUT_MS 30000
-#define VOICE_RETRY_MS            30000
-#define VOICE_POLL_MS             100
-#define WAKE_TASK_STACK           4096
-#define WAKE_BUFFER_BYTES         (VOICE_SAMPLE_RATE * sizeof(int16_t) * 12)
+#define VOICE_SAMPLE_RATE            16000
+#define VOICE_FRAME_MS               60
+#define VOICE_FRAME_SAMPLES          (VOICE_SAMPLE_RATE / 1000 * VOICE_FRAME_MS)
+#define VOICE_TX_OPUS_MAX            512
+#define VOICE_RX_OPUS_MAX            1400
+#define VOICE_RX_QUEUE_LEN           8
+#define VOICE_TASK_STACK             8192
+#define VOICE_TASK_PRIO              5
+#define VOICE_TURN_TIMEOUT_MS        15000
+#define VOICE_RESPONSE_TIMEOUT_MS    30000
+#define VOICE_FIRST_AUDIO_TIMEOUT_MS 90000
+#define VOICE_RETRY_MS               30000
+#define VOICE_POLL_MS                100
+#define WAKE_TASK_STACK              4096
+#define WAKE_BUFFER_BYTES            (VOICE_SAMPLE_RATE * sizeof(int16_t) * 12)
 
 #define VOICE_BIT_NET         (1 << 0)
 #define VOICE_BIT_TRIGGER     (1 << 1)
@@ -67,6 +69,7 @@ static model_iface_data_t *s_wake_model;
 static int s_wake_samples;
 static esp_xiaozhi_chat_handle_t s_chat;
 static esp_mcp_t *s_mcp;
+static bool s_cleanup_pending;
 static OpusEncoder *s_encoder;
 static OpusDecoder *s_decoder;
 
@@ -189,7 +192,10 @@ static void on_event(esp_xiaozhi_chat_event_t event, void *data, void *ctx)
 // 服务端主动结束会话（用户说"退下"）：交给 voice_task 释放资源
 static void on_server_goodbye(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg; (void)base; (void)id; (void)data;
+    (void)arg;
+    (void)base;
+    (void)id;
+    (void)data;
     ESP_LOGI(TAG, "server goodbye");
     xEventGroupSetBits(s_events, VOICE_BIT_HANGUP);
 }
@@ -198,10 +204,23 @@ static void close_session(void)
 {
     xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING);
     if (s_chat != 0) {
-        // Deinit stops transport callbacks before we release the caller-owned MCP.
-        esp_xiaozhi_chat_deinit(s_chat);
+        // A failed stop may leave callbacks live: retain all their resources and retry.
+        esp_err_t err = esp_xiaozhi_chat_stop(s_chat);
+        if (err != ESP_OK) {
+            s_cleanup_pending = true;
+            xEventGroupSetBits(s_events, VOICE_BIT_ERROR);
+            audio_set_mute(true);
+            ESP_LOGW(TAG, "session stop pending: %s", esp_err_to_name(err));
+            return;
+        }
+        // After successful WS stop, deinit consumes the handle even on cleanup errors.
+        err = esp_xiaozhi_chat_deinit(s_chat);
         s_chat = 0;
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "session cleanup: %s", esp_err_to_name(err));
+        }
     }
+    s_cleanup_pending = false;
     if (s_mcp != NULL) {
         esp_mcp_destroy(s_mcp);
         s_mcp = NULL;
@@ -249,8 +268,11 @@ static esp_err_t open_session(void)
         return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
     }
 
-    // The installed esp_xiaozhi requires a real engine even with no custom tools.
     err = esp_mcp_create(&s_mcp);
+    if (err != ESP_OK) {
+        goto failed;
+    }
+    err = device_mcp_register(s_mcp);
     if (err != ESP_OK) {
         goto failed;
     }
@@ -331,7 +353,12 @@ static esp_err_t stream_microphone(void)
 static esp_err_t play_response(void)
 {
     TickType_t last_audio = xTaskGetTickCount();
-    while (xTaskGetTickCount() - last_audio < pdMS_TO_TICKS(VOICE_RESPONSE_TIMEOUT_MS)) {
+    bool received_audio = false;
+    // Tool discovery + LLM/tool rounds + first TTS have a bounded 75 s server budget.
+    // Once playback starts, retain the shorter gap limit rather than extending every gap.
+    while (xTaskGetTickCount() - last_audio
+           < pdMS_TO_TICKS(received_audio ? VOICE_RESPONSE_TIMEOUT_MS : VOICE_FIRST_AUDIO_TIMEOUT_MS))
+    {
         if (!network_ready() || (xEventGroupGetBits(s_events) & VOICE_BIT_ERROR)) {
             return ESP_FAIL;
         }
@@ -350,6 +377,7 @@ static esp_err_t play_response(void)
             if (err != ESP_OK || written != (size_t)samples * 4) {
                 return ESP_FAIL;
             }
+            received_audio = true;
             last_audio = xTaskGetTickCount();
         } else if (xEventGroupGetBits(s_events) & VOICE_BIT_TTS_STOPPED) {
             // TTS stop can arrive before the worker drains the queued audio.
@@ -404,15 +432,29 @@ static esp_err_t run_turn(void)
 static void voice_task(void *arg)
 {
     (void)arg;
-    bool suspended = false;   // 用户说过"退下"：不建会话，只跑本地唤醒
+    bool suspended = false; // 用户说过"退下"：不建会话，只跑本地唤醒
     for (;;) {
         EventBits_t bits =
             xEventGroupWaitBits(s_events, VOICE_BIT_NET | VOICE_BIT_RESET, pdFALSE, pdFALSE, portMAX_DELAY);
         if (xSemaphoreTake(s_network_lock, pdMS_TO_TICKS(VOICE_POLL_MS)) != pdTRUE) {
             continue;
         }
+        if (s_cleanup_pending) {
+            close_session();
+            if (!s_cleanup_pending && suspended && network_ready()) {
+                xEventGroupSetBits(s_events, VOICE_BIT_ARMED);
+            }
+            xSemaphoreGive(s_network_lock);
+            vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
+            continue;
+        }
         if (bits & VOICE_BIT_RESET) {
             close_session();
+            if (s_cleanup_pending) {
+                xSemaphoreGive(s_network_lock);
+                continue;
+            }
+            suspended = false; // Reprovisioning starts a fresh session after NET becomes ready again.
             xEventGroupClearBits(s_events, VOICE_BIT_RESET | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE | VOICE_BIT_TRIGGER);
             xSemaphoreGive(s_network_lock);
             continue;
@@ -422,7 +464,9 @@ static void voice_task(void *arg)
             xEventGroupClearBits(s_events, VOICE_BIT_HANGUP);
             close_session();
             suspended = true;
-            xEventGroupSetBits(s_events, VOICE_BIT_ARMED);
+            if (!s_cleanup_pending) {
+                xEventGroupSetBits(s_events, VOICE_BIT_ARMED);
+            }
             xSemaphoreGive(s_network_lock);
             ESP_LOGI(TAG, "session released, waiting for wake word");
             continue;
@@ -447,7 +491,7 @@ static void voice_task(void *arg)
         }
         xSemaphoreGive(s_network_lock);
         if (err != ESP_OK) {
-            // No stale handles or partial codec state survive a failed attempt.
+            // Failed stop retains callback-owned resources; pending cleanup runs before the next setup.
             xEventGroupWaitBits(s_events, VOICE_BIT_RESET, pdFALSE, pdFALSE, pdMS_TO_TICKS(VOICE_RETRY_MS));
             continue;
         }
@@ -510,7 +554,7 @@ esp_err_t voice_init(void)
     s_events = xEventGroupCreate();
     if (s_events != NULL) {
         ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_SERVER_GOODBYE,
-                                                  on_server_goodbye, NULL));
+                                                   on_server_goodbye, NULL));
     }
     s_network_lock = xSemaphoreCreateMutex();
     s_rx_queue = xQueueCreate(VOICE_RX_QUEUE_LEN, sizeof(voice_packet_t));
