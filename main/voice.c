@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "audio.h"
+#include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mcp_engine.h"
@@ -48,6 +49,7 @@ static const char *WAKE_WORD = "小鹿小鹿";
 #define VOICE_BIT_RESET       (1 << 6)
 #define VOICE_BIT_ARMED       (1 << 7)
 #define VOICE_BIT_CAPTURE     (1 << 8)
+#define VOICE_BIT_HANGUP      (1 << 9)
 #define VOICE_TURN_BITS       (VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_ERROR)
 
 typedef struct {
@@ -184,6 +186,14 @@ static void on_event(esp_xiaozhi_chat_event_t event, void *data, void *ctx)
     }
 }
 
+// 服务端主动结束会话（用户说"退下"）：交给 voice_task 释放资源
+static void on_server_goodbye(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    ESP_LOGI(TAG, "server goodbye");
+    xEventGroupSetBits(s_events, VOICE_BIT_HANGUP);
+}
+
 static void close_session(void)
 {
     xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING);
@@ -208,24 +218,6 @@ static void close_session(void)
     audio_set_mute(true);
 }
 
-static esp_err_t apply_websocket_override(const voice_settings_t *settings)
-{
-    if (settings->websocket_url[0] == '\0') {
-        return ESP_OK;
-    }
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open("websocket", NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = nvs_set_str(handle, "url", settings->websocket_url);
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return err;
-}
-
 static esp_err_t open_session(void)
 {
     esp_xiaozhi_chat_config_t config = ESP_XIAOZHI_CHAT_DEFAULT_CONFIG();
@@ -247,13 +239,9 @@ static esp_err_t open_session(void)
             ESP_LOGW(TAG, "activation code: %s %s", info.activation_code,
                      info.activation_message ? info.activation_message : "");
         }
-        err = apply_websocket_override(&settings);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "websocket override unavailable: %s", esp_err_to_name(err));
-        }
-        // 只走 WebSocket：可选地址覆盖服务端下发的地址
+        // 只走 WebSocket，地址一律用信息接口下发的那条
         config.has_mqtt_config = false;
-        config.has_websocket_config = settings.websocket_url[0] != '\0' || info.has_websocket_config;
+        config.has_websocket_config = info.has_websocket_config;
     }
     esp_xiaozhi_chat_free_info(&info);
     if (err != ESP_OK || !config.has_websocket_config) {
@@ -416,6 +404,7 @@ static esp_err_t run_turn(void)
 static void voice_task(void *arg)
 {
     (void)arg;
+    bool suspended = false;   // 用户说过"退下"：不建会话，只跑本地唤醒
     for (;;) {
         EventBits_t bits =
             xEventGroupWaitBits(s_events, VOICE_BIT_NET | VOICE_BIT_RESET, pdFALSE, pdFALSE, portMAX_DELAY);
@@ -426,6 +415,26 @@ static void voice_task(void *arg)
             close_session();
             xEventGroupClearBits(s_events, VOICE_BIT_RESET | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE | VOICE_BIT_TRIGGER);
             xSemaphoreGive(s_network_lock);
+            continue;
+        }
+        // 服务端说了 goodbye：释放 WS/MCP/编解码器，只留唤醒
+        if (xEventGroupGetBits(s_events) & VOICE_BIT_HANGUP) {
+            xEventGroupClearBits(s_events, VOICE_BIT_HANGUP);
+            close_session();
+            suspended = true;
+            xEventGroupSetBits(s_events, VOICE_BIT_ARMED);
+            xSemaphoreGive(s_network_lock);
+            ESP_LOGI(TAG, "session released, waiting for wake word");
+            continue;
+        }
+        // 挂起中：等唤醒再重建会话
+        if (suspended) {
+            xSemaphoreGive(s_network_lock);
+            bits = xEventGroupWaitBits(s_events, VOICE_BIT_TRIGGER | VOICE_BIT_RESET, pdFALSE, pdFALSE,
+                                       pdMS_TO_TICKS(VOICE_POLL_MS));
+            if (bits & VOICE_BIT_TRIGGER) {
+                suspended = false;
+            }
             continue;
         }
         esp_err_t err = ESP_OK;
@@ -499,6 +508,10 @@ esp_err_t voice_init(void)
     }
     err = ESP_ERR_NO_MEM;
     s_events = xEventGroupCreate();
+    if (s_events != NULL) {
+        ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_SERVER_GOODBYE,
+                                                  on_server_goodbye, NULL));
+    }
     s_network_lock = xSemaphoreCreateMutex();
     s_rx_queue = xQueueCreate(VOICE_RX_QUEUE_LEN, sizeof(voice_packet_t));
     s_microphone = xStreamBufferCreateWithCaps(WAKE_BUFFER_BYTES, sizeof(s_mono), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

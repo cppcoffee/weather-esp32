@@ -8,11 +8,10 @@
 
 #define VOICE_URL_CAP            256
 #define VOICE_SETTINGS_NAMESPACE "wifi"
-#define VOICE_SETTINGS_KEY       "voice_v2"
+#define VOICE_SETTINGS_KEY       "voice_v3"
 
 typedef struct {
     char info_url[VOICE_URL_CAP];
-    char websocket_url[VOICE_URL_CAP];
 } voice_settings_t;
 
 // Only a missing namespace/key yields zeroed settings (未配置). Other errors leave
@@ -25,7 +24,7 @@ esp_err_t voice_settings_load(voice_settings_t *settings);
 // owns the commit and close, including any WiFi credential writes in that transaction.
 esp_err_t voice_settings_store(nvs_handle_t handle, const voice_settings_t *settings);
 
-// ESP_ERR_INVALID_ARG for NULL, unterminated arrays or disallowed URLs.
-// info_url is required: there is no built-in default OTA address. websocket_url may be
-// empty, in which case the address from the info response is used.
+// ESP_ERR_INVALID_ARG for NULL, an unterminated array or a disallowed URL.
+// info_url is required: there is no built-in default OTA address, and the WebSocket
+// address always comes from the info response.
 esp_err_t voice_settings_validate(const voice_settings_t *settings);

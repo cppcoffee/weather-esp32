@@ -252,14 +252,13 @@ static esp_err_t root_get(httpd_req_t *req)
     }
 
     char count[12];
-    char escaped_voice_url[VOICE_URL_CAP * 6], escaped_voice_ws[VOICE_URL_CAP * 6];
+    char escaped_voice_url[VOICE_URL_CAP * 6];
     voice_settings_t settings = {0};
     if (voice_settings_load(&settings) != ESP_OK) {
         ESP_LOGW(TAG, "invalid saved voice settings; showing empty fields");
         memset(&settings, 0, sizeof(settings));
     }
     html_escape(settings.info_url, escaped_voice_url, sizeof(escaped_voice_url));
-    html_escape(settings.websocket_url, escaped_voice_ws, sizeof(escaped_voice_ws));
     snprintf(count, sizeof(count), "%d", n);
     const page_value_t values[] = {
         {"{{STYLE}}", portal_style},
@@ -269,7 +268,6 @@ static esp_err_t root_get(httpd_req_t *req)
         {"{{AP_URL}}", NET_AP_URL},
         {"{{AP_SSID}}", own},
         {"{{VOICE_URL}}", escaped_voice_url},
-        {"{{VOICE_WS}}", escaped_voice_ws},
     };
     esp_err_t err = send_page(req, portal_index, values, sizeof(values) / sizeof(values[0]));
     free(options);
@@ -326,11 +324,10 @@ static esp_err_t save_post(httpd_req_t *req)
     // 信息地址必填：固件没有内置默认 OTA 地址
     voice_settings_t settings = {0};
     form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
-    form_field(body, "voice_ws", settings.websocket_url, sizeof(settings.websocket_url));
     esp_err_t voice_err = voice_settings_validate(&settings);
     if (voice_err != ESP_OK) {
         nvs_close(h);
-        return reply(req, "语音地址无效", "请填写服务信息地址（OTA）和可选的 WebSocket 地址。", false);
+        return reply(req, "语音地址无效", "请填写服务信息地址（OTA），例如 http://PC局域网IP:8003/xiaozhi/ota/", false);
     }
     esp_err_t err = nvs_set_str(h, "ssid", ssid);
     if (err == ESP_OK) {

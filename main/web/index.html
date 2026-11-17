@@ -57,13 +57,6 @@
                         <code>http://PC局域网IP:8003/xiaozhi/ota/</code>
                     </p>
                 </div>
-                <div class="f">
-                    <label for="voice-ws">WebSocket 地址（可选）</label>
-                    <input type="url" name="voice_ws" id="voice-ws" maxlength="255" value="{{VOICE_WS}}" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-ws-help voice-host-help">
-                    <p class="hint" id="voice-ws-help">留空时自动使用服务端下发的地址。手动填写示例：
-                        <code>ws://PC局域网IP:8000/xiaozhi/v1/</code>
-                    </p>
-                </div>
                 <p class="hint" id="voice-host-help">请将 PC局域网IP 换成运行服务的电脑的局域网 IP，设备不能填写 localhost。</p>
             </section>
             <button class="send" type="submit">保存并连接</button>

@@ -61,9 +61,8 @@ HARNESS = r'''
 #include <string.h>
 
 _Static_assert(VOICE_URL_CAP == 256, "URL capacity is part of the storage contract");
-_Static_assert(sizeof(voice_settings_t) == 512, "Unexpected persisted layout");
+_Static_assert(sizeof(voice_settings_t) == 256, "Unexpected persisted layout");
 _Static_assert(offsetof(voice_settings_t, info_url) == 0, "Unexpected info_url layout");
-_Static_assert(offsetof(voice_settings_t, websocket_url) == 256, "Unexpected websocket_url layout");
 
 #define READ_HANDLE 19
 #define WRITE_HANDLE 23
@@ -114,7 +113,7 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *value, size_t
 {
     ++reads;
     assert(handle == READ_HANDLE && read_open);
-    assert(strcmp(key, "voice_v2") == 0 && length);
+    assert(strcmp(key, "voice_v3") == 0 && length);
     if (get_error != ESP_OK) {
         // Even a failed read which touched its buffer must not mutate the caller's output.
         if (value && *length >= 4) {
@@ -142,7 +141,7 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *value, size_t
 esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, size_t length)
 {
     ++sets;
-    assert(strcmp(key, "voice_v2") == 0 && value);
+    assert(strcmp(key, "voice_v3") == 0 && value);
     assert(length == sizeof(voice_settings_t));
     if (handle != WRITE_HANDLE || !write_open) {
         return ESP_ERR_NVS_INVALID_HANDLE;
@@ -181,12 +180,11 @@ void nvs_close(nvs_handle_t handle)
     }
 }
 
-static voice_settings_t make_settings(const char *info, const char *websocket)
+static voice_settings_t make_settings(const char *info)
 {
     voice_settings_t settings = {0};
-    assert(strlen(info) < VOICE_URL_CAP && strlen(websocket) < VOICE_URL_CAP);
+    assert(strlen(info) < VOICE_URL_CAP);
     strcpy(settings.info_url, info);
-    strcpy(settings.websocket_url, websocket);
     return settings;
 }
 
@@ -195,18 +193,17 @@ static void expect_validation(const voice_settings_t *settings, esp_err_t expect
     voice_settings_t before = *settings;
     esp_err_t actual = voice_settings_validate(settings);
     if (actual != expected) {
-        fprintf(stderr, "validate info='%s' ws='%s': got %x, expected %x\n",
-                settings->info_url, settings->websocket_url, actual, expected);
+        fprintf(stderr, "validate info='%s': got %x, expected %x\n",
+                settings->info_url, actual, expected);
     }
     assert(actual == expected);
     assert(memcmp(&before, settings, sizeof(before)) == 0);
     ++checks;
 }
 
-static void expect_url(const char *url, bool websocket, bool valid)
+static void expect_url(const char *url, bool valid)
 {
-    voice_settings_t settings = make_settings(websocket ? "https://voice.example/info" : url,
-                                               websocket ? url : "");
+    voice_settings_t settings = make_settings(url);
     expect_validation(&settings, valid ? ESP_OK : ESP_ERR_INVALID_ARG);
 }
 
@@ -222,14 +219,7 @@ static void test_urls(void)
         "https://example.com/?", "https://example.com/path/@name?x=%00%0D%0A",
     };
     for (size_t i = 0; i < sizeof(valid_info) / sizeof(valid_info[0]); ++i) {
-        expect_url(valid_info[i], false, true);
-    }
-    const char *valid_ws[] = {
-        "ws://192.168.1.2:8000/xiaozhi/v1/", "wss://voice.example/ws?token=a%2Fb%23c",
-        "ws://[2001:db8::2]:65535/", "wss://VOICE.EXAMPLE:443/ws?email=a@b.example",
-    };
-    for (size_t i = 0; i < sizeof(valid_ws) / sizeof(valid_ws[0]); ++i) {
-        expect_url(valid_ws[i], true, true);
+        expect_url(valid_info[i], true);
     }
     const char *invalid_info[] = {
         "", "/info", "voice.example/info", "//voice.example/info", "http:voice.example",
@@ -252,29 +242,19 @@ static void test_urls(void)
         "https://host/\x7f", "https://host/\xc3\xa9", "https://h\xc3\xb6st.example/",
     };
     for (size_t i = 0; i < sizeof(invalid_info) / sizeof(invalid_info[0]); ++i) {
-        expect_url(invalid_info[i], false, false);
+        expect_url(invalid_info[i], false);
     }
-    const char *invalid_ws[] = {
-        "http://host/ws", "https://host/ws", "wsx://host/ws", "WS://host/ws", "Wss://host/ws",
-        "ws://host:0/", "ws://host:65536/", "wss://user:pass@host/", "ws://@host/", "wss://host/#",
-        "ws://localhost/", "wss://a.LOCALHOST/", "ws://127.20.30.40/", "wss://0.0.0.0/",
-        "ws://[::1]/", "ws://[::]/", "wss://[::ffff:127.0.0.2]/", "ws://host/a b",
-        "wss://host/\n", "ws://host/\xff", "ws://", "/ws",
-    };
-    for (size_t i = 0; i < sizeof(invalid_ws) / sizeof(invalid_ws[0]); ++i) {
-        expect_url(invalid_ws[i], true, false);
-    }
-    // All literal controls, whitespace and non-ASCII bytes must be rejected in both URL fields.
+    // ws/wss 不再作为信息地址接受
+    expect_url("ws://voice.example/xiaozhi/v1/", false);
+    expect_url("wss://voice.example/ws", false);
+    // All literal controls, whitespace and non-ASCII bytes must be rejected.
     char url[] = "https://voice.example/aXb";
     for (unsigned int byte = 1; byte <= 255; ++byte) {
         if (byte > 32 && byte < 127) {
             continue;
         }
         url[sizeof(url) - 3] = (char)byte;
-        expect_url(url, false, false);
-        char ws[VOICE_URL_CAP];
-        snprintf(ws, sizeof(ws), "ws%s", url + 4);
-        expect_url(ws, true, false);
+        expect_url(url, false);
     }
 }
 
@@ -286,7 +266,6 @@ static void test_settings_and_bounds(void)
     strcpy(bounds.info_url, "https://voice.example/info");
     expect_validation(&bounds, ESP_OK);
     memset(bounds.info_url, 0, sizeof(bounds.info_url));
-    strcpy(bounds.websocket_url, "wss://voice.example/ws");
     expect_validation(&bounds, ESP_ERR_INVALID_ARG);
 
     struct {
@@ -296,11 +275,9 @@ static void test_settings_and_bounds(void)
     } guarded;
     memset(&guarded, 0xa5, sizeof(guarded));
     memset(guarded.settings.info_url, 'x', VOICE_URL_CAP);
-    strcpy(guarded.settings.websocket_url, "ws://voice.example/ws");
     assert(voice_settings_validate(&guarded.settings) == ESP_ERR_INVALID_ARG);
     strcpy(guarded.settings.info_url, "https://voice.example/info");
-    memset(guarded.settings.websocket_url, 'x', VOICE_URL_CAP);
-    assert(voice_settings_validate(&guarded.settings) == ESP_ERR_INVALID_ARG);
+    assert(voice_settings_validate(&guarded.settings) == ESP_OK);
     guarded.settings.info_url[0] = '\0';
     assert(voice_settings_validate(&guarded.settings) == ESP_ERR_INVALID_ARG);
     for (size_t i = 0; i < sizeof(guarded.before); ++i) {
@@ -308,10 +285,10 @@ static void test_settings_and_bounds(void)
     }
     checks += 3;
 
-    for (int field = 0; field < 2; ++field) {
-        voice_settings_t settings = make_settings("https://voice.example/info", "");
-        char *url = field ? settings.websocket_url : settings.info_url;
-        const char *prefix = field ? "wss://voice.example/" : "https://voice.example/";
+    {
+        voice_settings_t settings = make_settings("https://voice.example/info");
+        char *url = settings.info_url;
+        const char *prefix = "https://voice.example/";
         memset(url, 'a', VOICE_URL_CAP);
         memcpy(url, prefix, strlen(prefix));
         url[VOICE_URL_CAP - 1] = '\0';
@@ -338,7 +315,7 @@ static void seed_blob(const voice_settings_t *settings)
 
 static void expect_failed_load(esp_err_t expected)
 {
-    voice_settings_t output = make_settings("http://192.168.1.2:8000/ota/", "ws://192.168.1.2:8000/ws");
+    voice_settings_t output = make_settings("http://192.168.1.2:8003/xiaozhi/ota/");
     voice_settings_t before = output;
     assert(voice_settings_load(&output) == expected);
     assert(memcmp(&output, &before, sizeof(output)) == 0);
@@ -399,7 +376,7 @@ static void test_load(void)
     }
     for (int corruption = 0; corruption < 6; ++corruption) {
         reset_nvs();
-        voice_settings_t invalid = make_settings("https://voice.example/info", "wss://voice.example/ws");
+        voice_settings_t invalid = make_settings("https://voice.example/info");
         switch (corruption) {
         case 0:
             invalid.info_url[0] = '\0';
@@ -411,13 +388,13 @@ static void test_load(void)
             memset(invalid.info_url, 'a', VOICE_URL_CAP);
             break;
         case 3:
-            memset(invalid.websocket_url, 'a', VOICE_URL_CAP);
+            strcpy(invalid.info_url, "http://127.0.0.1:8003/xiaozhi/ota/");
             break;
         case 4:
             strcpy(invalid.info_url, "http://127.0.0.1/ota/");
             break;
         case 5:
-            strcpy(invalid.websocket_url, "wss://user:pass@voice.example/ws");
+            strcpy(invalid.info_url, "https://user:pass@voice.example/ota/");
             break;
         }
         seed_blob(&invalid);
@@ -430,8 +407,7 @@ static void test_store(void)
 {
     const voice_settings_t cases[] = {
         {.info_url = "https://voice.example/info"},
-        {.info_url = "http://192.168.1.8:8000/ota/?x=a%20b",
-         .websocket_url = "ws://192.168.1.8:8000/ws?token=a%23b"},
+        {.info_url = "http://192.168.1.8:8000/xiaozhi/ota/?x=a%20b&token=a%23b"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_nvs();
@@ -457,7 +433,7 @@ static void test_store(void)
     reset_nvs();
     nvs_handle_t handle;
     assert(nvs_open("wifi", NVS_READWRITE, &handle) == ESP_OK);
-    voice_settings_t saved = make_settings("https://voice.example/info", "wss://voice.example/ws");
+    voice_settings_t saved = make_settings("https://voice.example/info");
     assert(voice_settings_store(handle, &saved) == ESP_OK);
     assert(nvs_commit(handle) == ESP_OK);
     voice_settings_t invalid = saved;
@@ -467,7 +443,7 @@ static void test_store(void)
     const esp_err_t write_errors[] = {ESP_FAIL, ESP_ERR_NVS_NOT_ENOUGH_SPACE, ESP_ERR_NVS_INVALID_HANDLE};
     for (size_t i = 0; i < sizeof(write_errors) / sizeof(write_errors[0]); ++i) {
         set_error = write_errors[i];
-        voice_settings_t replacement = make_settings("https://voice.example/other", "");
+        voice_settings_t replacement = make_settings("https://voice.example/other");
         assert(voice_settings_store(handle, &replacement) == set_error);
         assert(commits == 1 && closes == 0 && write_open);
         assert(memcmp(blob, &saved, sizeof(saved)) == 0 && !pending_present);
@@ -486,7 +462,7 @@ static void test_store(void)
 int main(void)
 {
     assert(strcmp(VOICE_SETTINGS_NAMESPACE, "wifi") == 0);
-    assert(strcmp(VOICE_SETTINGS_KEY, "voice_v2") == 0);
+    assert(strcmp(VOICE_SETTINGS_KEY, "voice_v3") == 0);
     test_urls();
     test_settings_and_bounds();
     test_load();

@@ -156,7 +156,7 @@ static bool field_equals(const char *url, const struct http_parser_url *parsed, 
            && memcmp(url + parsed->field_data[field].off, expected, length) == 0;
 }
 
-static bool valid_url(const char *url, bool websocket)
+static bool valid_url(const char *url)
 {
     size_t length = strlen(url);
     for (size_t i = 0; i < length; ++i) {
@@ -179,8 +179,8 @@ static bool valid_url(const char *url, bool websocket)
     if (memchr(url, '@', parsed.field_data[UF_HOST].off)) {
         return false;
     }
-    if (!field_equals(url, &parsed, UF_SCHEMA, websocket ? "ws" : "http")
-        && !field_equals(url, &parsed, UF_SCHEMA, websocket ? "wss" : "https"))
+    if (!field_equals(url, &parsed, UF_SCHEMA, "http")
+        && !field_equals(url, &parsed, UF_SCHEMA, "https"))
     {
         return false;
     }
@@ -189,13 +189,11 @@ static bool valid_url(const char *url, bool websocket)
 
 esp_err_t voice_settings_validate(const voice_settings_t *settings)
 {
-    if (!settings || !memchr(settings->info_url, '\0', VOICE_URL_CAP)
-        || !memchr(settings->websocket_url, '\0', VOICE_URL_CAP))
+    if (!settings || !memchr(settings->info_url, '\0', VOICE_URL_CAP))
     {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!valid_url(settings->info_url, false)
-        || (settings->websocket_url[0] != '\0' && !valid_url(settings->websocket_url, true)))
+    if (!valid_url(settings->info_url))
     {
         return ESP_ERR_INVALID_ARG;
     }
