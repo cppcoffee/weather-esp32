@@ -33,7 +33,7 @@ ESP32-S3 + GYSDISPLAY 2.9" 墨水屏（物理 296×128，面板 RAM 128×296，S
 | 音频 GND | GND | 必须与 ESP32-S3 共地 |
 ### 小智 AI 语音唤醒
 
-启用语音后，说「小鹿小鹿」触发一轮对话。固件通过 ESP-SR WakeNet 在本地识别唤醒词，命中后才向小智服务上传问句。服务信息地址（OTA）必须逐台在配网页填写，固件没有内置默认地址。按键用于短按切页和长按 3 秒重新配网。
+启用语音后，说「小鹿小鹿」触发一轮对话。固件通过 ESP-SR WakeNet 在本地识别唤醒词，命中后才向小智服务上传问句。服务信息地址（OTA）必须逐台在配网页填写，固件没有内置默认地址。按键用于短按切页和长按 5 秒重新配网。
 
 ESP32-S3-WROOM-1-N16R8 的 8 MB Octal PSRAM 使用 GPIO33–37。音频已移到 `GPIO2`、`GPIO47` 和 `GPIO48`；其中 I²S 的两根迁移线在模块引脚区域相邻，便于 PCB 布线。GPIO43/44 继续留给外接 UART 调试，GPIO19/20 保留 USB-JTAG。默认配置已启用 Octal PSRAM（80 MHz），首次启用前仍需确认 PCB 实际连线与模块型号一致。
 
@@ -72,7 +72,7 @@ ESP32-S3-WROOM-1-N16R8 的 8 MB Octal PSRAM 使用 GPIO33–37。音频已移到
 - `wake word detected`：本地已经检测到“小鹿小鹿”，随后应看到 `listening`。
 - `user:` / `bot:`：串口收到识别文本或回答文本。
 
-当前版本的语音状态和激活码没有显示在墨水屏上。短按按键仍然切换天气页面，长按 3 秒会清除 WiFi 凭据并进入配网，这会中断语音会话。
+当前版本的语音状态和激活码没有显示在墨水屏上。短按按键仍然切换天气页面，长按 5 秒会清除 WiFi 凭据并进入配网，这会中断语音会话。
 
 ### 语音读取时间、天气与温湿度（MCP）
 
@@ -126,7 +126,7 @@ idf.py -p /dev/cu.usbmodem* flash
 
 屏幕在配网模式会显示这条提示。换网络：清一次 NVS（`idf.py erase-flash` 会连固件一起清掉，之后重新烧）或用同样的方法重新配。
 
-已保存的凭据可以在**长按按键 3 秒**后清除（屏幕同时切换到配网提示页），再重新配网。WiFi 凭据仅通过网页配置并保存在 NVS 中，不再提供编译时默认值。未保存凭据时进入网页配网流程；已保存凭据但暂时连不上路由器时，按 5、10、20、40、60 秒的阶梯间隔重试（最多 1 分钟 1 次），不会自动开热点。已有的 NVS 配置不受固件更新影响。
+**长按按键 5 秒**后，屏幕先显示「WiFi 重置中」。设备清除 WiFi 凭据后保留提示约 1 秒，再显示热点名称和配网地址。WiFi 凭据仅通过网页配置并保存在 NVS 中，不再提供编译时默认值。未保存凭据时进入网页配网流程；已保存凭据但暂时连不上路由器时，按 5、10、20、40、60 秒的阶梯间隔重试（最多 1 分钟 1 次），不会自动开热点。已有的 NVS 配置不受固件更新影响。
 
 ## 数据从哪来
 
@@ -200,7 +200,7 @@ python3 tools/preview_ui.py --sanitize
 - `main/net_portal.c` — SoftAP 配网生命周期：AP/IP 配置、WiFi 模式、DNS/HTTP 服务启停。
 - `main/portal_web.c` / `main/portal_web.h` — 配网页 HTTP 服务：热点扫描、凭据保存、模板渲染和保存事件同步。
 - `main/web/` — 配网页独立源文件：`index.html`、`result.html`、`style.css`、`app.js`。通过 `main/CMakeLists.txt` 的 `EMBED_TXTFILES` 编译进固件，不需要文件系统或前端构建工具。服务端替换 `{{TOKEN}}` 并分块发送，CSS/JS 仍内联在 HTML 响应中，避免保存后热点关闭导致资源加载失败。热点扫描、SSID 转义与普通表单提交仍由 C 处理；重新扫描仍刷新页面，手填 SSID 优先。修改网页后重新构建和烧录即可，不需要生成墨水屏字模。
-- `main/button.c` / `main/button.h` — 单个低电平按键：2 次采样去抖，短按切页，长按 3 秒清掉 NVS 里的 WiFi 凭据并回到配网页。
+- `main/button.c` / `main/button.h` — 单个低电平按键：2 次采样去抖，短按切页，长按 5 秒触发 WiFi 重置和重新配网。
 - `components/dns_server/` — 复用 ESP-IDF captive portal 示例的 DNS server 组件，负责 DNS 协议处理和将 A 查询指向 SoftAP。
 - `main/portal_dns.c` / `main/portal_dns.h` — 配网 DNS 组件的设备特定启动配置，不自行实现 DNS 协议。
 - `main/weather.c` / `main/weather.h` — IP 定位 + 五天天气预报，使用 Component Manager 提供的 `espressif/cjson` 解析 JSON。只从 `daily.time`、`daily.weather_code`、`daily.temperature_2m_max`、`daily.temperature_2m_min` 和 `daily.precipitation_probability_max` 读取五天数据。逐日验证日期、数组长度、0–99 整数天气码、0–100% 有限降水概率、温度类型及高低温关系；必需数据缺失、为 `null`、日期不连续或响应截断时视为失败，不用后续字段冒充预报数据。

@@ -289,6 +289,8 @@ static bool button_pressed_level;
 static unsigned press_cycle[8], press_at[8], press_count, press_next;
 static int expected_view;
 static unsigned button_frames;
+static bool reset_test, credentials_erased;
+static unsigned reset_frames;
 
 static unsigned expected_retry_seconds(unsigned failures) {
     unsigned s = 5;
@@ -340,6 +342,18 @@ void vTaskDelay(unsigned ms) {
     }
     /* epd.c settling delays are 2/10 ms; the application waits in 20 ms slices. */
     if (ms < (unsigned)BTN_TICK) return;
+    if (reset_test) {
+        if (reset_frames == 0) {
+            assert(ms == BTN_TICK);
+            button_pressed_level = true;
+            wait_elapsed += ms;
+            assert(wait_elapsed <= 5000 + 2 * BTN_TICK);
+        } else {
+            assert(reset_frames == 1 && credentials_erased && ms == 1000);
+            puts("reset_notice_wait");
+        }
+        return;
+    }
     assert(ms == BTN_TICK);
     if (!wait_elapsed) wait_ms = expected_wait_ms();
     wait_elapsed += ms;
@@ -521,7 +535,21 @@ int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *t) {
             memcpy(last_frame, p, FRAME_BYTES);
             return 0;
         }
-        if (updating) {
+        if (reset_test && button_pressed_level) {
+            assert(reset_frames < 2);
+            unsigned char saved[FRAME_BYTES];
+            memcpy(saved, p, FRAME_BYTES);
+            if (reset_frames == 0) {
+                const char *notice = "WiFi 重置中";
+                epd_clear(EPD_WHITE);
+                epd_text(148 - epd_text_w(&font_mid, notice) / 2, 70, &font_mid, notice);
+            } else {
+                ui_draw_portal_hint();
+            }
+            assert(memcmp(saved, p, FRAME_BYTES) == 0);
+            memcpy(p, saved, FRAME_BYTES);
+            puts(reset_frames++ == 0 ? "reset_notice_frame" : "portal_hint_frame");
+        } else if (updating) {
             check_app_frame(p);
         } else if (!boot_checked) {
             boot_checked = true;
@@ -541,6 +569,7 @@ bool net_has_stored(void) { return portal_attempts <= 0; }
 bool net_try_stored(int timeout) {
     assert(timeout == 25000);
     puts("connect");
+    if (reset_test && reset_frames == 2) longjmp(done, 1);
     if (portal_attempts > 0) return false;
     if (connect_failures > 0) {
         connect_failures--;
@@ -555,7 +584,12 @@ void net_portal(void) {
 }
 const char *net_ap_ssid(void) { return "weather-123ABC"; }
 const char *net_ap_pass(void) { return "weather123ABC"; }
-void net_forget_creds(void) { puts("forget"); }
+void net_forget_creds(void) {
+    assert(reset_test && reset_frames == 1 && !credentials_erased);
+    assert(wait_elapsed == 5000 + 2 * BTN_TICK);
+    credentials_erased = true;
+    puts("forget");
+}
 void net_time_sync(void) { assert(weather_reserved); puts("time_sync"); }
 void device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying, bool updated) {
     static weather_t previous;
@@ -607,7 +641,8 @@ int main(int argc, char **argv) {
     pattern = argv[1];
     portal_attempts = atoi(argv[2]);
     connect_failures = argc > 3 ? atoi(argv[3]) : 0;
-    if (argc > 4 && argv[4][0]) {
+    reset_test = argc > 4 && strcmp(argv[4], "hold") == 0;
+    if (argc > 4 && argv[4][0] && !reset_test) {
         char *spec = strdup(argv[4]);
         assert(spec);
         char *save = NULL;
@@ -1326,11 +1361,14 @@ static void feed(bool pressed, unsigned ms, const char *label) {
 int main(void) {
     button_init();
     feed(false, 200, "idle");
-    feed(true, 3100, "hold");      /* one HOLD while held, and no TAP on release */
+    feed(true, 40, "debounce");
+    feed(true, 4980, "before-threshold");
+    feed(true, 20, "threshold");   /* one HOLD at exactly 5 s after debounce */
+    feed(true, 200, "still-held");
     feed(false, 200, "hold-release");
     feed(true, 100, "tap");
     feed(false, 200, "tap-release");
-    feed(true, 2980, "below");     /* under the threshold: a TAP on release */
+    feed(true, 5000, "below");     /* 4.98 s after debounce: a TAP on release */
     feed(false, 200, "below-release");
     feed(true, 20, "bounce");      /* single 20 ms samples never settle */
     feed(false, 20, "bounce");
@@ -1466,8 +1504,17 @@ def compile_button(compiler, source, work):
 def check_button(executable, work):
     """Debounce and hold timing of the real button state machine."""
     trace = run([executable], work, 10).decode("utf-8").splitlines()
-    require(trace == ["event:hold@hold", "event:tap@tap-release", "event:tap@below-release"],
-            f"button: expected a hold at 3 s, taps on shorter releases and no events during bounce; got {trace}")
+    require(trace == ["event:hold@threshold", "event:tap@tap-release", "event:tap@below-release"],
+            f"button: expected one hold at 5 s, taps on shorter releases and no events during bounce; got {trace}")
+
+
+def check_button_reset(executable, work):
+    """Drive a held button through reset, then simulate completing setup."""
+    trace = run([executable, "S", 0, 0, "hold"], work, 10).decode("ascii").splitlines()
+    events = [line for line in trace if not line.startswith("frame:")]
+    require(events[-6:] == ["reset_notice_frame", "forget", "reset_notice_wait",
+                            "portal_hint_frame", "portal", "connect"],
+            f"button reset: expected reset screen before erase and setup before reconnect; got {events}")
 
 
 def validate_weather(trace, case, expected):
@@ -2311,7 +2358,8 @@ def main():
         if button:
             try:
                 check_button(button, work)
-                print("PASS button: debounced tap and the 3 s reset hold", flush=True)
+                check_button_reset(current, work)
+                print("PASS button: debounced tap and 5 s hold; reset notice, erase, setup and reconnect", flush=True)
             except (AssertionError, ValueError, subprocess.SubprocessError) as error:
                 failure(error, "current/button")
         if voice_audio:

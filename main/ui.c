@@ -379,6 +379,12 @@ void ui_draw_retry(unsigned attempt, unsigned retry_seconds)
     epd_text(8, 16, &font_mid, buf);
 }
 
+void ui_draw_resetting(void)
+{
+    epd_clear(EPD_WHITE);
+    text_center(PANEL_H / 2, PANEL_W / 2 + 6, &font_mid, "WiFi 重置中");
+}
+
 void ui_draw_portal_hint(void)
 {
     epd_clear(EPD_WHITE);

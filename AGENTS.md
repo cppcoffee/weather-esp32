@@ -135,7 +135,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 | --- | --- |
 | `managed_components/espressif__cjson/` | Component Manager 自动下载的 cJSON 源码，固件和主机回归共用 |
 | `main/main.c` | 启动、配网、重试、30 分钟更新、当前页与成功天气快照、刷新调度 |
-| `main/button.c` / `.h` | GPIO4 低电平按键，内部上拉；2 次采样去抖，短按切页，长按 3s 重置 WiFi |
+| `main/button.c` / `.h` | GPIO4 低电平按键，内部上拉；2 次采样去抖，短按切页，长按 5 秒重置 WiFi |
 | `main/epd.c` / `.h` | SSD1680 SPI 驱动、4736 字节帧缓冲、绘图原语、全刷/局部刷新 |
 | `main/ui.c` / `.h` | 五天页、10 列逐时页、传感器底栏、状态、重试与配网提示；只画帧缓冲 |
 | `main/font_icons.c` / `.h` | Weather Icons 的 11 个 1bpp 图标子集；日页与逐时页使用两套固定尺寸字模 |
@@ -179,7 +179,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - `net_try_stored(CONNECT_TIMEOUT_MS)` 的连接等待为 25 秒。有凭据但连不上时按 5 → 10 → 20 → 40 → 60 → 60… 秒重试，并重画顶部连接失败提示；只有无凭据才进入网页配网。
 - 天气请求失败采用相同阶梯，成功后清零天气重试计数，恢复 30 分钟等待。连接与天气阶段使用各自的重试计数；等待不包含请求、对时、刷屏耗时，不做每秒倒计时。
 - 每次天气成功后 `net_apply_tz()`；首次天气成功才 `net_time_sync()`。时区来自数值 UTC 偏移，不是带 DST 规则的地区时区。
-- 长按 3 秒：清 NVS → 配网提示页并全刷 → `net_portal()` → 重新连接。长按事件只报告一次，松开不再触发短按。
+- 长按 5 秒触发重配网。先暂停语音，再用普通刷新显示「WiFi 重置中」，清除 NVS 中的 WiFi 凭据后保留提示约 1 秒，随后全刷配网提示页、进入 `net_portal()` 并在配网完成后重新连接。长按事件只报告一次，松开不再触发短按。
 - **仅应用自己的等待**通过 `wait_serviced()` 每 20ms 轮询按键。连接、HTTP、SNTP、配网、屏幕 BUSY 等阻塞调用期间不轮询按键，不能承诺任意时刻长按都能立即响应。
 - 保留 10 KB 主任务栈：HTTPS 在主任务同步运行，历史实机记录中 4 KB 会在 TLS 握手时栈溢出并反复重启。
 
@@ -220,7 +220,7 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 - 等待预算：设备首音频等待90秒、播放中断流等待30秒；配套Rust文本回合正常首音频65秒、含失败提示75秒、总回合180秒（不包含ASR）。不要只改一端的超时。WS stop失败时保留chat/MCP/Opus，释放应用网络锁后由voice任务重试清理，禁止新会话；成功stop后deinit消费句柄。
 - AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考）做回声消除，参考信号是 `play_response()` 实际写入 I2S 的 PCM（`s_reference` 流缓冲，按写入顺序喂入，不加人为延迟）。WakeNet 仍在 AFE 之外，检测的是 AEC 输出；播放期间保持 `ARMED`，命中唤醒词置 `VOICE_BIT_INTERRUPT`，由 `voice.c` 的 `run_turn()` 同一任务静音、丢弃被中止回复的音频，发送 `abort`(wake_word_detected) 并在同一通道重新 `listen start`，不重建会话。AFE 初始化失败时回退为“播放期间不检测唤醒”。两个语音任务只通过 `voice_internal.h` 的事件位和两个流缓冲通信；真实回声抑制量、`aec_filter_length` 与端到端打断延迟必须真机验证。
 - 屏上反馈：语音状态（连接、聆听、说话、失败）沿用现有状态角落与文案机制，且**新增中文文案必须重跑 `tools/genfont.py`**（中文只在 `font_mid`）。**M1 尚未加语音文案和激活码页**，配对码只能从串口看；补屏上反馈时要一次把状态词和配对页做完，别分两次重生成字模。
-- 按键语义：短按切页，长按 3 秒重配网。
+- 按键语义：短按切页，长按 5 秒重配网。
 - 音频回调把下行包送入有界队列。采集任务和播放任务共用 ES8311：播放时仍持续采集供 AEC 消除回声，启用 AEC 时唤醒检测保持开启以便打断；未启用 AEC 时播放期间暂停唤醒检测和录音。
 
 ## 配网页维护
@@ -262,11 +262,11 @@ cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
 ## 回归要求与覆盖边界
 
 - 改驱动、布局或字模后至少运行 `python3 tools/test_app.py` 和 `python3 tools/preview_ui.py`。改 Weather Icons 映射、生成器或 `font_icons.c` 后还要核对 `third_party/weather-icons/README.md` 的许可/来源与预览。测试通过不代表实屏黑度、残影、刷新时序或网络可用性已验证。
-- `preview_ui.py` 覆盖按天页并生成逐时页预览；逐时 UI 在 `test_app.py` 中检查，切页由 `expected_view`、`button_toggle`、`button_switch_full`、`button_retry` 等应用逻辑覆盖；按键另有去抖和 3 秒长按阈值测试。
+- `preview_ui.py` 生成按天、逐时和 WiFi 重置等画面预览。逐时 UI 在 `test_app.py` 中检查，切页由 `expected_view`、`button_toggle`、`button_switch_full`、`button_retry` 等应用逻辑覆盖。按键回归覆盖去抖、5 秒阈值、重置画面先于擦除、配网提示及重新连接。
 - 改布局同步核对：`ui.c` 的日/小时列宽、网格起点和行锚点；`preview_ui.py` 的 `COL_W` / `GRID_X` / `DATE_BASE` / `ICON_TOP` / `DAILY_TEMP_BASE` / `PRECIP_BASE`、`icon_mask` / `expect_forecast`；`test_app.py` 的 `centers` / `boundaries` / `hour_centers`、图标字形、宽度及基线断言。不要只改断言以掩盖越界。
 - 主机解析测试广泛覆盖日数据、作用域、日期、非法值、缺项及截断 JSON；逐时有缺失/短数组/首日错位等用例，但 `validate_weather()` 尚未逐字段比较成功响应的 `hours`。改逐时解析时补对应断言，不假设现有用例已穷尽 DST 和数值边界。
 - 应用测试检查完整 SPI 帧、启动等待、退避、失败正文保留、状态角落隔离、首次对时和切页；网络为 stub，**不覆盖真实 `net.c` / `net_portal.c` / `portal_web.c` / `portal_dns.c` 的 NVS、WiFi、HTTP/TLS、DNS、网页、SNTP 或硬件阻塞时序**。
-- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/3 秒重配网动作；`test_device_mcp.py` 编译真实工具及managed cJSON，使用SDK公开头和stub注册API/时钟/RTOS，覆盖数据、失败快照保留、分配失败、并发，不验证MCP协议或真实SNTP。`test_voice_lifecycle.py` 抽取未经改写的网络状态/会话清理/voice主循环函数，stub RTOS与协议调用，覆盖停止失败资源保留、挂起唤醒、重配网后重新ARMED，不覆盖整个voice.c或真实SDK停止时序。AEC 路径（`voice_capture.c` 的 `init_afe`/`afe_process`/`route_microphone` 与 `voice.c` 里打断后的重启）不在主机覆盖内，回声抑制量和打断延迟只能真机听感验证。`main.c` 里的 `voice_*` 和发布调用在 harness 中是 stub；发布断言检查与UI同源。改 `voice.c` 的时序或分帧仍需真机听感验证。
+- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/5 秒重配网动作；`test_device_mcp.py` 编译真实工具及managed cJSON，使用SDK公开头和stub注册API/时钟/RTOS，覆盖数据、失败快照保留、分配失败、并发，不验证MCP协议或真实SNTP。`test_voice_lifecycle.py` 抽取未经改写的网络状态/会话清理/voice主循环函数，stub RTOS与协议调用，覆盖停止失败资源保留、挂起唤醒、重配网后重新ARMED，不覆盖整个voice.c或真实SDK停止时序。AEC 路径（`voice_capture.c` 的 `init_afe`/`afe_process`/`route_microphone` 与 `voice.c` 里打断后的重启）不在主机覆盖内，回声抑制量和打断延迟只能真机听感验证。`main.c` 里的 `voice_*` 和发布调用在 harness 中是 stub；发布断言检查与UI同源。改 `voice.c` 的时序或分帧仍需真机听感验证。
 - `partitions.csv` 分别为固件和 ESP-SR 模型分配分区。调整模型或依赖后，用构建输出核对 app 和模型镜像各自的大小。
 - `--baseline` 接受旧 `main/` 目录，用于比较请求、调用及完整帧；只有数据契约、布局和字模兼容的基线才有意义。`.cache/` 中历史快照不是运行依赖，不能直接套用旧的单日/旧切页结论。
 - `ABLATION.md` 的体积、帧像素与实机观察属于当时版本的实验，不是当前布局的测量；不要将旧数字或未经复测的残影结论写成当前保证。

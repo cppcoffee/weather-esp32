@@ -28,4 +28,5 @@ void ui_draw_hourly(const weather_t *weather, const sensor_reading_t *sensor);
 void ui_draw_status(ui_status_t status, unsigned attempt);
 // Replace only the title; attempt is the next retry number (1 after the first failure).
 void ui_draw_retry(unsigned attempt, unsigned retry_seconds);
+void ui_draw_resetting(void);
 void ui_draw_portal_hint(void);

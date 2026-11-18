@@ -16,6 +16,7 @@ static const char *TAG = "app";
 
 #define BOOT_WAIT_MS       5000 // let the router/DHCP come up before the first attempt
 #define CONNECT_TIMEOUT_MS 25000
+#define RESET_NOTICE_MS    1000
 #define REFRESH_S          (30 * 60)
 #define RETRY_MIN_S        5
 #define RETRY_MAX_S        60
@@ -97,15 +98,18 @@ static void present(app_t *app, bool page_switch)
     }
 }
 
-// A long hold erases the stored credentials and goes straight to the portal page, so a
-// wrong or missing AP can be fixed without a cable. Returns true when that happened.
+// Returns true when a long hold clears the stored credentials and opens the portal.
 static bool button_service(app_t *app, unsigned slice_ms)
 {
     switch (button_poll(slice_ms)) {
     case BUTTON_HOLD:
         ESP_LOGW(TAG, "button held: erasing stored credentials");
         voice_net_pause();
+        ui_draw_resetting();
+        epd_refresh();
         net_forget_creds();
+        // Keep the notice readable even if the NVS erase finishes immediately.
+        vTaskDelay(pdMS_TO_TICKS(RESET_NOTICE_MS));
         ui_draw_portal_hint();
         epd_refresh_full();
         net_portal();

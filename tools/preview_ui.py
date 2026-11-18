@@ -746,6 +746,13 @@ int main(void) {
 
     weather_scene = false;
     call_count = 0;
+    ui_draw_resetting();
+    centered(PANEL_H / 2, 70, &font_mid, "WiFi 重置中");
+    assert(call_count == 1);
+    epd_refresh();
+    emit("wifi-reset");
+
+    call_count = 0;
     ui_draw_portal_hint();
     epd_refresh();
     expect(8, 16, &font_mid, "初始化设置");
@@ -755,7 +762,7 @@ int main(void) {
         "forecast area, single-line low-high ranges/font fallback/invalids/isolated "
         "min-max changes, five API dates, compact WMO icons/column bounds, daily "
         "probabilities/rounded umbrella policy, UTF-8 city elision, offline advice "
-        "replacement, retry body retention, portal and Chinese glyphs\n", frames);
+        "replacement, retry body retention, WiFi reset, portal and Chinese glyphs\n", frames);
     return 0;
 }
 '''
@@ -803,7 +810,7 @@ def capture_frames(compiler, sanitize=False):
             raise RuntimeError(f"short SPI frame: {name}")
         frames[name] = frame
     required = {"demo", "sensor", "wide-values", "ranges", "retry", "initial-failure", "conditions",
-                "dry", "unknown", "thunder", "hourly"}
+                "dry", "unknown", "thunder", "hourly", "wifi-reset"}
     if frames.keys() != required:
         raise RuntimeError(f"unexpected preview scenes: {frames.keys()}")
     # epd.c writes the framebuffer clockwise into 128x296 panel RAM.
@@ -855,7 +862,7 @@ def main():
         write_png(native, scenes["demo"], 1, "umbrella advised; unknown sensor, native 296x128")
         outputs = [output, native]
         for name in ("sensor", "wide-values", "ranges", "retry", "initial-failure", "conditions",
-                     "dry", "unknown", "thunder", "hourly"):
+                     "dry", "unknown", "thunder", "hourly", "wifi-reset"):
             path = output.with_name(output.stem + "-" + name + ".png")
             write_png(path, scenes[name], args.scale, name)
             outputs.append(path)
