@@ -20,3 +20,6 @@ void voice_capture_stop(void);
 // False when the echo canceller could not be created. The session must then keep WakeNet
 // disarmed while a reply plays, because the microphone would hear the speaker directly.
 bool voice_capture_has_aec(void);
+
+// Allocate the optional follow-up detector before enabling its event bit.
+bool voice_capture_prepare_vad(void);

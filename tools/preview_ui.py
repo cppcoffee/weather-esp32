@@ -212,7 +212,7 @@ void epd_text(int x, int y, const aafont *f, const char *text) {
             int right = left + g->w, bottom = top + g->h;
             assert(left >= 0 && right <= EPD_W && top >= 0 && bottom <= EPD_H);
             if (weather_scene && !icon_font) {
-                assert(f != &font_huge);
+                assert(f == &font_mid || f == &font_temp || f == &font_small || f == &font_clock);
                 assert(y == 16 || y == DATE_BASE || y == UNKNOWN_ICON_BASE ||
                        y == DAILY_TEMP_BASE || y == PRECIP_BASE || y == 124);
             }
@@ -325,6 +325,7 @@ static void retry_preserves_body(const unsigned char *previous, unsigned attempt
     epd_fill_rect(0, 0, EPD_W, 22, EPD_WHITE);
     snprintf(heading, sizeof(heading), "无网络 30s后重试 #%u", attempt);
     preview_real_epd_text(8, 16, &font_mid, heading);
+    preview_real_epd_text(292 - epd_text_w(&font_clock, "08:30"), 16, &font_clock, "08:30");
     epd_refresh();
     assert(!memcmp(retried, frame, sizeof(frame)));
 }
@@ -746,7 +747,21 @@ int main(void) {
 
     weather_scene = false;
     call_count = 0;
+    voice_feedback_t feedback = {.state = VOICE_STATE_ACTIVATION, .activation_code = "123456"};
+    assert(ui_update_voice(&feedback));
+    epd_refresh();
+    expect(8, 16, &font_mid, "激活");
+    expect(52, 16, &font_mid, "123456");
+    emit("activation");
+    feedback = (voice_feedback_t){.state = VOICE_STATE_LISTENING};
+    assert(ui_update_voice(&feedback));
+    epd_refresh();
+    emit("listening");
+
+    call_count = 0;
     ui_draw_resetting();
+    feedback = (voice_feedback_t){.state = VOICE_STATE_ACTIVATION, .activation_code = "654321"};
+    assert(!ui_update_voice(&feedback) && !ui_update_clock());
     centered(PANEL_H / 2, 70, &font_mid, "WiFi 重置中");
     assert(call_count == 1);
     epd_refresh();
@@ -810,7 +825,7 @@ def capture_frames(compiler, sanitize=False):
             raise RuntimeError(f"short SPI frame: {name}")
         frames[name] = frame
     required = {"demo", "sensor", "wide-values", "ranges", "retry", "initial-failure", "conditions",
-                "dry", "unknown", "thunder", "hourly", "wifi-reset"}
+                "dry", "unknown", "thunder", "hourly", "activation", "listening", "wifi-reset"}
     if frames.keys() != required:
         raise RuntimeError(f"unexpected preview scenes: {frames.keys()}")
     # epd.c writes the framebuffer clockwise into 128x296 panel RAM.
@@ -862,7 +877,7 @@ def main():
         write_png(native, scenes["demo"], 1, "umbrella advised; unknown sensor, native 296x128")
         outputs = [output, native]
         for name in ("sensor", "wide-values", "ranges", "retry", "initial-failure", "conditions",
-                     "dry", "unknown", "thunder", "hourly", "wifi-reset"):
+                     "dry", "unknown", "thunder", "hourly", "activation", "listening", "wifi-reset"):
             path = output.with_name(output.stem + "-" + name + ".png")
             write_png(path, scenes[name], args.scale, name)
             outputs.append(path)

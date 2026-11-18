@@ -17,6 +17,7 @@
 #include "freertos/event_groups.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "voice.h"
 
 static const char *TAG = "net";
 static EventGroupHandle_t s_events; // 仅 GOT_IP；配网握手由 portal_web.c 管理
@@ -25,12 +26,19 @@ static atomic_bool s_time_synced;
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    (void)arg;
+    (void)data;
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "disconnected, retrying");
-        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && (id == WIFI_EVENT_STA_DISCONNECTED || id == WIFI_EVENT_STA_STOP)) {
+        xEventGroupClearBits(s_events, GOT_IP);
+        voice_net_set_connected(false);
+        if (id == WIFI_EVENT_STA_DISCONNECTED) {
+            ESP_LOGW(TAG, "disconnected, retrying");
+            esp_wifi_connect();
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        voice_net_set_connected(true);
         xEventGroupSetBits(s_events, GOT_IP);
     }
 }
@@ -44,9 +52,10 @@ void net_init(void)
 
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
+    s_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(s_events != NULL ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_event, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, NULL, NULL));
-    s_events = xEventGroupCreate();
 }
 
 void net_forget_creds(void)

@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """Bounded host regression of selected, UNMODIFIED functions from main/voice.c.
 
-Extracts close_session, voice_task, voice_net_pause, and the tiny network_ready /
-voice_net_ready helpers using exact signatures and known next-function boundaries;
-VOICE_BIT_*, VOICE_TURN_BITS, VOICE_NETWORK_READY, VOICE_POLL_MS and VOICE_RETRY_MS
-come from main/voice_internal.h, the header the capture and session tasks share.
-Extraction fails closed if these boundaries change. No lifecycle body is copied
-or rewritten. This is NOT a build/test of all voice.c: open_session and run_turn,
+Extracts the STA event handler and voice lifecycle functions by exact signatures
+and known next-function boundaries. Uses the production voice_internal.h. This is NOT a build/test of all voice.c: open_session and run_turn,
 RTOS, protocol, audio and Opus are stubs. In particular it does not validate real
 SDK stop timing, audio, the voice_capture.c task, WakeNet detection, provisioning,
 or concurrency.
@@ -34,7 +30,8 @@ BOUNDARIES = (
     ("static bool network_ready(void)", "static void on_audio(const uint8_t *data, int len, void *ctx)"),
     ("static void close_session(void)", "static esp_err_t open_session(void)"),
     ("static void voice_task(void *arg)", "esp_err_t voice_init(void)"),
-    ("void voice_net_ready(void)", "void voice_net_pause(void)"),
+    ("void voice_net_ready(void)", "void voice_net_set_connected(bool connected)"),
+    ("void voice_net_set_connected(bool connected)", "void voice_net_pause(void)"),
     ("void voice_net_pause(void)", "bool voice_weather_begin(void)"),
 )
 
@@ -44,7 +41,7 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def extract(source, macros_source, path):
+def extract(source, path, boundaries):
     fragments = []
     ranges = []
 
@@ -53,7 +50,7 @@ def extract(source, macros_source, path):
         fragments.append(f"#line {line} {json.dumps(str(path))}\n" + text)
         ranges.append(f"{text.splitlines()[0]} [L{line}–{line + text.count(chr(10)) - 1}]")
 
-    for signature, following in BOUNDARIES:
+    for signature, following in boundaries:
         starts = list(re.finditer(r"^" + re.escape(signature) + r"\n", source, re.MULTILINE))
         ends = list(re.finditer(r"^" + re.escape(following) + r"\n", source, re.MULTILINE))
         require(len(starts) == len(ends) == 1, f"function boundary changed: {signature} -> {following}")
@@ -66,25 +63,7 @@ def extract(source, macros_source, path):
         )
         append(body, start)
 
-    # Match the entire known contiguous macro block, not arbitrary C fragments.
-    match = re.search(
-        r"^#define VOICE_BIT_NET[^\n]*\n(?:#define VOICE_BIT_[A-Z_]+[^\n]*\n)*"
-        r"#define VOICE_TURN_BITS[^\n]*\n(?=\n// Both tasks use the same rule)",
-        macros_source, re.MULTILINE,
-    )
-    require(match, "VOICE_BIT/VOICE_TURN_BITS macro boundary changed")
-    macro_block = match.group()
-    require(
-        len(re.findall(r"^#define VOICE_BIT_", macros_source, re.MULTILINE))
-        == len(re.findall(r"^#define VOICE_BIT_", macro_block, re.MULTILINE)),
-        "VOICE_BIT definitions outside expected block",
-    )
-    macros = [macro_block]
-    for name in ("VOICE_NETWORK_READY", "VOICE_POLL_MS", "VOICE_RETRY_MS"):
-        matches = list(re.finditer(r"^#define " + name + r"[ \t(][^\n]*\n", macros_source, re.MULTILINE))
-        require(len(matches) == 1, f"constant definition changed: {name}")
-        macros.append(matches[0].group())
-    return "\n".join(macros), "\n".join(fragments), ranges
+    return "\n".join(fragments), ranges
 
 
 PRELUDE = r'''
@@ -94,6 +73,12 @@ PRELUDE = r'''
 #include <stdlib.h>
 #include <setjmp.h>
 #include <string.h>
+#include "voice_feedback.h"
+#include "voice_internal.h"
+
+bool voice_feedback_publish(voice_state_t state, const char *code) {
+    (void)state; (void)code; return true;
+}
 
 static const char *context = "setup";
 #define CHECK(x) do { if (!(x)) { \
@@ -113,7 +98,14 @@ typedef struct { unsigned generation; } esp_mcp_t, OpusEncoder, OpusDecoder;
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 
+enum { WIFI_EVENT, IP_EVENT };
+enum { WIFI_EVENT_STA_START, WIFI_EVENT_STA_DISCONNECTED, WIFI_EVENT_STA_STOP, IP_EVENT_STA_GOT_IP };
+typedef int esp_event_base_t;
+#define GOT_IP 1u
+static EventBits_t wifi_events;
 static EventBits_t events;
+static unsigned wifi_connects;
+static void esp_wifi_connect(void) { wifi_connects++; }
 static EventBits_t *s_events = &events;
 static int lock_token, queue_token;
 static void *s_network_lock = &lock_token, *s_rx_queue = &queue_token;
@@ -148,7 +140,18 @@ static esp_err_t run_turn(void);
 
 HARNESS = r'''
 #line 1 "lifecycle_harness.c"
-enum action { NET, GOODBYE, PAUSE, WAKE, IDLE };
+enum action { NET, GOODBYE, PAUSE, WAKE, IDLE, DROP, FAST_RECONNECT, IP };
+static bool drop_in_turn;
+static void wifi_event(esp_event_base_t base, int32_t event)
+{
+    on_event(NULL, base, event, NULL);
+}
+
+static void disconnect(void)
+{
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED);
+    CHECK(!wifi_events && !network_ready());
+}
 struct step {
     const char *label;
     enum action action;
@@ -194,7 +197,19 @@ static void outer_boundary(void)
     context = script[current].label;
     switch (script[current].action) {
     case NET:
+        wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
         voice_net_ready();
+        break;
+    case DROP:
+        disconnect();
+        break;
+    case FAST_RECONNECT:
+        disconnect();
+        wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+        CHECK(wifi_events == GOT_IP && !network_ready());
+        break;
+    case IP:
+        wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
         break;
     case GOODBYE:
         /* Inject callback fact, not a copy of on_server_goodbye or capture_task. */
@@ -202,7 +217,7 @@ static void outer_boundary(void)
         break;
     case PAUSE:
         voice_net_pause();
-        CHECK(!(events & (VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_RECEIVING
+        CHECK(!(events & (VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_RECEIVING
                           | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE)));
         CHECK(events & VOICE_BIT_RESET);
         break;
@@ -217,19 +232,19 @@ static void outer_boundary(void)
 
 static EventBits_t xEventGroupGetBits(EventBits_t *group)
 {
-    CHECK(group == &events);
+    CHECK(group == &events || group == &wifi_events);
     return *group;
 }
 
 static EventBits_t xEventGroupSetBits(EventBits_t *group, EventBits_t bits)
 {
-    CHECK(group == &events);
+    CHECK(group == &events || group == &wifi_events);
     return *group |= bits;
 }
 
 static EventBits_t xEventGroupClearBits(EventBits_t *group, EventBits_t bits)
 {
-    CHECK(group == &events);
+    CHECK(group == &events || group == &wifi_events);
     EventBits_t previous = *group;
     *group &= ~bits;
     return previous;
@@ -240,12 +255,14 @@ static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask,
 {
     CHECK(group == &events && clear == pdFALSE && all == pdFALSE && !locked);
     CHECK(++waits <= 100); /* Hard bound even if source starts polling unexpectedly. */
-    if (mask == (VOICE_BIT_NET | VOICE_BIT_RESET)) {
-        CHECK(timeout == portMAX_DELAY);
+    if (timeout == portMAX_DELAY) {
+        EventBits_t needed = (events & VOICE_BIT_ENABLED) ? VOICE_BIT_NET : VOICE_BIT_ENABLED;
+        CHECK(mask == (needed | VOICE_BIT_RESET));
         outer_boundary();
         CHECK(events & mask); /* Never pretend an infinite wait returned without an event. */
     } else {
-        CHECK(mask == (VOICE_BIT_TRIGGER | VOICE_BIT_RESET));
+        CHECK(mask == (VOICE_BIT_TRIGGER | VOICE_BIT_RESET)
+              || mask == (VOICE_BIT_TRIGGER | VOICE_BIT_RESET | VOICE_BIT_HANGUP));
         CHECK(timeout == pdMS_TO_TICKS(VOICE_POLL_MS));
         if (wake_on_wait) {
             /* Emulate only the capture task's event handoff, not WakeNet detection. */
@@ -314,6 +331,13 @@ static esp_err_t run_turn(void)
     CHECK(s_chat && s_chat == live_chat && !stopped && s_mcp == live_mcp);
     CHECK(s_encoder && s_decoder && (events & VOICE_BIT_CAPTURE));
     turns++;
+    if (drop_in_turn) {
+        drop_in_turn = false;
+        disconnect();
+        wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+        CHECK(!network_ready() && (events & VOICE_BIT_RESET));
+        return ESP_FAIL;
+    }
     xEventGroupSetBits(s_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED);
     return ESP_OK;
 }
@@ -373,11 +397,37 @@ static void opus_decoder_destroy(OpusDecoder *decoder)
 
 static void make_script(const char *route, int failures)
 {
-    EventBits_t net_armed = VOICE_BIT_NET | VOICE_BIT_ARMED;
+    EventBits_t online = VOICE_BIT_ENABLED | VOICE_BIT_NET;
+    EventBits_t net_armed = online | VOICE_BIT_ARMED;
     EventBits_t error = failures ? VOICE_BIT_ERROR : 0;
     bool wake = strcmp(route, "wake") == 0;
     bool reset_live = strcmp(route, "reset-live") == 0;
     add("NET: first session and ARMED", NET, 1, 0, 0, 0, false, net_armed);
+    bool fast = strcmp(route, "fast-reconnect") == 0;
+    bool active = strcmp(route, "during-turn") == 0;
+    if (fast || active || strcmp(route, "disconnect") == 0) {
+        if (active) {
+            drop_in_turn = true;
+            add("turn: lose WiFi and regain IP before returning", WAKE, 1, 0, 0, 1, false, online | VOICE_BIT_RESET);
+        }
+        EventBits_t surviving = active || fast ? online : VOICE_BIT_ENABLED;
+        EventBits_t pending_bits = surviving | VOICE_BIT_RESET | VOICE_BIT_ERROR;
+        add("outage: dispose old session on voice task", active ? IDLE : fast ? FAST_RECONNECT : DROP,
+            1, 1, !failures, active, failures != 0,
+            failures ? pending_bits | (active ? 0 : VOICE_BIT_ARMED) : surviving);
+        for (int attempt = 1; attempt <= failures; attempt++) {
+            add("outage: retry failed SDK stop", IDLE, 1, 1 + attempt, attempt == failures, active,
+                attempt < failures, pending_bits | (active ? 0 : VOICE_BIT_ARMED));
+        }
+        if (failures) {
+            add("outage: complete reset after successful stop", IDLE, 1, failures + 1, 1, active, false, surviving);
+        }
+        add("IP restored: rebuild and arm once", active || fast ? IDLE : IP,
+            2, failures + 1, 1, active, false, net_armed);
+        add("wake: first turn after network recovery", WAKE, 2, failures + 1, 1, active + 1, false, net_armed);
+        add("final RESET", PAUSE, 2, failures + 2, 2, active + 1, false, 0);
+        return;
+    }
     if (!reset_live) {
         add("goodbye: close or retain resources", GOODBYE, 1, 1, !failures, 0,
             failures != 0, net_armed | error);
@@ -392,7 +442,7 @@ static void make_script(const char *route, int failures)
         }
         add("suspended: no eager reopen without wake", IDLE, 1, failures + 1, 1, 0, false, net_armed | error);
         add("wake: leave suspended without reopening yet", WAKE, 1, failures + 1, 1, 0, false,
-            VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE | error);
+            online | VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE | error);
         add("wake reconnect: new session and turn", IDLE, 2, failures + 1, 1, 1, false, net_armed);
     } else {
         if (!reset_live) {
@@ -407,7 +457,7 @@ static void make_script(const char *route, int failures)
         }
         if (failures) {
             add("RESET after cleanup: clear suspension and reset flags", IDLE, 1, failures + 1,
-                1, 0, false, error);
+                1, 0, false, 0);
         }
         add("NET after RESET: rebuild and ARMED without a wake", NET, 2, failures + 1, 1, 0, false, net_armed);
     }
@@ -419,8 +469,6 @@ static void make_script(const char *route, int failures)
 int main(int argc, char **argv)
 {
     CHECK(argc == 4);
-    CHECK(strcmp(argv[1], "wake") == 0 || strcmp(argv[1], "reprovision") == 0
-          || strcmp(argv[1], "reset-live") == 0);
     int failures = atoi(argv[2]);
     CHECK(failures >= 0 && failures <= 2);
     failures_left = failures;
@@ -428,8 +476,17 @@ int main(int argc, char **argv)
     s_events = NULL;
     voice_net_pause();
     voice_net_ready();
+    voice_net_set_connected(true);
     CHECK(events == 0); /* No-op when voice_init never created events. */
     s_events = &events;
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
+    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    CHECK(wifi_events == GOT_IP && events == VOICE_BIT_NET && !network_ready());
+    disconnect();
+    CHECK(wifi_connects == 2 && events == 0);
+    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
+    CHECK(wifi_connects == 2 && wifi_events == 0 && events == 0);
     make_script(argv[1], failures);
     if (setjmp(finished) == 0) voice_task(NULL);
     CHECK(current == script_count && !locked && takes == gives && failures_left == 0);
@@ -464,12 +521,14 @@ def main():
     compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
     require(compiler, "no host C compiler found (cc/clang/gcc)")
     source = Path(__file__).resolve().parents[1] / "main" / "voice.c"
-    internal = Path(__file__).resolve().parents[1] / "main" / "voice_internal.h"
-    macros, functions, ranges = extract(
-        source.read_text(encoding="utf-8"), internal.read_text(encoding="utf-8"), source
-    )
+    functions, ranges = extract(source.read_text(encoding="utf-8"), source, BOUNDARIES)
+    net = source.with_name("net.c")
+    handler, net_ranges = extract(net.read_text(encoding="utf-8"), net, (
+        ("static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)", "void net_init(void)"),
+    ))
+    handler = "#define s_events (&wifi_events)\n" + handler + "\n#undef s_events\n"
     print("Extracting unchanged source (not the whole voice.c):", flush=True)
-    for entry in ranges:
+    for entry in ranges + net_ranges:
         print(f"  {entry}", flush=True)
     env = dict(os.environ, LC_ALL="C")
     if args.sanitize:
@@ -478,18 +537,18 @@ def main():
     with tempfile.TemporaryDirectory(prefix="weather-test-voice-lifecycle-") as directory:
         work = Path(directory)
         harness = work / "lifecycle.c"
-        harness.write_text(PRELUDE + "\n" + macros + "\n" + functions + "\n" + HARNESS, encoding="utf-8")
+        harness.write_text(PRELUDE + "\n" + functions + "\n" + handler + "\n" + HARNESS, encoding="utf-8")
         executable = work / "lifecycle.out"
         flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"] if args.sanitize else []
         run([
             compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", *flags,
-            harness, "-o", executable,
+            "-I", source.parent, harness, "-o", executable,
         ], work, env, 60)
-        for route in ("wake", "reprovision", "reset-live"):
+        for route in ("wake", "reprovision", "reset-live", "disconnect", "fast-reconnect", "during-turn"):
             for failures in range(3):
                 for deinit_error in range(2):
                     print(run([executable, route, failures, deinit_error], work, env, 5), end="", flush=True)
-    print(f"PASS 18 lifecycle scenarios{' (ASan/UBSan)' if args.sanitize else ''}")
+    print(f"PASS 36 lifecycle scenarios{' (ASan/UBSan)' if args.sanitize else ''}")
     print("Scope: does not validate the real SDK stop timing, audio, WakeNet, or all of voice.c.")
 
 

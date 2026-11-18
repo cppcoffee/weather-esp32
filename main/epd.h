@@ -29,10 +29,7 @@ void epd_clear(int color);
 void epd_pixel(int x, int y, int color);
 void epd_hline(int x, int y, int w, int color);
 
-void epd_line(int x0, int y0, int x1, int y1, int color);
-
 void epd_fill_rect(int x, int y, int w, int h, int color);
-void epd_fill_circle(int cx, int cy, int r, int color);
 void epd_text(int x, int y_baseline, const aafont *f, const char *s); // y = baseline
 int epd_text_w(const aafont *f, const char *s);
 void epd_refresh(void);

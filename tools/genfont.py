@@ -31,8 +31,7 @@ parser = argparse.ArgumentParser(description='Generate the bundled 1bpp text fon
 parser.add_argument('--only', choices=('clock',), help='generate only font_clock.c; no CJK font required')
 args = parser.parse_args()
 
-SPECS = [('font_huge', 46, 'Bold', False),
-         ('font_mid', 16, 'Medium', True),
+SPECS = [('font_mid', 16, 'Medium', True),
          ('font_temp', 14, 'Medium', False),
          ('font_small', 12, 'Regular', False),
          ('font_clock', 12, 'Bold', False)]
@@ -71,7 +70,6 @@ for name, size, weight, cjk in SPECS:
         adv = int(round(f.getlength(ch)))
         # 1-bit 屏没有灰阶：误差扩散会把 12~16px 的 1px 笔画打散成噪点，看起来"发虚"。
         # FreeType 的 mono 目标（mode='1'）把笔画网格对齐到整像素，边缘干净、粗细一致；
-        # 大字号（46px）两种方式几乎一样，统一用 mono 也让字模体积和代码只有一条路径。
         mask, (x0, y0) = f.getmask2(ch, anchor='ls', mode='1')
         img = Image.Image()._new(mask)
         w, h = img.size

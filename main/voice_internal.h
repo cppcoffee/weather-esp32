@@ -19,6 +19,7 @@
 #define VOICE_FIRST_AUDIO_TIMEOUT_MS 90000
 #define VOICE_RETRY_MS               30000
 #define VOICE_POLL_MS                100
+#define VOICE_FOLLOWUP_MS            6000
 // Shorter poll while the reply plays so a wake word stops the speaker promptly.
 #define VOICE_PLAYBACK_POLL_MS 20
 #define WAKE_TASK_STACK        4096
@@ -37,8 +38,13 @@
 #define VOICE_BIT_CAPTURE     (1 << 8)
 #define VOICE_BIT_HANGUP      (1 << 9)
 #define VOICE_BIT_INTERRUPT   (1 << 10)
-#define VOICE_TURN_BITS       (VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_ERROR)
+#define VOICE_BIT_ENABLED     (1 << 11)
+#define VOICE_BIT_FOLLOWUP    (1 << 12)
+#define VOICE_BIT_SPEECH      (1 << 13)
+#define VOICE_BIT_WS_LOST     (1 << 14)
+#define VOICE_TURN_BITS       (VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_ERROR | VOICE_BIT_WS_LOST)
+#define VOICE_END_BITS        (VOICE_BIT_RESET | VOICE_BIT_HANGUP | VOICE_BIT_ERROR | VOICE_BIT_WS_LOST)
 
-// Both tasks use the same rule: usable only while the network is up and no reprovisioning
-// reset is pending.
-#define VOICE_NETWORK_READY(bits) (((bits) & (VOICE_BIT_NET | VOICE_BIT_RESET)) == VOICE_BIT_NET)
+// Both tasks use the same rule: voice is enabled, STA has IP, and teardown is complete.
+#define VOICE_NETWORK_READY(bits)                                                                                      \
+    (((bits) & (VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_RESET)) == (VOICE_BIT_ENABLED | VOICE_BIT_NET))

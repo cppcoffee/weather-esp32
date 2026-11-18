@@ -1,0 +1,47 @@
+#include "voice_feedback.h"
+
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+
+static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static voice_feedback_t s_feedback;
+
+bool voice_feedback_publish(voice_state_t state, const char *activation_code)
+{
+    if (state < VOICE_STATE_DISABLED || state > VOICE_STATE_ERROR) {
+        return false;
+    }
+    voice_feedback_t next = {.state = state};
+    if (state == VOICE_STATE_ACTIVATION) {
+        if (activation_code == NULL) {
+            return false;
+        }
+        size_t length = strnlen(activation_code, sizeof(next.activation_code));
+        if (length == 0 || length > VOICE_ACTIVATION_CODE_MAX) {
+            return false;
+        }
+        for (size_t i = 0; i < length; i++) {
+            if ((unsigned char)activation_code[i] <= 0x20 || (unsigned char)activation_code[i] > 0x7e) {
+                return false;
+            }
+        }
+        memcpy(next.activation_code, activation_code, length);
+    } else if (activation_code != NULL) {
+        return false;
+    }
+    portENTER_CRITICAL(&s_lock);
+    if (s_feedback.state != VOICE_STATE_ACTIVATION || (state != VOICE_STATE_CONNECTING && state != VOICE_STATE_ERROR)) {
+        s_feedback = next;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    return true;
+}
+
+voice_feedback_t voice_feedback_get(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    voice_feedback_t copy = s_feedback;
+    portEXIT_CRITICAL(&s_lock);
+    return copy;
+}

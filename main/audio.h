@@ -18,9 +18,12 @@
 #define AUDIO_I2C_SCL_GPIO  41
 #define AUDIO_I2C_SDA_GPIO  42
 
-#define AUDIO_SAMPLE_RATE_HZ  16000
-#define AUDIO_CHANNEL_COUNT   2
-#define AUDIO_BITS_PER_SAMPLE 16
+#define AUDIO_SAMPLE_RATE_HZ   16000
+#define AUDIO_DMA_DESC_NUM     6
+#define AUDIO_DMA_FRAME_NUM    240
+#define AUDIO_PLAYBACK_TAIL_MS (1000 * AUDIO_DMA_DESC_NUM * AUDIO_DMA_FRAME_NUM / AUDIO_SAMPLE_RATE_HZ)
+#define AUDIO_CHANNEL_COUNT    2
+#define AUDIO_BITS_PER_SAMPLE  16
 
 // Initialize the I2C control bus, I2S full-duplex channels and ES8311 codec.
 // The output is muted after initialization; call audio_set_mute(false) before playback.
@@ -32,7 +35,4 @@ bool audio_is_ready(void);
 esp_err_t audio_read(void *buffer, size_t length, size_t *bytes_read);
 esp_err_t audio_write(void *buffer, size_t length, size_t *bytes_written);
 
-// Volume is in the codec driver's 0..100 scale. Microphone gain is in dB.
-esp_err_t audio_set_volume(int volume);
-esp_err_t audio_set_mic_gain(float gain_db);
 esp_err_t audio_set_mute(bool muted);

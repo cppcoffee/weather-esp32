@@ -9,9 +9,12 @@
 // Load the WakeNet model and start the audio tasks. Capture starts after voice_net_ready().
 esp_err_t voice_init(void);
 
-// Call after the first weather attempt/time sync, so voice setup does not overlap
-// the boot's weather HTTPS request. First pairing still prints a code to the log.
+// Enable voice after the first weather attempt, including after provisioning.
+// Runtime STA availability is reported separately by the network event handler.
 void voice_net_ready(void);
+
+// Report STA IP acquisition/loss. Disconnect schedules teardown on the voice task.
+void voice_net_set_connected(bool connected);
 
 // Cancel recording/playback and discard pending triggers before changing WiFi.
 void voice_net_pause(void);

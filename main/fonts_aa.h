@@ -17,7 +17,6 @@ typedef struct {
     uint8_t line_height;
 } aafont;
 
-extern const aafont font_huge;  // 46px bold, for the temperature
 extern const aafont font_mid;   // 16px medium; the only font with Chinese glyphs
 extern const aafont font_temp;  // 14px medium, Latin only, for the five-day ranges
 extern const aafont font_small; // 12px regular, Latin only

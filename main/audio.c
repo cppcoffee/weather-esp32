@@ -21,8 +21,6 @@ _Static_assert(!PSRAM_PIN_IN_USE(AUDIO_PA_EN_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2
 #define AUDIO_I2C_PORT            I2C_NUM_0
 #define AUDIO_I2S_PORT            I2S_NUM_0
 #define AUDIO_I2C_SPEED_HZ        400000
-#define AUDIO_DMA_DESC_NUM        6
-#define AUDIO_DMA_FRAME_NUM       240
 #define AUDIO_DEFAULT_VOLUME      60
 #define AUDIO_DEFAULT_MIC_GAIN_DB 18.0f
 
@@ -300,22 +298,6 @@ esp_err_t audio_write(void *buffer, size_t length, size_t *bytes_written)
         *bytes_written = err == ESP_CODEC_DEV_OK ? length : 0;
     }
     return err == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t audio_set_volume(int volume)
-{
-    if (!s_ready) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return check_codec_result(esp_codec_dev_set_out_vol(s_codec, volume), "set speaker volume");
-}
-
-esp_err_t audio_set_mic_gain(float gain_db)
-{
-    if (!s_ready) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return check_codec_result(esp_codec_dev_set_in_gain(s_codec, gain_db), "set microphone gain");
 }
 
 esp_err_t audio_set_mute(bool muted)

@@ -106,6 +106,7 @@ WEATHER_URL = (
 HEADERS = {
     "esp_err.h": """#pragma once
 #define ESP_OK 0
+#define ESP_ERR_NO_MEM -4
 #define ESP_ERR_NOT_SUPPORTED -2
 #define ESP_ERR_INVALID_STATE -3
 typedef int esp_err_t;
@@ -124,9 +125,18 @@ static inline int64_t esp_timer_get_time(void) { return 0; }
 """,
     "freertos/FreeRTOS.h": """#pragma once
 #define pdMS_TO_TICKS(ms) (ms)
+#define portMAX_DELAY (~0U)
+#define pdPASS 1
 """,
     "freertos/task.h": """#pragma once
 void vTaskDelay(unsigned ms);
+int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle);
+""",
+    "freertos/semphr.h": """#pragma once
+typedef void *SemaphoreHandle_t;
+SemaphoreHandle_t xSemaphoreCreateMutex(void);
+int xSemaphoreTake(SemaphoreHandle_t semaphore, unsigned timeout);
+int xSemaphoreGive(SemaphoreHandle_t semaphore);
 """,
     "driver/gpio.h": """#pragma once
 #include <stdint.h>
@@ -260,14 +270,30 @@ HARNESS = r'''
 #include "net.h"
 #include "ui.h"
 #include "device_mcp.h"
+#include "voice_feedback.h"
 #include "fixtures.h"
 
 typedef int esp_err_t;
 #define ESP_OK 0
 void app_main(void);
 esp_err_t audio_init(void) { return ESP_OK; }
+/* The dedicated clock regression runs the real clock task with pthread-backed RTOS stubs. */
+static bool display_locked;
+void *xSemaphoreCreateMutex(void) { return (void *)1; }
+int xSemaphoreTake(void *semaphore, unsigned timeout) {
+    assert(semaphore && !display_locked); display_locked = true; return 1;
+}
+int xSemaphoreGive(void *semaphore) {
+    assert(semaphore && display_locked); display_locked = false; return 1;
+}
+int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle) {
+    assert(entry && !strcmp(name, "clock") && stack >= 2048); return 1;
+}
 /* voice.c needs the real esp_xiaozhi/opus stack, so the app harness links stubs. */
 esp_err_t voice_init(void) { return ESP_OK; }
+voice_feedback_t voice_feedback_get(void) {
+    return (voice_feedback_t){.state = VOICE_STATE_WAIT_NETWORK};
+}
 static bool weather_reserved;
 static unsigned weather_attempts;
 void voice_net_ready(void) { assert(!weather_reserved && weather_attempts > 0); }
@@ -343,6 +369,7 @@ void vTaskDelay(unsigned ms) {
     /* epd.c settling delays are 2/10 ms; the application waits in 20 ms slices. */
     if (ms < (unsigned)BTN_TICK) return;
     if (reset_test) {
+        assert(!display_locked);
         if (reset_frames == 0) {
             assert(ms == BTN_TICK);
             button_pressed_level = true;
@@ -464,9 +491,16 @@ static void check_app_frame(unsigned char *fb) {
         attempt = button ? retries : retries + 1;
         unsigned delay = expected_retry_seconds(attempt);
         snprintf(heading, sizeof(heading), "无网络 %us后重试 #%u", delay, attempt);
-        if (8 + epd_text_w(&font_mid, heading) > EPD_W)
+        if (8 + epd_text_w(&font_mid, heading) > 230)
             snprintf(heading, sizeof(heading), "无网络 %us重试 #%u", delay, attempt);
+        if (8 + epd_text_w(&font_mid, heading) > 230)
+            snprintf(heading, sizeof(heading), "无网络 #%u", attempt);
         epd_text(8, 16, &font_mid, heading);
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        strftime(heading, sizeof(heading), "%H:%M", &tm);
+        epd_text(292 - epd_text_w(&font_clock, heading), 16, &font_clock, heading);
     }
     ui_draw_status(success ? UI_STATUS_UPDATED : UI_STATUS_RETRY, attempt);
     bool matches = memcmp(saved, fb, FRAME_BYTES) == 0;
@@ -585,7 +619,7 @@ void net_portal(void) {
 const char *net_ap_ssid(void) { return "weather-123ABC"; }
 const char *net_ap_pass(void) { return "weather123ABC"; }
 void net_forget_creds(void) {
-    assert(reset_test && reset_frames == 1 && !credentials_erased);
+    assert(reset_test && reset_frames == 1 && !display_locked && !credentials_erased);
     assert(wait_elapsed == 5000 + 2 * BTN_TICK);
     credentials_erased = true;
     puts("forget");
@@ -803,8 +837,7 @@ void traced_text(int x, int y, const aafont *font, const char *text) {
     }
     const char *name = font == &font_mid ? "mid" : font == &font_temp ? "temp" :
                        font == &font_small ? "small" : font == &font_clock ? "clock" :
-                       font == &font_huge ? "huge" :
-                                              font == &font_icon_daily ? "icon_daily" : font == &font_icon ? "icon" : "other";
+                       font == &font_icon_daily ? "icon_daily" : font == &font_icon ? "icon" : "other";
     printf("text:%d:%d:%d:%s:%d:%d:%d:%d:%s\n", x, y, epd_text_w(font, text), name,
         left, top, right, bottom, text);
     epd_text(x, y, font, text);

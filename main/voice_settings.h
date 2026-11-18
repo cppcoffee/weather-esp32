@@ -12,6 +12,7 @@
 
 typedef struct {
     char info_url[VOICE_URL_CAP];
+    uint8_t followup;
 } voice_settings_t;
 
 // Only a missing namespace/key yields zeroed settings (未配置). Other errors leave

@@ -26,6 +26,18 @@
 #define HOUR_COL_W  28
 #define HOUR_GRID_X ((PANEL_H - HOUR_COLS * HOUR_COL_W) / 2)
 
+#define CLOCK_LEFT 230
+static char displayed_clock[6];
+static bool clock_visible;
+static voice_feedback_t voice_feedback;
+static bool voice_known;
+static ui_status_t application_status;
+static unsigned application_attempt;
+static char header_city[24];
+static char header_label[32];
+static char retry_title[64];
+static bool retry_header;
+
 _Static_assert(WEATHER_HOURS >= (HOUR_COLS - 1) * HOUR_STEP + 1, "hourly strip needs 10 hours");
 
 static void text_center(int cx, int y_base, const aafont *f, const char *s)
@@ -123,11 +135,10 @@ static const char *today_hint(const weather_t *w)
     }
 }
 
-static void draw_city(const weather_t *w)
+static void draw_city(const char *city)
 {
-    const char *city = w && w->ok ? w->city : "无数据";
-    char label[sizeof(w->city) + 4];
-    size_t length = strnlen(city, sizeof(w->city));
+    char label[sizeof(header_city) + 4];
+    size_t length = strnlen(city, sizeof(header_city));
     memcpy(label, city, length);
     label[length] = '\0';
     if (epd_text_w(&font_mid, label) > 96) {
@@ -195,10 +206,44 @@ static const char *status_text(ui_status_t status, unsigned attempt, char *buf, 
     }
 }
 
-void ui_draw_status(ui_status_t status, unsigned attempt)
+static const char *selected_status(char *buf, size_t size)
+{
+    if (voice_known) {
+        switch (voice_feedback.state) {
+        case VOICE_STATE_DISABLED:
+            return "语音不可用";
+        case VOICE_STATE_CONNECTING:
+            return "语音连接";
+        case VOICE_STATE_NEED_SETUP:
+            return "设置语音";
+        case VOICE_STATE_ACTIVATION:
+            return "等待激活";
+        case VOICE_STATE_READY:
+            if (application_status != UI_STATUS_CONNECTING && application_status != UI_STATUS_FETCHING
+                && application_status != UI_STATUS_SYNCING)
+            {
+                return "待唤醒";
+            }
+            break;
+        case VOICE_STATE_LISTENING:
+            return "正在聆听";
+        case VOICE_STATE_WAITING:
+            return "等待回答";
+        case VOICE_STATE_SPEAKING:
+            return "正在说话";
+        case VOICE_STATE_ERROR:
+            return "语音失败";
+        default:
+            break;
+        }
+    }
+    return status_text(application_status, application_attempt, buf, size);
+}
+
+static void draw_status(void)
 {
     char buf[24];
-    const char *text = status_text(status, attempt, buf, sizeof(buf));
+    const char *text = selected_status(buf, sizeof(buf));
     epd_fill_rect(STATUS_LEFT, 110, PANEL_H - STATUS_LEFT, EPD_H - 110, EPD_WHITE);
     int width = epd_text_w(&font_mid, text);
     if (*text && width <= STATUS_MAX_W) {
@@ -206,17 +251,92 @@ void ui_draw_status(ui_status_t status, unsigned attempt)
     }
 }
 
-static void draw_header(const weather_t *w, const char *label)
+void ui_draw_status(ui_status_t status, unsigned attempt)
 {
-    char buf[32];
-    draw_city(w);
-    text_center(174, 16, &font_mid, label);
+    application_status = status;
+    application_attempt = attempt;
+    draw_status();
+}
+
+bool ui_update_clock(void)
+{
+    if (!clock_visible) {
+        return false;
+    }
+    char buf[6];
     time_t now = time(NULL);
     struct tm tm;
-    localtime_r(&now, &tm);
-    strftime(buf, sizeof(buf), "%H:%M", &tm);
+    if (localtime_r(&now, &tm) == NULL || strftime(buf, sizeof(buf), "%H:%M", &tm) == 0
+        || strcmp(buf, displayed_clock) == 0)
+    {
+        return false;
+    }
+    epd_fill_rect(CLOCK_LEFT, 0, PANEL_H - CLOCK_LEFT, 22, EPD_WHITE);
     epd_text(EPD_W - 8 - epd_text_w(&font_clock, buf), 16, &font_clock, buf);
+    memcpy(displayed_clock, buf, sizeof(displayed_clock));
+    return true;
+}
+
+static void show_clock(void)
+{
+    clock_visible = true;
+    displayed_clock[0] = '\0';
+    (void)ui_update_clock();
+}
+
+static void render_header(void)
+{
+    epd_fill_rect(0, 0, EPD_W, 22, EPD_WHITE);
+    if (voice_known && voice_feedback.state == VOICE_STATE_ACTIVATION) {
+        epd_text(8, 16, &font_mid, "激活");
+        const aafont *font = &font_mid;
+        if (epd_text_w(font, voice_feedback.activation_code) > CLOCK_LEFT - 52) {
+            font = &font_small;
+        }
+        epd_text(52, 16, font, voice_feedback.activation_code);
+    } else if (retry_header) {
+        epd_text(8, 16, &font_mid, retry_title);
+    } else {
+        draw_city(header_city);
+        text_center(174, 16, &font_mid, header_label);
+    }
+    show_clock();
+}
+
+static void draw_header(const weather_t *w, const char *label)
+{
+    const char *city = w && w->ok ? w->city : "无数据";
+    snprintf(header_city, sizeof(header_city), "%.*s", (int)sizeof(header_city) - 1, city);
+    snprintf(header_label, sizeof(header_label), "%s", label);
+    retry_header = false;
+    render_header();
     epd_hline(6, 22, EPD_W - 12, EPD_BLACK);
+}
+
+bool ui_update_voice(const voice_feedback_t *feedback)
+{
+    if (feedback == NULL) {
+        return false;
+    }
+    char old_status[24], buf[24];
+    snprintf(old_status, sizeof(old_status), "%s", selected_status(buf, sizeof(buf)));
+    bool was_activation = voice_known && voice_feedback.state == VOICE_STATE_ACTIVATION;
+    bool header_changed = was_activation != (feedback->state == VOICE_STATE_ACTIVATION)
+                          || (was_activation && strcmp(voice_feedback.activation_code, feedback->activation_code) != 0);
+    voice_feedback = *feedback;
+    voice_known = true;
+    // Keep the snapshot current while the reset or setup screen is visible.
+    if (!clock_visible) {
+        return false;
+    }
+    bool status_changed = strcmp(old_status, selected_status(buf, sizeof(buf))) != 0;
+    if (header_changed) {
+        render_header();
+    }
+    if (status_changed) {
+        draw_status();
+    }
+    return header_changed || status_changed;
 }
 
 // The generated glyph metrics center visible ink within each fixed icon cell.
@@ -370,23 +490,27 @@ void ui_draw_hourly(const weather_t *w, const sensor_reading_t *sensor)
 
 void ui_draw_retry(unsigned attempt, unsigned retry_seconds)
 {
-    char buf[64];
-    epd_fill_rect(0, 0, EPD_W, 22, EPD_WHITE);
-    snprintf(buf, sizeof(buf), "无网络 %us后重试 #%u", retry_seconds, attempt);
-    if (8 + epd_text_w(&font_mid, buf) > EPD_W) {
-        snprintf(buf, sizeof(buf), "无网络 %us重试 #%u", retry_seconds, attempt);
+    snprintf(retry_title, sizeof(retry_title), "无网络 %us后重试 #%u", retry_seconds, attempt);
+    if (8 + epd_text_w(&font_mid, retry_title) > CLOCK_LEFT) {
+        snprintf(retry_title, sizeof(retry_title), "无网络 %us重试 #%u", retry_seconds, attempt);
     }
-    epd_text(8, 16, &font_mid, buf);
+    if (8 + epd_text_w(&font_mid, retry_title) > CLOCK_LEFT) {
+        snprintf(retry_title, sizeof(retry_title), "无网络 #%u", attempt);
+    }
+    retry_header = true;
+    render_header();
 }
 
 void ui_draw_resetting(void)
 {
+    clock_visible = false;
     epd_clear(EPD_WHITE);
     text_center(PANEL_H / 2, PANEL_W / 2 + 6, &font_mid, "WiFi 重置中");
 }
 
 void ui_draw_portal_hint(void)
 {
+    clock_visible = false;
     epd_clear(EPD_WHITE);
     char buf[48];
     epd_text(8, 16, &font_mid, "初始化设置");

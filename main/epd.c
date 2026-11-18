@@ -242,43 +242,10 @@ void epd_hline(int x, int y, int w, int color)
     }
 }
 
-void epd_line(int x0, int y0, int x1, int y1, int color)
-{
-    int dx = x1 > x0 ? x1 - x0 : x0 - x1, sx = x0 < x1 ? 1 : -1;
-    int dy = -(y1 > y0 ? y1 - y0 : y0 - y1), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    while (1) {
-        epd_pixel(x0, y0, color);
-        if (x0 == x1 && y0 == y1) {
-            break;
-        }
-        int e2 = 2 * err;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
-        }
-    }
-}
-
 void epd_fill_rect(int x, int y, int w, int h, int color)
 {
     for (int j = 0; j < h; j++) {
         epd_hline(x, y + j, w, color);
-    }
-}
-
-void epd_fill_circle(int cx, int cy, int r, int color)
-{
-    for (int dy = -r; dy <= r; dy++) {
-        int dx = 0;
-        while ((dx + 1) * (dx + 1) + dy * dy <= r * r) {
-            dx++;
-        }
-        epd_hline(cx - dx, cy + dy, 2 * dx + 1, color);
     }
 }
 

@@ -268,6 +268,7 @@ static esp_err_t root_get(httpd_req_t *req)
         {"{{AP_URL}}", NET_AP_URL},
         {"{{AP_SSID}}", own},
         {"{{VOICE_URL}}", escaped_voice_url},
+        {"{{VOICE_FOLLOWUP}}", settings.followup ? "checked" : ""},
     };
     esp_err_t err = send_page(req, portal_index, values, sizeof(values) / sizeof(values[0]));
     free(options);
@@ -324,6 +325,9 @@ static esp_err_t save_post(httpd_req_t *req)
     // 信息地址必填：固件没有内置默认 OTA 地址
     voice_settings_t settings = {0};
     form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
+    char followup[8];
+    form_field(body, "voice_followup", followup, sizeof(followup));
+    settings.followup = strcmp(followup, "1") == 0;
     esp_err_t voice_err = voice_settings_validate(&settings);
     if (voice_err != ESP_OK) {
         nvs_close(h);

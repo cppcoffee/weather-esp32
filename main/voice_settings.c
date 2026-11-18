@@ -189,7 +189,7 @@ static bool valid_url(const char *url)
 
 esp_err_t voice_settings_validate(const voice_settings_t *settings)
 {
-    if (!settings || !memchr(settings->info_url, '\0', VOICE_URL_CAP))
+    if (!settings || settings->followup > 1 || !memchr(settings->info_url, '\0', VOICE_URL_CAP))
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -215,7 +215,7 @@ esp_err_t voice_settings_load(voice_settings_t *settings)
         return err;
     }
 
-    voice_settings_t loaded;
+    voice_settings_t loaded = {0};
     size_t length = sizeof(loaded);
     err = nvs_get_blob(handle, VOICE_SETTINGS_KEY, &loaded, &length);
     nvs_close(handle);
@@ -226,7 +226,8 @@ esp_err_t voice_settings_load(voice_settings_t *settings)
     if (err != ESP_OK) {
         return err;
     }
-    if (length != sizeof(loaded)) {
+    // The previous blob contained just the URL. A missing option defaults to off.
+    if (length != sizeof(loaded) && length != sizeof(loaded.info_url)) {
         return ESP_ERR_NVS_INVALID_LENGTH;
     }
     err = voice_settings_validate(&loaded);

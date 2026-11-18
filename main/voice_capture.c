@@ -7,6 +7,7 @@
 #include "esp_afe_sr_models.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_vad.h"
 #include "freertos/task.h"
 #include "voice_audio.h"
 #include "voice_internal.h"
@@ -34,6 +35,13 @@ static int16_t s_ref_scratch[VOICE_FRAME_SAMPLES];
 // WakeNet still wants whole chunks, which an AFE frame size need not match.
 static int16_t s_wake_chunk[VOICE_FRAME_SAMPLES];
 static int s_wake_fill;
+
+#define FOLLOWUP_FRAME_MS       30
+#define FOLLOWUP_SAMPLES        (VOICE_SAMPLE_RATE / 1000 * FOLLOWUP_FRAME_MS)
+#define FOLLOWUP_HISTORY_FRAMES 4
+static vad_handle_t s_vad;
+static int16_t (*s_vad_history)[FOLLOWUP_SAMPLES];
+static size_t s_vad_fill, s_vad_next, s_vad_count;
 
 // AEC removes the assistant's own playback from the microphone so WakeNet can stay armed while
 // the reply plays. WakeNet itself stays outside the AFE: the existing detection path, model
@@ -106,23 +114,74 @@ static void on_wake_word(void)
     ESP_LOGI(TAG, "wake word detected");
 }
 
-// Routes processed microphone audio either to the upload buffer or to WakeNet. Capture wins:
-// a turn never detects a second wake word while it is recording the question.
+static void buffer_microphone(const int16_t *mono, size_t samples)
+{
+    size_t bytes = samples * sizeof(int16_t);
+    if (xStreamBufferSpacesAvailable(s_microphone) < bytes) {
+        xEventGroupClearBits(s_events, VOICE_BIT_CAPTURE);
+        xEventGroupSetBits(s_events, VOICE_BIT_ERROR);
+    } else {
+        xStreamBufferSend(s_microphone, mono, bytes, 0);
+    }
+}
+
+static void detect_followup(const int16_t *mono, size_t samples)
+{
+    while (samples > 0) {
+        size_t take = FOLLOWUP_SAMPLES - s_vad_fill;
+        if (take > samples) {
+            take = samples;
+        }
+        int16_t *frame = s_vad_history[s_vad_next];
+        memcpy(frame + s_vad_fill, mono, take * sizeof(int16_t));
+        s_vad_fill += take;
+        mono += take;
+        samples -= take;
+        if (s_vad_fill < FOLLOWUP_SAMPLES) {
+            return;
+        }
+        s_vad_fill = 0;
+        s_vad_next = (s_vad_next + 1) % FOLLOWUP_HISTORY_FRAMES;
+        if (s_vad_count < FOLLOWUP_HISTORY_FRAMES) {
+            s_vad_count++;
+        }
+        if (vad_process_with_trigger(s_vad, frame) != VAD_SPEECH) {
+            continue;
+        }
+        EventBits_t bits = xEventGroupGetBits(s_events);
+        if (!(bits & VOICE_BIT_FOLLOWUP) || !VOICE_NETWORK_READY(bits) || (bits & VOICE_END_BITS)) {
+            return;
+        }
+        xStreamBufferReset(s_microphone);
+        size_t first = s_vad_next + FOLLOWUP_HISTORY_FRAMES - s_vad_count;
+        for (size_t i = 0; i < s_vad_count; i++) {
+            buffer_microphone(s_vad_history[(first + i) % FOLLOWUP_HISTORY_FRAMES], FOLLOWUP_SAMPLES);
+        }
+        buffer_microphone(mono, samples);
+        xEventGroupSetBits(s_events, VOICE_BIT_SPEECH);
+        return;
+    }
+}
+
+// Capture owns speech detection. Only the session task can start network capture.
 static void route_microphone(const int16_t *mono, size_t samples)
 {
-    if (xEventGroupGetBits(s_events) & VOICE_BIT_CAPTURE) {
-        // Preserve the start of the question while the chat audio channel opens.
-        size_t bytes = samples * sizeof(int16_t);
-        if (xStreamBufferSpacesAvailable(s_microphone) < bytes) {
-            xEventGroupClearBits(s_events, VOICE_BIT_CAPTURE);
-            xEventGroupSetBits(s_events, VOICE_BIT_ERROR);
-        } else {
-            xStreamBufferSend(s_microphone, mono, bytes, 0);
-        }
+    EventBits_t bits = xEventGroupGetBits(s_events);
+    if (!(bits & VOICE_BIT_FOLLOWUP) && (s_vad_count || s_vad_fill)) {
+        vad_reset_trigger(s_vad);
+        s_vad_next = s_vad_count = s_vad_fill = 0;
+    }
+    if ((bits & VOICE_BIT_CAPTURE) || ((bits & VOICE_BIT_FOLLOWUP) && (bits & VOICE_BIT_SPEECH))) {
+        buffer_microphone(mono, samples);
         s_wake_fill = 0;
         return;
     }
-    if (!(xEventGroupGetBits(s_events) & VOICE_BIT_ARMED)) {
+    if ((bits & VOICE_BIT_FOLLOWUP) && s_vad != NULL) {
+        detect_followup(mono, samples);
+        s_wake_fill = 0;
+        return;
+    }
+    if (!(bits & VOICE_BIT_ARMED)) {
         s_wake_fill = 0;
         return;
     }
@@ -188,7 +247,8 @@ static void capture_task(void *arg)
     (void)arg;
     const size_t stereo_bytes = s_wake_samples * 2 * sizeof(int16_t);
     for (;;) {
-        xEventGroupWaitBits(s_events, VOICE_BIT_ARMED | VOICE_BIT_CAPTURE, pdFALSE, pdFALSE, portMAX_DELAY);
+        xEventGroupWaitBits(s_events, VOICE_BIT_ARMED | VOICE_BIT_CAPTURE | VOICE_BIT_FOLLOWUP, pdFALSE, pdFALSE,
+                            portMAX_DELAY);
         if (!VOICE_NETWORK_READY(xEventGroupGetBits(s_events))) {
             vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
             continue;
@@ -196,6 +256,11 @@ static void capture_task(void *arg)
         size_t read = 0;
         esp_err_t err = audio_read(s_capture_stereo, stereo_bytes, &read);
         EventBits_t bits = xEventGroupGetBits(s_events);
+        if (!VOICE_NETWORK_READY(bits)) {
+            s_wakenet->clean(s_wake_model);
+            s_wake_fill = 0;
+            continue;
+        }
         if (err != ESP_OK || read != stereo_bytes) {
             if (bits & VOICE_BIT_CAPTURE) {
                 xEventGroupSetBits(s_events, VOICE_BIT_ERROR);
@@ -256,6 +321,12 @@ void voice_capture_stop(void)
         heap_caps_free(s_afe_in);
         s_afe_in = NULL;
     }
+    if (s_vad != NULL) {
+        vad_destroy(s_vad);
+        s_vad = NULL;
+        heap_caps_free(s_vad_history);
+        s_vad_history = NULL;
+    }
     s_afe = NULL;
     s_feed_samples = 0;
     s_afe_fill = 0;
@@ -271,4 +342,23 @@ void voice_capture_stop(void)
 bool voice_capture_has_aec(void)
 {
     return s_afe != NULL;
+}
+
+bool voice_capture_prepare_vad(void)
+{
+    if (s_vad != NULL) {
+        return true;
+    }
+    s_vad_history =
+        heap_caps_malloc(FOLLOWUP_HISTORY_FRAMES * sizeof(*s_vad_history), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_vad_history == NULL) {
+        return false;
+    }
+    s_vad = vad_create_with_param(VAD_MODE_2, VOICE_SAMPLE_RATE, FOLLOWUP_FRAME_MS, 60, 180);
+    if (s_vad == NULL) {
+        heap_caps_free(s_vad_history);
+        s_vad_history = NULL;
+        return false;
+    }
+    return true;
 }

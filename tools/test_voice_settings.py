@@ -61,7 +61,7 @@ HARNESS = r'''
 #include <string.h>
 
 _Static_assert(VOICE_URL_CAP == 256, "URL capacity is part of the storage contract");
-_Static_assert(sizeof(voice_settings_t) == 256, "Unexpected persisted layout");
+_Static_assert(sizeof(voice_settings_t) == 257, "Unexpected persisted layout");
 _Static_assert(offsetof(voice_settings_t, info_url) == 0, "Unexpected info_url layout");
 
 #define READ_HANDLE 19
@@ -274,6 +274,7 @@ static void test_settings_and_bounds(void)
         unsigned char after[8];
     } guarded;
     memset(&guarded, 0xa5, sizeof(guarded));
+    guarded.settings.followup = 0;
     memset(guarded.settings.info_url, 'x', VOICE_URL_CAP);
     assert(voice_settings_validate(&guarded.settings) == ESP_ERR_INVALID_ARG);
     strcpy(guarded.settings.info_url, "https://voice.example/info");
@@ -357,9 +358,18 @@ static void test_load(void)
         expect_failed_load(get_error);
         assert(opens == 1 && reads >= 1 && closes == 1);
     }
-    // Every truncated size, plus oversized data, must fail rather than zero the settings.
+    reset_nvs();
+    voice_settings_t legacy = make_settings("https://voice.example/info");
+    seed_blob(&legacy);
+    blob_length = VOICE_URL_CAP;
+    memset(&output, 0xa5, sizeof(output));
+    assert(voice_settings_load(&output) == ESP_OK);
+    assert(memcmp(&output, &legacy, sizeof(output)) == 0 && !output.followup);
+    ++checks;
+
+    // Any size other than the current and legacy layouts must fail.
     for (size_t length = 0; length < sizeof(blob); ++length) {
-        if (length == sizeof(voice_settings_t)) {
+        if (length == sizeof(voice_settings_t) || length == VOICE_URL_CAP) {
             continue;
         }
         reset_nvs();
@@ -368,13 +378,13 @@ static void test_load(void)
         expect_failed_load(ESP_ERR_NVS_INVALID_LENGTH);
         assert(opens == 1 && closes == 1);
     }
-    for (int delta = -1; delta <= 1; delta += 2) {
+    for (int delta = -2; delta <= 1; delta += 3) {
         reset_nvs();
         seed_blob(&zeroed);
         reported_length = (size_t)((int)sizeof(zeroed) + delta);
         expect_failed_load(ESP_ERR_NVS_INVALID_LENGTH);
     }
-    for (int corruption = 0; corruption < 6; ++corruption) {
+    for (int corruption = 0; corruption < 7; ++corruption) {
         reset_nvs();
         voice_settings_t invalid = make_settings("https://voice.example/info");
         switch (corruption) {
@@ -396,6 +406,9 @@ static void test_load(void)
         case 5:
             strcpy(invalid.info_url, "https://user:pass@voice.example/ota/");
             break;
+        case 6:
+            invalid.followup = 2;
+            break;
         }
         seed_blob(&invalid);
         expect_failed_load(ESP_ERR_INVALID_ARG);
@@ -407,7 +420,7 @@ static void test_store(void)
 {
     const voice_settings_t cases[] = {
         {.info_url = "https://voice.example/info"},
-        {.info_url = "http://192.168.1.8:8000/xiaozhi/ota/?x=a%20b&token=a%23b"},
+        {.info_url = "http://192.168.1.8:8000/xiaozhi/ota/?x=a%20b&token=a%23b", .followup = 1},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_nvs();

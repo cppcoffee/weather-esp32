@@ -112,10 +112,13 @@ static __attribute__((unused)) esp_err_t httpd_resp_send_err(httpd_req_t *r, int
 SCAN_STUB = r'''
 typedef struct {
     char info_url[256];
+    unsigned char followup;
 } voice_settings_t;
+static bool followup;
 static int voice_settings_load(voice_settings_t *settings)
 {
     memset(settings, 0, sizeof(*settings));
+    settings->followup = followup;
     return 0;
 }
 static __attribute__((unused)) int voice_settings_validate(const voice_settings_t *settings)
@@ -139,7 +142,7 @@ static const char *net_ap_ssid(void) { return "weather-A1B2C3"; }
 RUNNER = r'''
 static esp_err_t invoke(httpd_req_t *r, int argc, char **argv)
 {
-    if (!strcmp(argv[1], "root")) return root_get(r);
+    if (!strcmp(argv[1], "root") || !strcmp(argv[1], "root-followup")) return root_get(r);
     if (!strcmp(argv[1], "reply")) {
         assert(argc == 5);
         return reply(r, argv[3], argv[4], !strcmp(argv[2], "ok"));
@@ -153,7 +156,8 @@ static esp_err_t invoke(httpd_req_t *r, int argc, char **argv)
 int main(int argc, char **argv)
 {
     assert(argc >= 2);
-    if (!strcmp(argv[1], "root")) {
+    if (!strcmp(argv[1], "root") || !strcmp(argv[1], "root-followup")) {
+        followup = !strcmp(argv[1], "root-followup");
         input_count = argc - 2;
         input_ssids = argv + 2;
     }
@@ -256,7 +260,7 @@ def check_assets(assets):
     expected = {
         "index.html": {
                 "STYLE", "SCRIPT", "OPTIONS", "COUNT", "AP_URL", "AP_SSID",
-                "VOICE_URL",
+                "VOICE_URL", "VOICE_FOLLOWUP",
             },
         "result.html": {"STYLE", "TITLE", "MESSAGE"},
         "style.css": set(), "app.js": set(),
@@ -278,8 +282,8 @@ def run(executable, *args):
     return status, body
 
 
-def check_root(executable, assets, ap_url, ssids):
-    status, body = run(executable, "root", *ssids)
+def check_root(executable, assets, ap_url, ssids, followup=False):
+    status, body = run(executable, "root-followup" if followup else "root", *ssids)
     assert status == "200 OK"
     page = Page(body)
     assert page.sections["style"] == [assets["style.css"]]
@@ -289,12 +293,15 @@ def check_root(executable, assets, ap_url, ssids):
     assert len(forms) == 1 and forms[0].get("method", "").lower() == "post"
     assert forms[0].get("action") == "/save"
     fields = {a.get("name"): (tag, a) for tag, a in page.elements if tag in {"input", "select"}}
-    assert set(fields) == {"ssid", "ssid2", "pass", "voice_url"}
+    assert set(fields) == {"ssid", "ssid2", "pass", "voice_url", "voice_followup"}
     assert fields["ssid"][0] == "select"
     assert(fields["ssid2"][1].get("type") == "text")
     assert(fields["pass"][1].get("type") == "password")
     assert(fields["voice_url"][1].get("type") == "url")
     assert "required" in fields["voice_url"][1]
+    assert fields["voice_followup"][1]["type"] == "checkbox"
+    assert fields["voice_followup"][1]["value"] == "1"
+    assert ("checked" in fields["voice_followup"][1]) == followup
     assert any(tag == "button" and a.get("type") == "submit" for tag, a in page.elements)
     wifi_options = [(attrs, text) for attrs, text in page.options]
     shown = [ssid for ssid in ssids if ssid != OWN]
@@ -331,6 +338,8 @@ def main():
         for label, ssids in cases.items():
             check_root(executable, assets, ap_url, ssids)
             print(f"PASS root: {label}")
+        check_root(executable, assets, ap_url, [], followup=True)
+        print("PASS root: saved follow-up checkbox")
         for ok, status in (("ok", "200 OK"), ("bad", "400 Bad Request")):
             title, message = "配置结果", "已保存，请等待连接。" if ok == "ok" else "请输入 WiFi 名称。"
             actual, body = run(executable, "reply", ok, title, message)
