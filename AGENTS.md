@@ -1,279 +1,188 @@
 # AGENTS.md
 
-## 项目速览
+面向改代码的 AI：这里只写“改什么、改哪里、怎么验、不能违反什么”。用户文档在 `README.md`，进度与真机验收在 `TODO.md`，取舍历史在 `ABLATION.md` / `IMPROVEMENTS.md`（历史结论不等于当前约束）。
 
-ESP32-S3 + 2.9" SSD1680 墨水屏天气面板，ESP-IDF/C。源码 `main/`，主机回归 `tools/`。两个页面：按天（5 列）和按小时（10 列，每小时一列），按键切换。接口获取 5 天 + 21 条逐时数据；逐时页在 21 条缓存中按当前当地小时选取 10 列，余量不足时用占位。
+ESP32-S3 + 2.9" SSD1680 墨水屏天气面板（ESP-IDF/C，源码 `main/`，主机回归 `tools/`）。按天 5 列 + 逐时 10 列两页，按键切换；外加小智 AI 语音（WakeNet「小鹿小鹿」→ Opus 上传 → TTS 播放）。
 
-产品同时要支持**小智 AI 语音对话**：语音问答时间、天气和温湿度，墨水屏作为常显与语音状态的反馈面。首次会话由 WakeNet 检测「小鹿小鹿」触发，配网页可在播完后限时追问，默认开启。协议层用乐鑫的 `espressif/esp_xiaozhi` 组件，服务信息地址（OTA）由 SETUP-WIFI 页面逐台填写，固件没有内置默认服务器。接线和运行前置条件见「语音对话（小智 AI）」。时间、天气、本地温湿度、设备状态和音量 MCP 工具、屏上激活码与语音状态已接入；实际进度、剩余实现和真机验收统一维护在 `TODO.md`。
-
-本文描述当前实现；修改行为时同步更新相关测试与说明。`README.md`、`ABLATION.md` 中部分内容是历史记录，尤其是“不保留旧天气快照”和“切页强制全刷”，不能直接当作当前约束。
-
-## 通用能力复用原则
-
-- 通用能力优先使用 ESP-IDF 内置组件或 Component Manager 注册表中的成熟组件，不重复实现已有的解析器、编码器、协议处理、数据结构或其他基础设施；例如 JSON 使用自动管理的 `espressif/cjson`，HTTP(S)、DNS、TLS 和网络协议优先使用 ESP-IDF API。
-- 使用 Component Manager 组件时，在 `idf_component.yml` 中声明直接依赖并用 `dependencies.lock` 锁定版本；由组件管理器解析的传递依赖也应保持自动下载，不要把同一份第三方源码复制到 `components/`，也不要为了适配组件名额外维护重复包装层。`managed_components/` 是生成的下载目录，不提交到仓库。
-- 不要自行实现通用 DNS 协议、报文编解码、查询解析或网络基础设施；优先复用 ESP-IDF/lwIP、Component Manager 组件或成熟库。`portal_dns` 只有在现有 API 无法覆盖配网热点的设备特定强制解析行为时，才允许保留最小适配代码。
-- 自己实现的代码只负责业务规则、设备特定适配和库无法覆盖的边界；天气字段范围、日期连续性、刷新策略等业务校验仍由项目维护。若自动管理的组件缺少项目需要的严格校验，应在业务层补充最小必要规则，不修改下载目录中的第三方源码。
-- 准备新增通用工具前，先检查 ESP-IDF 内置组件、Component Manager 注册表和现有依赖。只有在没有合适组件，或组件的资源、许可证、平台兼容性不满足要求时，才在 `components/` 中实现最小必要本地组件；使用修改版第三方代码时记录上游版本、修改原因、许可证和测试范围。
-- 新增或调整依赖时同步更新 `idf_component.yml`、`dependencies.lock`、`CMakeLists.txt`、主机回归 harness、许可证和相关说明；固件与主机测试应尽量共用组件管理器下载的同一份源码。当前 `components/esp_xiaozhi/` 是基于上游 0.1.4 的单份本地修改版，Component Manager 使用 `override_path`；不要同时保留或修改 `managed_components/espressif__esp_xiaozhi/`。
-
-## 常用命令
-
-在项目根目录运行；主机回归和预览需要 Python 标准库及本机 C 编译器。运行天气/应用回归前，项目必须已由 ESP-IDF Component Manager 下载依赖（执行 `idf.py reconfigure` 或 `idf.py build`）。
+## 构建与测试
 
 ```bash
-python3 tools/test_app.py                 # 应用、解析、按键、UI 全量回归
-python3 tools/test_clock.py --sanitize    # 独立时钟、阻塞取数、跨分钟/午夜、显示互斥及像素隔离
-python3 tools/test_voice_feedback.py --sanitize # 激活码所有权/校验、并发快照、状态绘图和标题恢复
-python3 tools/test_portal.py              # 配网页模板、转义及 HTTP 分块发送回归
-python3 tools/test_device_mcp.py          # 设备工具、音量、快照、不可用状态、分配失败与并发回归
-python3 tools/test_audio_volume.py        # 音量恢复、设置、NVS 故障和回滚
-python3 tools/test_voice_lifecycle.py     # 抽取真实状态函数，检查停止失败重试、挂起唤醒与重配网恢复
-python3 tools/test_voice_session.py --sanitize # 真实会话/播放函数，模拟激活响应和音频时序
-python3 tools/test_app.py --only weather  # 仅天气解析
-python3 tools/test_app.py --only ui       # 仅 UI
-python3 tools/test_app.py --only app      # 仅应用流程
-python3 tools/preview_ui.py              # 按天页预览及像素断言
-python3 tools/preview_ui.py --sanitize    # 可选：AddressSanitizer / UBSan
-```
-
-预览输出 `build/preview-5day.png`（3 倍放大）、`build/preview-5day-native.png`（296×128）及各状态图片，均为演示数据，不是实时天气。`test_app.py` 的生成物放在系统临时目录。
-
-本机使用 ESP-IDF v6.0.2。已激活环境时运行 `idf.py build`；否则可直接用 IDF 管理的 Python 环境：
-
-```bash
-env IDF_PATH=/Users/sharp/.espressif/v6.0.2/esp-idf \
-    IDF_PYTHON_ENV_PATH=/Users/sharp/.espressif/tools/python/v6.0.2/venv \
+# 本机 ESP-IDF v6.0.2（已激活环境时直接 idf.py build）
+env IDF_PATH=$HOME/.espressif/v6.0.2/esp-idf \
+    IDF_PYTHON_ENV_PATH=$HOME/.espressif/tools/python/v6.0.2/venv \
     ESP_IDF_VERSION=6.0.2 \
-    PATH="/Users/sharp/.espressif/tools/python/v6.0.2/venv/bin:$PATH" \
-    /Users/sharp/.espressif/tools/python/v6.0.2/venv/bin/python \
-    /Users/sharp/.espressif/v6.0.2/esp-idf/tools/idf.py build
+    PATH="$HOME/.espressif/tools/python/v6.0.2/venv/bin:$PATH" \
+    $HOME/.espressif/tools/python/v6.0.2/venv/bin/python \
+    $HOME/.espressif/v6.0.2/esp-idf/tools/idf.py build
 ```
 
-- 不要用 `bash -lc '. .../export.sh'`：登录 shell 可能先找到系统 Python 3.9，导致 IDF 拒绝激活。
-- 烧录前确认实际串口，再将末尾的 `build` 改为 `-p 实际串口 flash`；不要把历史设备路径当作固定值。`idf.py monitor` 在交互终端运行。
-- 目标和默认配置见 `sdkconfig.defaults`：ESP32-S3、8 MB Flash、USB Serial/JTAG、主任务栈 10240 字节。已有 `sdkconfig` 时修改 defaults 不一定改变当前配置，需核对两者。
+```bash
+python3 tools/test_app.py                  # 应用/解析/按键/UI（--only weather|ui|app）
+python3 tools/test_clock.py --sanitize     # 时钟、阻塞取数、跨午夜、显示互斥
+python3 tools/test_portal.py               # 配网页模板、转义、分块发送
+python3 tools/test_device_mcp.py           # 设备工具、音量、快照、并发
+python3 tools/test_audio_volume.py         # 音量恢复/NVS 故障回滚
+python3 tools/test_voice_feedback.py --sanitize  # 激活码、状态快照、状态绘图
+python3 tools/test_voice_lifecycle.py      # 会话清理、断网恢复、重配网
+python3 tools/test_voice_session.py --sanitize   # 录音、播放、追问、打断
+python3 tools/test_voice_settings.py       # 语音设置与 URL 校验
+python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，非实时天气）
+```
 
-## 字体与字模生成
+- 天气/应用回归会编译 `managed_components/espressif__cjson`，首次先 `idf.py build` 或 `reconfigure`。
+- 不要用 `bash -lc '. .../export.sh'`（登录 shell 可能先找到系统 Python 3.9，IDF 拒绝激活）。
+- `idf.py monitor` 需交互终端；脚本读串口会复位芯片。烧录用实际串口，路径不写死。
+- 目标配置以 `sdkconfig.defaults` 为准（ESP32-S3、16 MB Flash、Octal PSRAM、主任务栈 10240）；已有 `sdkconfig` 时不随 defaults 自动更新。
 
-仓库提交的是生成后的 `main/fonts_aa.c`、`main/font_clock.c` 和 `main/font_icons.c`，固件构建不需要字体文件、Pillow、Swift、联网或 `.cache/`。只有修改屏幕文案、字号、文字字体、Weather Icons 映射或字形布局时才需要重新生成；生成后必须运行字模/布局回归。不要把下载的 TTF、CSS 或预览 PNG 提交到仓库。
+## 模块
 
-### 文字字模：`fonts_aa.c`
+| 文件 | 职责 |
+| --- | --- |
+| `main/main.c` | 启动、配网、重试阶梯、30 分钟刷新、当前页/成功快照、刷新调度、`clock` 任务 |
+| `main/ui.c` / `.h` | 五天页、逐时页、传感器底栏、状态/重试/配网提示；只改帧缓冲 |
+| `main/epd.c` / `.h` | SSD1680 SPI 驱动、4736 B 帧缓冲、绘图原语、全刷/局刷 |
+| `main/weather.c` / `.h` | IP 定位、Open-Meteo、5 天 + 21 小时数据契约校验 |
+| `main/weather_json.c` / `.h` | cJSON 严格解析辅助（整段、有限数、定长串、数组成员） |
+| `main/net.c` / `.h` | NVS 凭据、STA、SNTP/时区、HTTP(S) GET |
+| `main/net_portal.c`、`main/portal_web.c`、`main/web/`、`components/dns_server/` | SoftAP 配网、网页渲染、DNS 劫持（不自行实现 DNS 协议） |
+| `main/audio.c` / `.h` | ES8311 + NS415B：I²S/I²C 初始化、`audio_read/write`、增益/音量、静音 |
+| `main/voice.c` / `.h` | 小智会话生命周期、单轮与追问、Opus 编解码、AEC 打断后重新聆听 |
+| `main/voice_capture.c` / `.h` | 采集任务：I²S 读、AEC 前端、WakeNet、端点检测；只操作事件组 + 两个流缓冲 |
+| `main/voice_internal.h` | 两语音任务共享的采样格式、缓冲尺寸、事件位契约 |
+| `main/voice_settings.c` / `.h` | OTA 地址与追问开关的 NVS 存取、URL 校验 |
+| `main/voice_audio.c` / `.h` | 纯函数：立体声↔单声道（无 SDK 依赖，主机可测） |
+| `main/device_mcp.c` / `.h` | 发布屏幕同源快照，注册时间/天气/传感器/音量工具 |
+| `main/fonts_aa.c`、`main/font_clock.c`、`main/font_icons.c` | 生成的 1bpp 字模，勿手改 |
+| `tools/genfont.py`、`tools/genicons.swift` | 字模生成器（字体文件不进仓库） |
+| `components/esp_xiaozhi/` | 上游 0.1.4 单份本地 override（`override_path`），勿另建副本 |
 
-`tools/genfont.py` 使用 Pillow 的 FreeType `mode='1'` 单色栅格器生成 1bpp、MSB-first、逐行字节补齐的 C 数组，输出为 `main/fonts_aa.c` 和独立时钟字模 `main/font_clock.c`；`--only clock` 只生成后者。输入字体只在生成时使用：
+- 保留 `main/`，不改 `src/`；新增 C 文件同步 `main/CMakeLists.txt` 与主机 harness。
+- 格式：`.clang-format`（4 空格、120 列、函数左花括号换行）；不要为局部修改重排字模文件。
 
-- 拉丁字母、数字和 `°` 使用 Google Fonts 的 Roboto Variable。原有 `fonts_aa.c` 的来源说明为 Apache License 2.0；新增时钟使用 Roboto 3.015（SIL OFL 1.1），固定提交、SHA256 与许可见 `third_party/roboto-clock/`。
-- 中文使用 Google Fonts 的 Noto Sans SC Variable，SIL Open Font License 1.1；只有 `font_mid`（16px）带中文。
-- 每种字号始终包含 ASCII `U+0020..U+007F` 和度符号 `U+00B0`；中文字符由 `main/main.c`、`main/ui.c`、`main/weather.c` 中的 C 字符串自动扫描，网页 `portal_web.c` 的文案不进入字模。
-- 当前输出为 `font_mid` 16px Medium、`font_temp` 14px Medium、`font_small` 12px Regular。右上角时钟另由 `tools/genfont.py --only clock` 生成 `font_clock`，为 12px Bold、仅拉丁字符；字号、字重、是否带中文在生成器中维护。无显示调用的旧 `font_huge` 已在消融对照后移除。
+## 通用复用
 
-输入路径由环境变量覆盖，默认值是当前目录下的 `Roboto[wdth,wght].ttf` 和 `NotoSansSC[wght].ttf`：
+- JSON 用 `espressif/cjson`，HTTP/TLS/DNS/网络用 ESP-IDF；不自写协议栈。
+- 新依赖写进 `idf_component.yml` 并由 `dependencies.lock` 锁定；`managed_components/` 不入库。
+- 自己实现只限业务规则、设备适配和库缺口；业务校验（字段范围、日期连续性、刷新策略）留在本项目。
+
+## 应用状态边界（违反会重复踩坑）
+
+- 主循环管网络与刷新；`clock` 任务每秒检查分钟/日期/语音快照。二者共用显示互斥锁串行化绘图+刷新+SPI 等待；网络与配网等待期间不得持锁。`ui.c` 只画帧缓冲，不联网、不刷新。
+- `app_t.w` = 本次请求结果（开始时被清空，失败可为脏数据）；`app_t.shown` = 最近成功快照。**失败重绘只读 `shown`**，不能靠 `w` 保留旧预报。
+- 失败时 `present()` 用旧快照（首次失败用占位）重画，再覆盖顶部重试标题与底栏状态；正文像素不动。
+- 首列显示 `今天` 仅当日期等于已同步当地日期。
+- 底栏温湿度只取 `sensor_reading_t`；未接驱动时 `valid=false` → `--.- °C` / `-- %`，禁止用天气温湿度代替。接入后填 `temperature_c`、`humidity_percent`、`valid=true`。
+- 已对时逐时页随当地小时滚动；未对时从缓存首条开始。MCP 始终返回全部 21 条。
+
+## 启动、重试、按键
+
+- 启动先画占位页并 `epd_refresh_full()`（清断电残影），再等 5 s 才连网；不能等天气成功才画首屏。
+- 连接等待 25 s；有凭据连不上按 5→10→20→40→60 s 阶梯重试。无凭据才进配网。
+- 天气失败同一阶梯，成功后清零并回 30 分钟；两者计数独立。等待不含请求/对时/刷屏耗时，无每秒倒计时。
+- 拿到 IP 即后台 SNTP；每次天气成功后 `net_apply_tz()`（时区取天气的 UTC 偏移）。
+- 长按 5 s：暂停语音 → 普通刷新显示「WiFi 重置中」→ 清 WiFi 凭据（保留服务设置）→ 约 1 s → 全刷配网页 → `net_portal()`。重置/配网画面隐藏时钟与语音反馈；长按只报一次，松开不触发短按。
+- 按键任务每 20 ms 采样，8 项队列，长按优先；主任务在网络调用返回后执行重置。配网结束清空队列。
+- 主任务栈保持 10 KB（HTTPS 同步跑在主任务；4 KB 会在 TLS 握手栈溢出重启）。
+
+## 天气契约
+
+- 顺序：`ip-api.com/json`（出口 IP 定位，无需 key）→ Open-Meteo HTTPS。不请求 `current`。
+- 参数：`daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max`、`hourly=weather_code,temperature_2m,precipitation_probability`、`temperature_unit=celsius&timezone=auto&forecast_days=5&forecast_hours=21`。
+- 日数组每个恰好 5 项、逐时每个恰好 21 项；缺失、`null`、数量错、截断或带非空白尾随内容 → 整次失败。只读对象直接成员，不要误读 `*_units` 或嵌套同名字段。
+- 日日期合法且连续；温度有限且可存 `float`，最低 ≤ 最高；概率 `[0,100]`；天气码整数 `0..99`，未映射码 UI 画 `?`。
+- 逐时格式 `YYYY-MM-DDTHH:00`，首条日期 == `days[0].date`；相邻本地时差允许 −1/0/+1/+2 h（DST）。每条保留当地日期（YYYYMMDD）+ 小时。MCP 日期输出 `YYYY-MM-DD`，重复/跳小时保持接口顺序。
+- 响应缓冲静态 8192 B，达到边界即失败。改字段或数量时同时改结构体、解析器、缓冲和测试 URL。
+
+## 语音（小智 AI）
+
+- 协议层用 `espressif/esp_xiaozhi`（依赖 `esp_websocket_client`、`mcp-c-sdk`）；**不要重写 WebSocket/MQTT/hello/认证/MCP**。本地修改范围见 `components/esp_xiaozhi/LOCAL_PATCH.md`。
+- 顺序：`chat_init`（回调）→ `get_info`（POST 板卡信息，拿激活码，MQTT/WS 配置写 NVS）→ `chat_start` → `open_audio_channel`（自动发 hello）→ `send_audio_data` → `stop`/`deinit`。事件回调只报协议事实，状态机/UI/命令由应用决定。
+- 音频契约：hello = `opus`/16000 Hz/1 ch/60 ms。`audio.c` 是 16 kHz/16 bit/**双声道**（左声道为麦克风），语音任务必须转单声道并 60 ms 分帧，不要把双声道直接当单声道发。接线真值在 `main/audio.h` 顶部 `#define`（EN=2、DOUT=47、WS=48、DIN=38、BCLK=39、MCLK=40、SCL=41、SDA=42）；改线只改那里。
+- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，`MCLK_MULTIPLE_384`，默认音量 60（0..100，NVS 恢复），麦克风增益 18 dB。`audio_init()` 后 DAC 静音且 PA_EN 拉低（可能同接板载 LED）；播放前 `audio_set_mute(false)`。`esp_codec_dev` 音量是 dB 线性映射（0=−50 dB），自检别用 30。
+- `voice_init()` 载模型建任务；联网后取配置建会话；返回激活码时复制到反馈快照（1–16 个无空格可打印 ASCII）并上屏/串口，等待绑定后重试，不打开未激活会话。challenge 激活未实现。
+- 唤醒：WakeNet（`esp-sr` 2.4.7 `wn9_xiaoluxiaolu_tts2`）只在本地；命中后才开麦上传。模型必须在 `model` 分区；无 PSRAM 时跳过语音。
+- 建连：`open_session()` 在 `chat_start` 后等 `ESP_XIAOZHI_CHAT_EVENT_CONNECTED`（≤ `VOICE_CONNECT_TIMEOUT_MS`），超时按失败重试——`chat ready` 表示套接字已通。断网/STA 停止后停止接收并清会话；快速恢复 IP 也要先清旧会话；普通断线保留激活码，重配网清除。
+- 追问（默认开启，配网页可关）：播放结束静音后开 6 s 本地 VAD 窗口；确认开口带 ≤120 ms 前滚，复用同一通道 `listen start/stop`；窗口内取数最多等 4 s（网络锁）。沉默退回待唤醒。
+- 端点：本地 VAD 约 660 ms 静默结束录音，录音上限 15 s，随后发 `listen stop`；服务端收尾另行保留。
+- 播放：正常结束等 I²S DMA 尾帧（`AUDIO_PLAYBACK_TAIL_MS`）再静音；打断/断线/出错立即停。
+- AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考），参考信号是 `play_response()` 实际写入 I²S 的 PCM（`s_reference`，按写入顺序，不加延迟）。WakeNet 在 AFE 之外，检测 AEC 输出；播放期间保持 `ARMED`，命中后置 `VOICE_BIT_INTERRUPT`，由 `run_turn()` 静音、丢音频、发 `abort`(wake_word_detected)、同通道重新 `listen start`。AFE 失败则回退为播放期不检测。
+- 两任务只通过 `voice_internal.h` 的事件位 + 两个流缓冲通信；新增位同步更新该头与主机 harness。
+- 预算（两端要一起改）：设备首音频 90 s、播放断流 30 s；Rust 正常首音频 65 s、含失败提示 75 s、整回合 180 s（不含 ASR）。
+- WS stop 失败：保留 chat/MCP/Opus，释放网络锁后由语音任务重试清理，禁止开新会话；成功后 `deinit` 消费句柄。
+- 屏上反馈：`voice_feedback.c/.h` 临界区发布/读取快照；连接重试/错误保留待激活码，其他状态清空。显示任务每秒合并更新：顶部激活码、右下角状态，保留天气正文/温湿度/时钟；配网页优先。新增中文文案必须重跑 `tools/genfont.py`。
+- 隐私：接上后麦克风音频与识别文本会发到配置的服务端，不是本地处理。
+- MCP：`device_mcp_publish()` 发布 `app->shown` + `sensor_reading_t`；工具 `self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading`（无参数只读）、`self.get_device_status`、`self.audio_speaker.set_volume`（0–100 写 NVS）。不要为一次问答重跑天气；未接入传感器必须 `available=false`；时间仅 SNTP 成功且时区已知时 `synchronized=true`；天气含抓取时间、单调时钟 age、`stale`/`retrying`，未对时抓取时间为 null。
+
+## 配网页
+
+- 热点 `weather-XXXXXX`（开放），`192.168.1.1`，扫描或手填 SSID；凭据明文 HTTP 存 NVS，不先验证连接。不写编译期凭据、不提交真实密码。
+- 模板替换**不转义、不递归**；SSID 先 `html_escape()`。新增 token 同步替换表 + `test_portal.py`。
+- 表单字段：`ssid`/`ssid2`（手填优先）/`pass`/`voice_url`（必填）/`voice_followup`（`1` = 开，未保存过设置时按开）。服务设置与 WiFi 凭据同一 `wifi` NVS 事务；长按重配网只清 WiFi 部分。旧版只存 URL 的配置按追问开启处理。
+- `send_page()` 分块发送并内联 CSS/JS；结果页自包含（保存后热点即关闭）。改页面后跑 `test_portal.py` + ESP-IDF 构建。
+
+## 屏幕驱动与刷新
+
+- 可见 296×128；面板 RAM `PANEL_W=128`/`PANEL_H=296`；帧缓冲 4736 B。`EPD_W=300` 是逻辑画布，`epd_pixel()` 裁掉 `x≥296`——新内容不能画在裁掉区。
+- 引脚：SCK 9、MOSI 10、RST 11、DC 12、CS 13、BUSY 14；SPI2 4 MHz；旋转只在 `epd_pixel()` 做。
+- `0x01` 门线 `0x27,0x01,0x00`，`0x45` Y 结尾 `0x27,0x01`。**不要改成 300 行 `0x2B`/4800 B**：多 4 行会回绕（右侧像素跑到左侧）。
+- 全刷：复位 → 全配置 → `0x32` 前 153 B + 6 B 电压 → `0x24` 写 4736 B → `0x22 0xC7` → `0x20`。
+- 局刷：复位 → 基础寄存器 → `0x3C 0x80` → `0x32` partial LUT 153 B → `0x37` 10 B → `0x22 0xC0`+`0x20` 预置 → `0x24` 图 → `0x22 0x0F`+`0x20`。不能只把全刷 `0x22` 改成 `0xFF`。
+- `epd_refresh()` 从启动全刷后开始计普通刷新；每 `FULL_REFRESH_EVERY`（=5）次做一次维护全刷，其余局刷。时钟帧/状态帧/重试帧/天气更新都走普通刷新并推进计数；切页单独计数。
+- 切页规则：第 1–7 次只局刷；第 8 次全刷并清零（若普通维护全刷同时到期，合并为一次）。`epd_refresh_full()` 强制全刷但不推进普通计数，只用于启动占位、首次进配网、长按重置；它也清零切页计数。
+- BUSY 高电平为忙；初始化等 2 s、刷新等 15 s，超时只记日志。
+- 局部刷新仍传整帧，不是只传矩形。
+
+## 排版锚点
+
+- 日页：5 × 52 px 列，`GRID_X=18`，中心 44/96/148/200/252。
+- 逐时页：10 × 28 px 列，`HOUR_GRID_X=8`，中心从 22 每次 +28；标题 `未来10小时`。
+- 共用 `DATE_BASE=42`、`ICON_TOP=46`、`TEMP_BASE=89`、`PRECIP_BASE=103`。
+- 日图标 `font_icon_daily`：advance 40、line 27、基线 73、墨迹 y=46..72。逐时图标 `font_icon`：advance 26、line 23、基线 69、墨迹 y=46..68。
+- 日页日期：今天→`font_mid`，其他→`font_small` `MM/DD`，无数据 `--/--`。温度单行 `最低°-最高°`，上限 48 px：`font_temp`→`font_small`→`--`（`12°-25°` 在 16px 是 53 px，装不进 52 px 列）。
+- 逐时温度上限 26 px（`font_temp`→`font_small`→`--`）；概率超宽去 `%`（`100%`→`100`），未知 `--%`。
+- 底栏基线 124：温度标签 x=8/读数 x=46（≤58 px）；湿度标签 x=110/读数 x=146（≤50 px）；全用 `font_mid`。
+- 状态角落 x≥200、y≥110，右对齐到 290，≤90 px：`正在联网`/`正在取数`/`已更新`/`重试 #n`（另有 `UI_STATUS_NONE`）。有空间时用 `font_small` 显示上次抓取 `HH:MM`（与 MCP 同源）。`set_status(..., true)` 的帧缓冲改动只能落在该角落。
+- 时钟：`font_clock` 12px Bold，基线 16，右对齐 292；未对时 `--:--`，无天气时区加 `UTC` 前缀。分钟更新只改 x=230..295、y=0..21；跨午夜或缓存过期可同时改日期标签/`预报待更新` 标题。重试文案限 x<230。配网页隐藏时钟，返回后恢复。
+- 字模：1bpp，16/14/12 px（+ `font_clock` 12 px Bold）；**中文只在 `font_mid`**；`°` 在所有字号。图标来自 `font_icons.c`，未知 WMO 码画 `?`，不要在 `ui.c` 手绘图标。
+- 日页顶部建议只看 `days[0]`：无数据/概率非法 → `预报待更新`；雷雨/冰雹 → `雷雨注意安全`；其余四舍五入后概率 ≥51% → `今日带伞`；已知天气低概率 → `降水概率低`；未知码低概率 → `预报待更新`。百分比显示与阈值用同一舍入。
+
+## 字模再生成
+
+仅当改屏幕文案、字号、字体、图标映射或行锚点时才需要；生成文件已入库，普通构建不需要字体/Pillow/Swift/联网。
 
 ```bash
-mkdir -p .cache/fonts
-curl -fL 'https://github.com/google/fonts/raw/main/ofl/roboto/Roboto%5Bwdth,wght%5D.ttf' \
-    -o '.cache/fonts/Roboto[wdth,wght].ttf'
-curl -fL 'https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf' \
-    -o '.cache/fonts/NotoSansSC[wght].ttf'
-python3 -m pip install Pillow  # 若当前 Python 环境尚未安装 Pillow
+# 文字（Pillow + Roboto + Noto Sans SC；路径含 [] 必须加引号）
 FONT_TTF='.cache/fonts/Roboto[wdth,wght].ttf' \
 FONT_CJK_TTF='.cache/fonts/NotoSansSC[wght].ttf' \
-python3 tools/genfont.py
+python3 tools/genfont.py                     # --only clock 只生成 font_clock.c
+
+# 图标（macOS Swift；TTF 需与 third_party/weather-icons/README.md 的 SHA256 一致）
+swift tools/genicons.swift .cache/weather-icons/weathericons-regular-webfont.ttf \
+    main/font_icons.c .cache/weather-icons/preview.png
 ```
 
-路径含 `[`、`]` 时必须加引号；脚本会从项目根目录读取上述 `main/*.c`，所以命令也必须在项目根目录运行。若只改了屏幕文案，通常无需重新下载字体，保留原 TTF 后直接重新运行最后三行即可。生成后检查对应 `.c` 的头部和缺字情况。
+- 字体下载地址、固定提交、SHA256、许可证见 `third_party/roboto-clock/`、`third_party/weather-icons/`；TTF/CSS/预览 PNG 不入库。
+- 中文扫描范围：`main.c`、`ui.c`、`weather.c` 的字符串（不含网页文案）。生成后检查头部与缺字。
+- 生成后跑 `test_app.py --only ui`、`test_app.py`、`preview_ui.py`，并人工看预览的太阳/云/降水方向。只验证不覆盖时输出到 `.cache/` 后 `cmp`。
 
-若只改右上角时钟字体，可只生成独立字模，不需要 CJK 字体：
+## 改动 → 必须跑的回归
 
-```bash
-FONT_TTF='.cache/fonts/Roboto[wdth,wght].ttf' \
-python3 tools/genfont.py --only clock
-```
-
-生成后运行：
-
-```bash
-python3 tools/test_app.py --only ui
-python3 tools/preview_ui.py
-```
-
-### Weather Icons 字模：`font_icons.c`
-
-`tools/genicons.swift` 在 macOS 上使用 CoreGraphics、CoreText、CryptoKit、ImageIO，从固定版本的 Weather Icons TTF 轮廓生成两套关闭抗锯齿的 1bpp 子集：`font_icon_daily`（advance 40、cell 高 27）和 `font_icon`（advance 26、cell 高 23）。来源、映射、版权和完整 SIL OFL 1.1 许可见 `third_party/weather-icons/README.md`、`OFL.txt`。生成器会校验 TTF SHA256，不能用系统里同名但内容不同的字体：
-
-- 上游提交：`bb80982bf1f43f2d57f9dd753e7413bf88beb9ed`
-- TTF SHA256：`176bda6661f213dde47c2114d76e476ec8ca9aae07dd54f9550d2d28fe02b4fd`
-- TTF 和预览只放在被 `.gitignore` 排除的 `.cache/weather-icons/`；CSS 仅用于核对官方名称和码点，生成器本身不读取 CSS。
-
-```bash
-mkdir -p .cache/weather-icons
-curl -fL --max-time 60 \
-    'https://raw.githubusercontent.com/erikflowers/weather-icons/bb80982bf1f43f2d57f9dd753e7413bf88beb9ed/font/weathericons-regular-webfont.ttf' \
-    -o .cache/weather-icons/weathericons-regular-webfont.ttf
-curl -fL --max-time 60 \
-    'https://raw.githubusercontent.com/erikflowers/weather-icons/bb80982bf1f43f2d57f9dd753e7413bf88beb9ed/css/weather-icons.css' \
-    -o .cache/weather-icons/weather-icons.css
-shasum -a 256 .cache/weather-icons/weathericons-regular-webfont.ttf .cache/weather-icons/weather-icons.css
-swift tools/genicons.swift \
-    .cache/weather-icons/weathericons-regular-webfont.ttf \
-    main/font_icons.c \
-    .cache/weather-icons/preview.png
-shasum -a 256 main/font_icons.c
-open .cache/weather-icons/preview.png
-```
-
-如果只想验证重生成而不覆盖已提交文件，把输出改成缓存文件并逐字节比较：
-
-```bash
-swift tools/genicons.swift \
-    .cache/weather-icons/weathericons-regular-webfont.ttf \
-    .cache/weather-icons/font_icons.regenerated.c
-cmp main/font_icons.c .cache/weather-icons/font_icons.regenerated.c
-```
-
-图标生成后至少运行 `python3 tools/test_app.py` 和 `python3 tools/preview_ui.py`，并人工查看预览中的太阳/云/降水方向；若改变 `tools/genicons.swift`、图标映射或源字体，还要核对 `third_party/weather-icons/README.md` 的许可、SHA256 和生成结果。生成的 `.c` 文件仍需通过 `main/CMakeLists.txt` 编译进固件。
-
-## 模块一览
-
-| 文件 | 作用 |
+| 改动 | 回归 |
 | --- | --- |
-| `managed_components/espressif__cjson/` | Component Manager 自动下载的 cJSON 源码，固件和主机回归共用 |
-| `main/main.c` | 启动、配网、重试、30 分钟更新、当前页与成功天气快照、刷新调度 |
-| `main/button.c` / `.h` | GPIO4 低电平按键，内部上拉；2 次采样去抖，短按切页，长按 5 秒重置 WiFi |
-| `main/epd.c` / `.h` | SSD1680 SPI 驱动、4736 字节帧缓冲、绘图原语、全刷/局部刷新 |
-| `main/ui.c` / `.h` | 五天页、10 列逐时页、传感器底栏、状态、重试与配网提示；只画帧缓冲 |
-| `main/font_icons.c` / `.h` | Weather Icons 的 11 个 1bpp 图标子集；日页与逐时页使用两套固定尺寸字模 |
-| `third_party/weather-icons/` | Weather Icons 来源、固定提交、SHA256 和 SIL OFL 1.1 许可说明 |
-| `main/weather.c` / `.h` | 出口 IP 定位、Open-Meteo 请求、cJSON 数据校验、5 天 + 21 小时数据契约 |
-- `main/weather_json.c` / `.h` | 使用 Component Manager 提供的 cJSON 完成严格整段解析、数值/整数/定长字符串/对象成员数组读取；不含天气业务校验
-| `main/net.c` / `.h` | NVS 凭据、STA 连接、SNTP/时区、HTTP(S) GET |
-| `main/audio.c` / `.h` | ES8311 + NS415B 的 I²C/I²S 初始化与 `audio_read`/`audio_write`/`audio_set_mute` 原语；上电静音 |
-| `main/voice.c` / `.h` | 小智会话生命周期、单轮和可选追问、Opus 编解码与 AEC 打断后的重新聆听 |
-| `main/voice_capture.c` / `.h` | 采集任务：I2S 读取、AEC 前端、WakeNet 检测与打断信号；只操作事件组和两个流缓冲 |
-| `main/voice_internal.h` | 两个语音任务共享的音频格式、缓冲尺寸与事件位契约 |
-| `main/voice_settings.c` / `.h` | 小智服务信息地址的 NVS 保存及 URL 校验，WebSocket 地址由服务下发 |
-| `main/voice_audio.c` / `.h` | 纯函数：交错立体声→左声道单声道、单声道→立体声；不含 SDK 依赖，主机可测 |
-| `main/device_mcp.c` / `.h` | 发布屏幕同源的成功天气/传感器快照；用 managed MCP SDK 注册时间、5 天＋21 小时预报、本地温湿度和扬声器状态读取，以及可持久化的音量控制 |
-| `main/net_portal.c` | SoftAP 配网生命周期：AP/IP、WiFi 模式、DNS/网页服务启停 |
-| `main/portal_web.c` | 网页配网：热点扫描、模板渲染、WiFi 与小智服务设置 `/save` 保存与凭据事件 |
-| `components/dns_server/` | 复用 ESP-IDF captive portal 示例的 DNS server 组件 |
-| `main/portal_dns.c` / `.h` | 配网 DNS 的设备特定启动配置；协议处理由 `dns_server` 组件负责 |
-| `main/web/` | 独立维护配网页 HTML 模板、CSS、JS；编译时嵌入，响应时内联 |
-| `main/fonts_aa.c` / `.h` | 生成的 1bpp 字模：`font_mid` / `font_temp` / `font_small`；右上角时间使用独立的 `main/font_clock.c` / `font_clock` 粗体字模 |
-| `tools/test_app.py` | 编译真实应用/按键/解析/UI/绘图代码，stub 网络及硬件 I/O |
-| `tools/preview_ui.py` | 用真实 UI/驱动渲染按天、逐时页 PNG，并检查布局与像素 |
-| `tools/genicons.swift` | 从固定 Weather Icons TTF 生成两套 1bpp 图标字模；字体文件不进仓库 |
-| `tools/test_portal.py` | 编译真实配网页渲染函数，stub 扫描和 HTTP；检查模板、转义与发送失败 |
-| `tools/test_voice_settings.py` | 编译真实语音设置/URL 校验，使用 ESP-IDF `http_parser` 和 stub NVS 回归 |
-| `tools/genfont.py` | 用 Pillow + TTF 生成文字字模；`--only clock` 只生成 `main/font_clock.c`，字体文件不进仓库 |
+| 驱动、布局、字模、图标 | `test_app.py` + `preview_ui.py`（图标另核对预览与 `third_party/` 说明） |
+| 时钟任务、显示互斥、重试/配网页绘图 | `test_clock.py --sanitize` |
+| 配网页、模板、嵌入资源 | `test_portal.py` + ESP-IDF 构建 |
+| 天气解析/数据契约 | `test_app.py --only weather`（含 `--only app`） |
+| 设备工具、音量、快照 | `test_device_mcp.py` + `test_audio_volume.py` |
+| `voice.c`/`voice_capture.c` 状态与时序 | `test_voice_lifecycle.py` + `test_voice_session.py --sanitize` |
+| 语音设置、URL 校验 | `test_voice_settings.py` |
+| 模型/依赖/分区 | 构建输出核对 app 与模型镜像大小 |
 
-保留 ESP-IDF 的 `main/` 约定，不为分层增加空接口或改成 `src/`。新增 C 源文件需同步 `main/CMakeLists.txt` 及相关主机编译 harness。C 格式遵循 `.clang-format`（4 空格、120 列、函数左花括号换行）；不要为局部修改重排整个字模文件。
+改布局时同步核对：`ui.c` 列宽/网格/锚点；`preview_ui.py` 的 `COL_W`/`GRID_X`/`DATE_BASE`/`ICON_TOP`/`DAILY_TEMP_BASE`/`PRECIP_BASE`/`icon_mask`/`expect_forecast`；`test_app.py` 的 `centers`/`boundaries`/`hour_centers` 与宽度、基线断言。不要只改断言掩盖越界。
 
-## 应用状态与数据边界
+## 覆盖边界（测试通过 ≠ 真机可用）
 
-- 主循环负责网络和页面刷新；`main.c` 的独立 `clock` 任务每秒检查可见分钟及语音快照变化。两者用同一显示互斥锁串行化绘图、刷新及 SPI/BUSY 等待，网络/配网等待期间不得持有显示锁。`ui.c` 只修改帧缓冲，不能自行联网或调用刷新。
-- `app_t.w` 是本次请求结果，`app_t.shown` 是最近成功的完整天气快照。`weather_update()` 开始会清空输出，失败时 `ok=false`，且可能已写入部分数据；**不能依靠 `w` 保留旧预报**。`current_weather()` 在有成功数据后选 `shown`，支持失败期间切页与重画。
-- `app_t.view` 默认按天；短按切页，沿用缓存和切页刷新计数。定时取数保持当前页。已对时的逐时页随当地小时滚动，未对时时从缓存首条开始。MCP 保留完整 21 条。
-- 天气更新失败时，`present()` 用旧快照（首次失败用占位）重画当前页，再覆盖顶部重试提示和底栏状态。正文视觉保持不变，不是解析器保留旧值，也不是应用只调用一次标题绘制。
-- **底栏温湿度只取本地传感器**（`sensor_reading_t`），不用天气接口温湿度冒充现场读数。目前未接入传感器驱动，入口传 `{0}`（`valid=false`），显示 `--.- °C` / `-- %`；接入后填 `temperature_c`、`humidity_percent` 并置 `valid=true`。
-
-## 启动、重试与按键
-
-- 初始化屏幕、网络、按键后，先画占位页并 `epd_refresh_full()` 清掉断电残留；然后 `wait_serviced(BOOT_WAIT_MS)` 等 5 秒再尝试连接。不能等天气请求成功才画首屏。
-- `net_try_stored(CONNECT_TIMEOUT_MS)` 的连接等待为 25 秒。有凭据但连不上时按 5 → 10 → 20 → 40 → 60 → 60… 秒重试，并重画顶部连接失败提示；只有无凭据才进入网页配网。
-- 天气请求失败采用相同阶梯，成功后清零天气重试计数，恢复 30 分钟等待。连接与天气阶段使用各自的重试计数；等待不包含请求、对时、刷屏耗时，不做每秒倒计时。
-- STA 获得 IP 后启动后台 SNTP，再次获得 IP 时重新发起，应用取天气和刷屏无需等待对时。每次天气成功后 `net_apply_tz()`，本地时区来自天气的数值 UTC 偏移。
-- 长按 5 秒触发重配网。先暂停语音，再用普通刷新显示「WiFi 重置中」，清除 NVS 中的 WiFi 凭据后保留提示约 1 秒，随后全刷配网提示页、进入 `net_portal()` 并在配网完成后重新连接。重置和配网画面期间隐藏时钟和语音反馈。长按事件只报告一次，松开不再触发短按。
-- 独立按键任务每 20 ms 采样，事件经 8 项队列传递，长按优先于未处理的短按。连接和天气 HTTP 阻塞期间，显示任务可按缓存切页。长按重配网由主任务在网络调用返回后执行。屏幕 BUSY 仍会推迟实际切页，配网结束后清空队列。
-- 保留 10 KB 主任务栈：HTTPS 在主任务同步运行，历史实机记录中 4 KB 会在 TLS 握手时栈溢出并反复重启。
-
-## 天气与网络契约
-
-- 每次 `weather_update()` 先请求 `http://ip-api.com/json/?fields=status,city,lat,lon` 获取出口 IP 位置，再请求 Open-Meteo HTTPS；无需 API key，不是 GPS 定位。
-- 天气请求包含 daily 的天气码/最高最低温/最大降水概率，以及 hourly 的天气码/温度/降水概率，使用 `temperature_unit=celsius&timezone=auto&forecast_days=5&forecast_hours=21`，不请求 `current`。
-- 日数组必须各恰好 5 项，逐时数组必须各恰好 21 项；任一必需数据缺失、`null`、数量错误或非法，整次更新失败。只按对象直接成员读取，不能误读 `daily_units`、`hourly_units` 或嵌套同名字段。截断或带非空白尾随内容的 JSON 不接受。
-- 日日期要求合法且连续；温度要求有限且可存入 `float`，最低温 ≤ 最高温；概率在 `[0,100]`；天气码接受整数 `0..99`，UI 未映射的码仍画 `?`，不冒充晴天。
-- 逐时格式为 `YYYY-MM-DDTHH:00`，首条日期须等于 `days[0].date`；相邻本地时间差允许 −1/0/+1/+2 小时以容忍 DST。起点为当前当地小时是 API 请求约定，不是与本机时钟比对后的保证。每条保留当地日期（YYYYMMDD）和小时。MCP 将日期返回为 YYYY-MM-DD，重复或跳过的小时保留接口顺序。设备只有最近一次上报的 UTC 偏移。遇到小时序列跳变且抓取时刻对应首条时，显示用距首小时的实际经过时间选取。
-- 响应缓冲为静态 8192 字节，达到容量边界视为失败；改数据数量或字段时同时检查响应容量、结构体、解析器和测试 URL。
-
-## 语音对话（小智 AI）
-
-- 协议用 `espressif/esp_xiaozhi`（上游 0.1.4 的本地 override，依赖 `esp_websocket_client`、`mcp-c-sdk`）连接官方或自建 Xiaozhi 服务；示例 `ai/xiaozhi_chat`，API 文档见 <https://docs.espressif.com/projects/esp-iot-solution/zh_CN/latest/ai/xiaozhi.html>。本地修改包含运行时 URL 的 info 请求入口、有界 WebSocket 发送、MCP 发送错误传播与安全 stop/deinit；**不要在本项目重新实现 WebSocket、MQTT+UDP、hello/认证或 MCP**。来源、Apache-2.0 许可证和修改范围见 `components/esp_xiaozhi/LOCAL_PATCH.md`。
-- 典型顺序：`esp_xiaozhi_chat_init`（传音频/事件回调）→ `esp_xiaozhi_chat_get_info`（POST 板卡信息拿激活码，把 MQTT/WS 配置写 NVS）→ `chat_start` → `chat_open_audio_channel`（不发 message 时自动生成 hello）→ `chat_send_audio_data` 推二进制音频帧 → `chat_stop` / `chat_deinit`。事件回调只报协议事实（TTS 起停、识别文本、emoji、system cmd），设备状态机、UI、执行命令由应用决定。
-- 编解码用 `esphome/micro-opus`。本地检测使用 `espressif/esp-sr` 2.4.7 的 `wn9_xiaoluxiaolu_tts2`（「小鹿小鹿」）。构建把模型打包到 `model` 分区，首次烧录要包含模型分区。依赖和许可由 ESP-IDF 组件管理器维护，见 ESP-SR 组件的 `LICENSE`。
-- `voice_init()` 加载模型并创建音频任务。联网后获取小智配置并初始化会话；信息接口返回激活码时，复制到反馈快照后释放响应，在屏幕及串口显示，等待绑定并重试信息接口，不打开未激活会话。唤醒前仅在本地检测。命中后采集任务缓存单声道问句，供会话任务打开音频通道后用 60 ms Opus 帧上传。收到 TTS 开始或到达录音时限后停止上传；会话任务从队列解码播放，播放完成后恢复检测。
-- 首次取数后应用启用语音，实际联网状态来自 STA 事件。`open_session()` 在 `chat_start` 后等 `ESP_XIAOZHI_CHAT_EVENT_CONNECTED`（最多 `VOICE_CONNECT_TIMEOUT_MS`），超时按失败重试；所以日志 `chat ready` 之前套接字已连通，唤醒不会再落在建连窗口里。断网或 STA 停止后语音停止接收，语音任务负责清理旧会话。快速恢复 IP 也须等旧会话清理完毕，再按原流程建连；普通断线保留待绑定的激活码，重配网会清除。只有回合边界清理旧音频，进入播放时保留已经到达的新回合音频。
-- 正常播放结束时，两种模式都等待 I²S DMA 尾帧后静音。打断、断线或出错可立即结束播放。免唤醒追问默认开启（配网页可关闭），开启时静音再开放 6 秒本地 ESP-SR VAD 窗口。确认开口后附带最多 120 ms 本地前滚，复用音频通道和 `listen start/stop`。开放窗口时释放天气网络锁，已开始的取数最多有 4 秒可供追问等待，超过后停止采集并等待锁归还以清理会话。初次提问和追问均可在检测到话音后的约 660 ms 静默后排空问句缓冲、补齐 Opus 帧并发送 `listen stop`。保留服务端收尾和 15 秒录音上限。
-- 音频契约：hello 默认 `opus` / 16000 Hz / 1 声道 / 60 ms 帧。`main/audio.c` 现状是 16 kHz、16 bit、**双声道**（左声道为麦克风），需要在音频任务里做单声道转换和 60 ms 分帧；不要把双声道数据直接当单声道推给服务端。
-- 音频接线以 `main/audio.h` 顶部 `#define` 为真值，改线只改那一处；下表供阅读，不是第二份配置：
-
-| 信号 | GPIO | 说明 |
-| --- | --- | --- |
-| NS415B EN（功放） | 2 | 高电平使能，由 ES8311 驱动 `pa_pin` 控制 |
-| I²S DOUT | 47 | ESP32 → ES8311 DIN/SDIN |
-| I²S WS | 48 | LRCK / WS |
-| I²S DIN | 38 | ES8311 DOUT → ESP32（麦克风输入） |
-| I²S BCLK | 39 | BCLK |
-| I²S MCLK | 40 | 按接线名为 MCN |
-| I²C SCL | 41 | ES8311 控制时钟 |
-| I²C SDA | 42 | ES8311 控制数据（接线名为 SCA） |
-
-- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，16 kHz / 16 bit / **双声道交错**，`MCLK_MULTIPLE_384`（ES8311 支持的整数时钟关系）。默认音量 60（0..100），覆盖值从 NVS 恢复。麦克风增益 18 dB；`audio_init()` 后 DAC 静音且**功放使能脚 PA_EN 拉低**（`esp_codec_dev_open()` 会短暂拉高，初始化末尾显式关掉；该脚可能同时接板载 LED），要播放先 `audio_set_mute(false)`（同时打开 DAC 与 PA）。注意 `esp_codec_dev` 的音量是线性 dB 映射（0=−50 dB、100=0 dB），低音量值实际非常轻，做通路自检时不要用 `volume 30` 级别的设置。
-- 当前板卡 ESP32-S3-WROOM-1-N16R8 使用 8 MB Octal PSRAM，占用 GPIO33–37。音频已迁移为功放 EN=`GPIO2`、I²S DOUT=`GPIO47`、WS=`GPIO48`，其余 I²S/I²C 保持 GPIO38–42；GPIO47/48 在模块引脚区域相邻，适合缩短 PCB 走线。GPIO43/44 留作外接 UART，GPIO19/20 保留 USB-JTAG。`sdkconfig.defaults` 已启用 `CONFIG_SPIRAM`、`CONFIG_SPIRAM_MODE_OCT` 和 80 MHz PSRAM；刷板前必须核对 PCB 实际连线。固件在没有可用 PSRAM 时跳过唤醒初始化。
-- 栈与任务：语音跑独立任务，不要挤主任务（10 KB 栈已只为同步 HTTPS 留出）；若 keystore 的 NVS 操作在 PSRAM 栈上出问题，用 `esp_xiaozhi_nvs_ops_register` 把 NVS 转到 SRAM 任务。
-- 隐私边界：接上后麦克风音频和识别结果会上传到 xiaozhi.me，属于联网上传，不可写成“本地处理”。只在唤醒或明确触发后开麦，空闲时保持 `audio_set_mute` 静音、不发送音频。
-- 与天气的关系：`device_mcp_publish()` 发布已有的 `app->shown` 快照和 `sensor_reading_t`，由 managed SDK 提供 `self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading` 三个无参数只读工具。另提供 `self.get_device_status` 读取当前扬声器音量及 `self.audio_speaker.set_volume` 设置整数 0–100，修改成功后保存到 NVS。不要为一次问答重跑 `weather_update()`，也不要绕过“失败保留旧快照”的语义。天气包含5天+21小时、抓取时间、单调缓存年龄、陈旧与重试状态；未对时抓取时间为null。传感器未接入时必须available=false，不能冒用预报。当前时间仅在SNTP成功、时钟合理且天气UTC偏移已知时synchronized=true。配套Rust服务端用官方rmcp发现与调用工具，云模型须支持tool_calls。
-- 等待预算：设备首音频等待90秒、播放中断流等待30秒；配套Rust文本回合正常首音频65秒、含失败提示75秒、总回合180秒（不包含ASR）。不要只改一端的超时。WS stop失败时保留chat/MCP/Opus，释放应用网络锁后由voice任务重试清理，禁止新会话；成功stop后deinit消费句柄。
-- AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考）做回声消除，参考信号是 `play_response()` 实际写入 I2S 的 PCM（`s_reference` 流缓冲，按写入顺序喂入，不加人为延迟）。WakeNet 仍在 AFE 之外，检测的是 AEC 输出；播放期间保持 `ARMED`，命中唤醒词置 `VOICE_BIT_INTERRUPT`，由 `voice.c` 的 `run_turn()` 同一任务静音、丢弃被中止回复的音频，发送 `abort`(wake_word_detected) 并在同一通道重新 `listen start`，不重建会话。AFE 初始化失败时回退为“播放期间不检测唤醒”。两个语音任务只通过 `voice_internal.h` 的事件位和两个流缓冲通信；真实回声抑制量、`aec_filter_length` 与端到端打断延迟必须真机验证。
-- 屏上反馈：`voice_feedback.c/.h` 用临界区发布/读取有界状态快照；激活码支持 1–16 个无空格的可打印 ASCII 字符，连接重试/错误保留待激活码，其他状态会清除它。显示任务每秒合并更新，顶部显示激活码、右下角显示语音状态，天气正文、温湿度和时钟保留；退出激活后恢复最新天气或重试标题，配网页优先。短暂状态可能合并；当前未实现 challenge 激活，真实绑定/音频反馈待验收。**新增中文文案必须重跑 `tools/genfont.py`**（中文只在 `font_mid`）。
-- 按键语义：短按切页，长按 5 秒重配网。
-- 音频回调把下行包送入有界队列。采集任务和播放任务共用 ES8311：播放时仍持续采集供 AEC 消除回声，启用 AEC 时唤醒检测保持开启以便打断；未启用 AEC 时播放期间暂停唤醒检测和录音。
-
-## 配网页维护
-
-- 配网热点是开放的 `weather-XXXXXX`（MAC 后三字节），网页地址 `192.168.1.1`，支持扫描或手填 SSID；凭据经明文 HTTP 保存到 NVS，不先验证连接成功。不要写入编译时凭据、提交真实密码或声称这是加密配网。
-- `portal_dns` 使用 ESP-IDF captive portal 示例的 `dns_server` 组件，将配网热点的所有 A 查询指向 `WIFI_AP_DEF` 地址；HTTP 重定向辅助触发系统配网页，不保证所有系统必弹窗。真实 WiFi、DNS、网页和 TLS 行为需真机验证。
-- 页面源文件在 `main/web/`：`index.html` 为配网页，`result.html` 为保存结果页，`style.css`、`app.js` 为样式与交互。通过 `main/CMakeLists.txt` 的 `EMBED_TXTFILES` 嵌入固件，无需文件系统、npm 或 CDN；改资源后需重新构建、烧录。
-- `portal_web.c` 的 `send_page()` 分块发送模板并替换 `{{TOKEN}}`，CSS/JS 在响应中内联，不另开静态资源路由。结果页必须自包含：保存后热点即将关闭，不能依赖后续请求加载样式。
-- 保留服务端同步扫描、刷新页面重新扫描及 `POST /save` 普通表单。WiFi 字段为 `ssid` / `ssid2` / `pass`，手填 `ssid2` 优先。小智字段为 `voice_url`（必填）和 `voice_followup`（勾选时为 `1`，未保存过设置时按勾选处理），WebSocket 地址由信息接口下发。服务设置与 WiFi 凭据在同一 `wifi` NVS 事务中保存，长按重配网只清 WiFi 凭据并保留服务设置。旧版只存 URL 的配置加载后按追问开启处理；用户明确取消则保持关闭。
-- 模板替换不自动转义，也不递归解析插入值。SSID 先经 `html_escape()` 再生成选项；结果页标题/消息仅传应用自己的固定文案，不直接传用户输入。新增 token 同步修改替换表及主机测试。
-- 改页面、模板发送或资源嵌入后运行 `python3 tools/test_portal.py` 和 ESP-IDF 构建。主机测试检查真实渲染函数、最大热点列表、特殊字符、空替换及发送错误；不执行 JS、不验证真实 HTTP 服务、WiFi/NVS、手机配网窗口或浏览器视觉效果。
-
-## 驱动与刷新策略
-
-- 可见横屏 296×128，面板 RAM 为 `PANEL_W=128`、`PANEL_H=296`，帧缓冲 **4736 字节**。`EPD_W=300` 只是逻辑画布，`epd_pixel()` 裁掉 `x>=296`；新内容不能放在被裁区域。
-- 引脚见 `epd.h`：SCK 9、MOSI 10、RST 11、DC 12、CS 13、BUSY 14；屏幕供电 3.3V。SPI2、4 MHz，旋转映射只在 `epd_pixel()` 做。
-- `0x01` 门线 `0x27,0x01,0x00`；`0x45` Y 结尾 `0x27,0x01`。不要改成 300 行的 `0x2B` 或 4800 字节：多出的 4 行会回绕，表现为右侧像素跑到左侧。
-- 全刷：复位 → 全量配置 → `0x32` 写 `ws_20_30` 前 153B，并写 6B 电压参数 → `0x24` 写 4736B → `0x22 0xC7` → `0x20`。
-- 局部：复位 → 基础寄存器 → `0x3C 0x80` → `0x32` 写 `ws_partial` 前 153B → `0x37` 写 10B → `0x22 0xC0` + `0x20` 预置 → `0x24` 写 4736B → `0x22 0x0F` + `0x20`。不能仅将全刷的 `0x22` 参数改为 `0xFF`。
-- `epd_refresh()` 在启动占位全刷之后从局刷开始；普通刷新计数每达到 `FULL_REFRESH_EVERY` 的倍数时做一次维护性全刷，其余使用局部波形。**时钟帧、状态帧、重试帧和天气更新走普通刷新接口**，计数取决于这些普通刷新调用；切页单独计数，不推进普通刷新计数。局部刷新仍传输完整帧缓冲，不是只传矩形区域。分钟更新也会推进计数，当前每 5 次普通刷新维护性全刷一次。
-- **切页刷新规则：累计第 1–7 次切页只使用局部刷新；第 8 次切页执行一次全刷并清零切页计数。未满 8 次不得因切页主动全刷。** 第 8 次的全刷同时清理多次局刷积累的残影；若普通维护全刷已经到期，应在这次全刷中一并完成，避免紧接着再闪一次。普通维护全刷或 `epd_refresh_full()` 执行后也会清零切页计数。
-- `epd_refresh_full()` 强制全刷但不消耗普通刷新计数，应用只用于启动占位、首次进入配网或长按重置配网等需要清理断电残影/整页状态的场景。第 8 次切页由切页刷新接口执行一次全刷；若长期局刷导致残影，切页全刷和驱动的周期性维护全刷负责恢复对比度。
-- BUSY 高电平为忙，初始化等待 2s、刷新等待 15s；超时只打日志，不无限卡住。
-
-## 排版与字模
-
-- 按天页 5 个 52px 等宽列，`GRID_X=18`，中心 44/96/148/200/252；日期、图标、温度、概率均居中，不加行标签。
-- 首列日期等于已同步的当地日期才用 `font_mid` 显示 `今天`，其他有效日期均以 `font_small` 显示 `MM/DD`。无数据时五列都是 `--/--`。温度单行 `最低°-最高°`，上限 48px，先用 14px `font_temp`，超宽降 `font_small`，仍超宽或无效则 `--`。`12°-25°` 在 14px 下 47px，在 16px 下 53px，不能直接换成 `font_mid`。
-- 按小时页 **10 列 × 28px**，`HOUR_GRID_X=8`，中心从 22 起每次加 28；从当前小时对应的缓存条目起依次显示，缓存不足时后续列画占位，标题为 `未来10小时`。
-- 小时用两位数字和 `font_small`，无数据 `--`；Weather Icons 的 `font_icon` 固定 advance 26、line height 23，基线 69，墨迹限制在 y=46..68 和当前 28px 列内。温度带 `°`、宽度上限 **26px**，`font_temp` → `font_small` → `--`；概率用 `font_small`，超宽时去掉 `%`（如 `100%` → `100`），未知仍为 `--%`。
-- 两页共用 `DATE_BASE=42`、`ICON_TOP=46`、`TEMP_BASE=89`、`PRECIP_BASE=103`；按天 Weather Icons 的 `font_icon_daily` 固定 advance 40、line height 27，基线 73，墨迹区为 y=46..72；逐时图标基线 69，墨迹区为 y=46..68。改行锚点或字模 cell 时同步核对两个页面。
-- 按天页顶部建议只看 `days[0]`：无预报或概率非法先显示 `预报待更新`；雷雨/冰雹优先 `雷雨注意安全`；其余天气只有四舍五入后的概率 **≥51%** 才显示 `今日带伞`；已知天气低于阈值显示 `降水概率低`，未知码低概率显示 `预报待更新`。阈值和百分比显示用同一舍入结果，日最大概率不代表正在下雨。
-- 底栏基线 124：温度标签 x=8、读数 x=46（上限 58px）；湿度标签 x=110、读数 x=146（上限 50px）；全部用 `font_mid`。非有限值、越界湿度或超宽读数用占位。
-- 状态角落 x≥200、y≥110，文字右对齐到 x=290，上限 90px。应用的可见状态为 `正在联网` / `正在取数` / `已更新` / `重试 #n`，另有空状态 `UI_STATUS_NONE`。抓取时间已知且该角落有空间时，用 `font_small` 显示上次成功更新的当地 `HH:MM`，与 MCP 共用同一抓取元数据。`set_status(..., true)` 在取数前单独刷状态帧，该帧的帧缓冲改动只能在此角落内。
-- 右上角 `HH:MM` 使用 12px Bold `font_clock`，基线 16、右对齐到 x=292。SNTP 同步前显示 `--:--`，同步后缺少天气时区时显示带 `UTC` 前缀的时间。独立任务每秒检查时钟、日期和预报时效。普通分钟更新只改 x=230..295、y=0..21，过午夜或缓存过期时可同时更新日期标签或「预报待更新」标题，当前页其他天气像素保留。调用者按变化决定刷新。两种天气页和重试页均保留时钟；重试文案限于 x<230，过宽降为紧凑文案。配网页隐藏时钟，返回天气页后恢复；完整重绘强制补画时钟。SPI/波形/BUSY 会带来可见延迟，不能承诺整分钟零延迟。
-- 文字字模为 1bpp：46/16/14/12px；**中文只在 `font_mid` 中**，度符号在所有字号中。天气图标来自 `main/font_icons.c` 的 Weather Icons 1bpp 子集，未知 WMO 码仍显示 `?`；不要在 `ui.c` 恢复手绘图标。新增屏幕文案后用 `tools/genfont.py` 重新生成并跑缺字检查；扫描范围为 `main.c`、`ui.c`、`weather.c` 的字符串，不含网页文案。
-- 文字字模生成额外依赖 Pillow、Roboto 与 Noto Sans SC TTF，路径可用 `FONT_TTF` / `FONT_CJK_TTF` 指定；天气图标字模生成需要 macOS Swift 的 CoreGraphics/CoreText/CryptoKit/ImageIO，以及 `.cache/weather-icons/` 中固定 SHA256 的 Weather Icons TTF。普通构建和测试直接使用已生成的 `fonts_aa.c` / `font_clock.c` / `font_icons.c`，不需要下载字体。
-
-## 回归要求与覆盖边界
-
-- 改驱动、布局或字模后至少运行 `python3 tools/test_app.py` 和 `python3 tools/preview_ui.py`。改 Weather Icons 映射、生成器或 `font_icons.c` 后还要核对 `third_party/weather-icons/README.md` 的许可/来源与预览。测试通过不代表实屏黑度、残影、刷新时序或网络可用性已验证。
-- 改时钟任务、显示互斥或时钟/重试页绘图后运行 `python3 tools/test_clock.py --sanitize`。它编译真实主循环、时钟任务、UI、按键和 EPD，使用 pthread 互斥/条件变量及模拟时钟，让天气请求保持阻塞后验证分钟更新、跨午夜/校时、像素隔离、擦除旧数字、两页/重试/配网恢复；不验证 FreeRTOS 实际调度、真实网络或物理屏幕时序。
-- `preview_ui.py` 生成按天、逐时和 WiFi 重置等画面预览。逐时 UI 在 `test_app.py` 中检查，切页由 `expected_view`、`button_toggle`、`button_switch_full`、`button_retry` 等应用逻辑覆盖。按键回归覆盖去抖、5 秒阈值、重置画面先于擦除、配网提示及重新连接。
-- 改布局同步核对：`ui.c` 的日/小时列宽、网格起点和行锚点；`preview_ui.py` 的 `COL_W` / `GRID_X` / `DATE_BASE` / `ICON_TOP` / `DAILY_TEMP_BASE` / `PRECIP_BASE`、`icon_mask` / `expect_forecast`；`test_app.py` 的 `centers` / `boundaries` / `hour_centers`、图标字形、宽度及基线断言。不要只改断言以掩盖越界。
-- 主机解析测试广泛覆盖日数据、作用域、日期、非法值、缺项及截断 JSON；逐时回归比较成功响应中 21 条的日期、小时、天气码、温度和概率，并检查缺失、短数组及跨日等边界。
-- 应用测试检查完整 SPI 帧、启动等待、退避、失败正文保留、状态角落隔离、首次对时和切页；网络为 stub，**不覆盖真实 `net.c` / `net_portal.c` / `portal_web.c` / `portal_dns.c` 的 NVS、WiFi、HTTP/TLS、DNS、网页、SNTP 或硬件阻塞时序**。
-- 语音链路大部分不在主机覆盖内：`esp_xiaozhi` 的传输、激活、Opus 编解码、唤醒和真实 I²S 回流只能真机验证。主机覆盖 `voice_audio.c` 的声道转换、`button.c` 的短按/5 秒重配网动作；`test_device_mcp.py` 编译真实工具及managed cJSON，使用SDK公开头和stub注册API/时钟/RTOS，覆盖数据、失败快照保留、分配失败、并发，不验证MCP协议或真实SNTP。`test_voice_lifecycle.py` 抽取未经改写的网络状态/会话清理/voice主循环函数，stub RTOS与协议调用，覆盖停止失败资源保留、挂起唤醒、重配网后重新ARMED，不覆盖整个voice.c或真实SDK停止时序。`test_voice_session.py` 编译真实会话、播放和追问前滚函数，模拟服务、RTOS、Opus、VAD 与 I²S，覆盖打断后重新聆听与追问。AEC 实际回声抑制量、唤醒与 VAD 识别率、打断延迟和音质需真机验证。`main.c` 里的 `voice_*` 和发布调用在 harness 中是 stub；发布断言检查与UI同源。改 `voice.c` 的时序或分帧仍需真机听感验证。
-- `partitions.csv` 分别为固件和 ESP-SR 模型分配分区。调整模型或依赖后，用构建输出核对 app 和模型镜像各自的大小。
-- `--baseline` 接受旧 `main/` 目录，用于比较请求、调用及完整帧；只有数据契约、布局和字模兼容的基线才有意义。`.cache/` 中历史快照不是运行依赖，不能直接套用旧的单日/旧切页结论。
-- `ABLATION.md` 的体积、帧像素与实机观察属于当时版本的实验，不是当前布局的测量；不要将旧数字或未经复测的残影结论写成当前保证。
+- 只有真机能验：真实 WiFi/HTTP(S)/TLS/DNS/NVS 时序、屏幕黑度/残影/刷新时序、WakeNet 与 VAD 识别率、AEC 实际抑制量、端到端打断延迟、音质与首句延迟。
+- `test_app.py` 的 `main.c` 语音与发布调用是 stub；`test_voice_lifecycle.py` 抽取真实状态函数（不覆盖整个 `voice.c` 或 SDK 停止时序）；`test_voice_session.py` 编译真实会话/播放/追问函数，stub RTOS/Opus/VAD/I²S；`test_portal.py` 不执行 JS、不验真实 HTTP。
+- `--baseline` 只在数据契约、布局、字模一致时有意义；`.cache/` 历史快照不是运行依赖。
+- 不要把 `ABLATION.md` 的旧体积/像素/残影数字当成当前保证。
