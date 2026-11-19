@@ -22,7 +22,10 @@
 static const char *TAG = "net";
 static EventGroupHandle_t s_events; // 仅 GOT_IP；配网握手由 portal_web.c 管理
 static atomic_bool s_time_synced;
+static bool s_sntp_initialized; // Owned by the default event loop.
 #define GOT_IP BIT0
+
+static void start_time_sync(void);
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -38,6 +41,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             esp_wifi_connect();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        start_time_sync();
         voice_net_set_connected(true);
         xEventGroupSetBits(s_events, GOT_IP);
     }
@@ -147,8 +151,9 @@ void net_apply_tz(int off)
 
 static void on_time_sync(struct timeval *tv)
 {
-    (void)tv;
-    atomic_store(&s_time_synced, true);
+    if (tv && tv->tv_sec >= NET_MIN_SYNCED_EPOCH) {
+        atomic_store(&s_time_synced, true);
+    }
 }
 
 bool net_time_is_synced(void)
@@ -156,22 +161,23 @@ bool net_time_is_synced(void)
     return atomic_load(&s_time_synced);
 }
 
-void net_time_sync(void)
+static void start_time_sync(void)
 {
+    if (s_sntp_initialized) {
+        // Recover promptly after a reconnect, even if the last poll has backed off.
+        if (esp_netif_sntp_start() != ESP_OK) {
+            ESP_LOGW(TAG, "sntp restart failed");
+        }
+        return;
+    }
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     cfg.sync_cb = on_time_sync;
+    cfg.wait_for_sync = false;
     if (esp_netif_sntp_init(&cfg) != ESP_OK) {
         ESP_LOGW(TAG, "sntp init failed");
         return;
     }
-    if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000)) != ESP_OK) {
-        ESP_LOGW(TAG, "sntp sync timeout");
-        return;
-    }
-    time_t now = time(NULL);
-    struct tm tm;
-    localtime_r(&now, &tm);
-    ESP_LOGI(TAG, "time %04d-%02d-%02d %02d:%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+    s_sntp_initialized = true;
 }
 
 int net_http_get(const char *url, char *buf, size_t cap)

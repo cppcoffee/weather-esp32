@@ -3,6 +3,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -154,6 +155,7 @@ static bool json_hours(const cJSON *hourly, const char first_date[11], weather_h
         if (i == 0 && strcmp(date, first_date) != 0) {
             return false;
         }
+        hours[i].date = atoi(date) * 10000 + atoi(date + 5) * 100 + atoi(date + 8);
         hours[i].hour = hour;
         hours[i].temperature_c = (float)temperature;
         hours[i].code = code;

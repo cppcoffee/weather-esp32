@@ -42,6 +42,9 @@ static int s_wake_fill;
 static vad_handle_t s_vad;
 static int16_t (*s_vad_history)[FOLLOWUP_SAMPLES];
 static size_t s_vad_fill, s_vad_next, s_vad_count;
+static int16_t s_endpoint_frame[FOLLOWUP_SAMPLES];
+static size_t s_endpoint_fill;
+static bool s_endpoint_heard_speech;
 
 // AEC removes the assistant's own playback from the microphone so WakeNet can stay armed while
 // the reply plays. WakeNet itself stays outside the AFE: the existing detection path, model
@@ -105,6 +108,12 @@ static void on_wake_word(void)
     xEventGroupClearBits(s_events, VOICE_BIT_ARMED);
     s_wake_fill = 0;
     xStreamBufferReset(s_microphone);
+    if (s_vad != NULL) {
+        vad_reset_trigger(s_vad);
+    }
+    s_endpoint_fill = 0;
+    s_endpoint_heard_speech = false;
+    xEventGroupClearBits(s_events, VOICE_BIT_LOCAL_EOS);
     if (xEventGroupGetBits(s_events) & VOICE_BIT_RECEIVING) {
         xEventGroupSetBits(s_events, VOICE_BIT_CAPTURE | VOICE_BIT_INTERRUPT);
         ESP_LOGI(TAG, "barge-in: wake word detected while speaking");
@@ -158,25 +167,64 @@ static void detect_followup(const int16_t *mono, size_t samples)
             buffer_microphone(s_vad_history[(first + i) % FOLLOWUP_HISTORY_FRAMES], FOLLOWUP_SAMPLES);
         }
         buffer_microphone(mono, samples);
+        // Continue the same VAD state from speech onset through the question.
+        s_endpoint_fill = 0;
+        s_endpoint_heard_speech = true;
+        xEventGroupClearBits(s_events, VOICE_BIT_LOCAL_EOS);
         xEventGroupSetBits(s_events, VOICE_BIT_SPEECH);
         return;
+    }
+}
+
+static void detect_endpoint(const int16_t *mono, size_t samples)
+{
+    while (samples > 0) {
+        size_t take = FOLLOWUP_SAMPLES - s_endpoint_fill;
+        if (take > samples) {
+            take = samples;
+        }
+        memcpy(s_endpoint_frame + s_endpoint_fill, mono, take * sizeof(int16_t));
+        s_endpoint_fill += take;
+        mono += take;
+        samples -= take;
+        if (s_endpoint_fill == FOLLOWUP_SAMPLES) {
+            s_endpoint_fill = 0;
+            if (vad_process_with_trigger(s_vad, s_endpoint_frame) == VAD_SPEECH) {
+                s_endpoint_heard_speech = true;
+            } else if (s_endpoint_heard_speech) {
+                // The last microphone chunk is already in the buffer.
+                xEventGroupSetBits(s_events, VOICE_BIT_LOCAL_EOS);
+                xEventGroupClearBits(s_events, VOICE_BIT_CAPTURE);
+                return;
+            }
+        }
     }
 }
 
 // Capture owns speech detection. Only the session task can start network capture.
 static void route_microphone(const int16_t *mono, size_t samples)
 {
+    static bool in_followup;
     EventBits_t bits = xEventGroupGetBits(s_events);
-    if (!(bits & VOICE_BIT_FOLLOWUP) && (s_vad_count || s_vad_fill)) {
-        vad_reset_trigger(s_vad);
-        s_vad_next = s_vad_count = s_vad_fill = 0;
+    bool followup = (bits & VOICE_BIT_FOLLOWUP) != 0;
+    if (followup != in_followup) {
+        if (followup && s_vad != NULL) {
+            vad_reset_trigger(s_vad);
+            s_vad_next = s_vad_count = s_vad_fill = 0;
+        }
+        in_followup = followup;
     }
     if ((bits & VOICE_BIT_CAPTURE) || ((bits & VOICE_BIT_FOLLOWUP) && (bits & VOICE_BIT_SPEECH))) {
-        buffer_microphone(mono, samples);
+        if (!(bits & VOICE_BIT_LOCAL_EOS)) {
+            buffer_microphone(mono, samples);
+            if (s_vad != NULL) {
+                detect_endpoint(mono, samples);
+            }
+        }
         s_wake_fill = 0;
         return;
     }
-    if ((bits & VOICE_BIT_FOLLOWUP) && s_vad != NULL) {
+    if ((bits & VOICE_BIT_FOLLOWUP) && !(bits & VOICE_BIT_LOCAL_EOS) && s_vad_history != NULL) {
         detect_followup(mono, samples);
         s_wake_fill = 0;
         return;
@@ -299,6 +347,11 @@ esp_err_t voice_capture_start(EventGroupHandle_t events, StreamBufferHandle_t mi
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "AEC unavailable (%s); wake word disabled during playback", esp_err_to_name(err));
     }
+    // The capture task owns this detector after startup; its absence leaves the hard timer intact.
+    s_vad = vad_create_with_param(VAD_MODE_2, VOICE_SAMPLE_RATE, FOLLOWUP_FRAME_MS, 60, 660);
+    if (s_vad == NULL) {
+        ESP_LOGW(TAG, "VAD unavailable; using the recording timeout and server endpoint");
+    }
     if (xTaskCreate(capture_task, "wake", WAKE_TASK_STACK, NULL, VOICE_TASK_PRIO, &s_task) != pdPASS) {
         voice_capture_stop();
         return ESP_ERR_NO_MEM;
@@ -346,19 +399,12 @@ bool voice_capture_has_aec(void)
 
 bool voice_capture_prepare_vad(void)
 {
-    if (s_vad != NULL) {
-        return true;
-    }
-    s_vad_history =
-        heap_caps_malloc(FOLLOWUP_HISTORY_FRAMES * sizeof(*s_vad_history), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_vad_history == NULL) {
-        return false;
-    }
-    s_vad = vad_create_with_param(VAD_MODE_2, VOICE_SAMPLE_RATE, FOLLOWUP_FRAME_MS, 60, 180);
     if (s_vad == NULL) {
-        heap_caps_free(s_vad_history);
-        s_vad_history = NULL;
         return false;
     }
-    return true;
+    if (s_vad_history == NULL) {
+        s_vad_history =
+            heap_caps_malloc(FOLLOWUP_HISTORY_FRAMES * sizeof(*s_vad_history), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    return s_vad_history != NULL;
 }

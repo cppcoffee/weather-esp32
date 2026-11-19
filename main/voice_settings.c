@@ -200,6 +200,13 @@ esp_err_t voice_settings_validate(const voice_settings_t *settings)
     return ESP_OK;
 }
 
+// Follow-up listening is on unless the setup page explicitly turned it off.
+static void voice_settings_defaults(voice_settings_t *settings)
+{
+    memset(settings, 0, sizeof(*settings));
+    settings->followup = 1;
+}
+
 esp_err_t voice_settings_load(voice_settings_t *settings)
 {
     if (!settings) {
@@ -208,7 +215,7 @@ esp_err_t voice_settings_load(voice_settings_t *settings)
     nvs_handle_t handle;
     esp_err_t err = nvs_open(VOICE_SETTINGS_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        memset(settings, 0, sizeof(*settings));
+        voice_settings_defaults(settings);
         return ESP_OK;
     }
     if (err != ESP_OK) {
@@ -220,14 +227,16 @@ esp_err_t voice_settings_load(voice_settings_t *settings)
     err = nvs_get_blob(handle, VOICE_SETTINGS_KEY, &loaded, &length);
     nvs_close(handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        memset(settings, 0, sizeof(*settings));
+        voice_settings_defaults(settings);
         return ESP_OK;
     }
     if (err != ESP_OK) {
         return err;
     }
-    // The previous blob contained just the URL. A missing option defaults to off.
-    if (length != sizeof(loaded) && length != sizeof(loaded.info_url)) {
+    // The previous blob contained just the URL; keep follow-up on for those devices too.
+    if (length == sizeof(loaded.info_url)) {
+        loaded.followup = 1;
+    } else if (length != sizeof(loaded)) {
         return ESP_ERR_NVS_INVALID_LENGTH;
     }
     err = voice_settings_validate(&loaded);

@@ -61,6 +61,7 @@ HARNESS = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "audio.h"
 #include "cJSON.h"
 #include "device_mcp.h"
 #include "esp_mcp_engine.h"
@@ -133,15 +134,19 @@ static void json_free(void *p)
     }
 }
 
+#define TOOL_COUNT (TEST_CURRENT_MCP ? 5 : 3)
+struct esp_mcp_property_s { int min, max; };
+struct esp_mcp_property_list_s { int volume; };
 struct esp_mcp_tool_s {
     const char *name;
     char *description;
     esp_mcp_tool_callback_ex_t callback;
     char *annotations;
+    esp_mcp_property_t *property;
     bool owned;
 };
 struct esp_mcp_s {
-    esp_mcp_tool_t *tools[3];
+    esp_mcp_tool_t *tools[TOOL_COUNT];
     int count;
 };
 struct esp_mcp_tool_result_s {
@@ -153,14 +158,46 @@ struct esp_mcp_tool_result_s {
 static int creates, annotates, adds, destroys, live_tools;
 static int fail_create, fail_annotation, fail_add;
 static const char *names[] = {
-    "self.get_current_time", "self.get_weather_forecast", "self.get_sensor_reading"
+    "self.get_current_time", "self.get_weather_forecast", "self.get_sensor_reading",
+    "self.get_device_status", "self.audio_speaker.set_volume"
 };
+
+static int current_volume = 60;
+static esp_err_t volume_error;
+static bool fail_property_create, fail_property_attach;
+
+esp_err_t audio_get_volume(int *volume) { *volume = current_volume; return ESP_OK; }
+esp_err_t audio_set_volume(int volume) {
+    if (volume < 0 || volume > 100) return ESP_ERR_INVALID_ARG;
+    if (volume_error != ESP_OK) return volume_error;
+    current_volume = volume;
+    return ESP_OK;
+}
+esp_mcp_property_t *esp_mcp_property_create_with_range(const char *name, int min, int max) {
+    CHECK(!strcmp(name, "volume") && min == 0 && max == 100);
+    if (fail_property_create) return NULL;
+    esp_mcp_property_t *prop = malloc(sizeof(*prop));
+    CHECK(prop);
+    *prop = (esp_mcp_property_t){min, max};
+    return prop;
+}
+esp_err_t esp_mcp_property_destroy(esp_mcp_property_t *prop) { free(prop); return ESP_OK; }
+esp_err_t esp_mcp_tool_add_property(esp_mcp_tool_t *tool, esp_mcp_property_t *prop) {
+    CHECK(!tool->property && !strcmp(tool->name, names[4]));
+    if (fail_property_attach) return ESP_FAIL;
+    tool->property = prop;
+    return ESP_OK;
+}
+int esp_mcp_property_list_get_property_int(const esp_mcp_property_list_t *list, const char *name) {
+    CHECK(list && !strcmp(name, "volume"));
+    return list->volume;
+}
 
 esp_mcp_tool_t *esp_mcp_tool_create_ex(const char *name, const char *title,
                                      const char *description, esp_mcp_tool_callback_ex_t callback)
 {
     CHECK(name && title == NULL && description && *description && callback);
-    CHECK(creates < 3 && strcmp(name, names[creates]) == 0);
+    CHECK(creates < TOOL_COUNT && strcmp(name, names[creates]) == 0);
     if (++creates == fail_create) return NULL;
     esp_mcp_tool_t *tool = calloc(1, sizeof(*tool));
     CHECK(tool);
@@ -180,7 +217,8 @@ esp_err_t esp_mcp_tool_set_annotations_json(esp_mcp_tool_t *tool, const char *te
     cJSON *json = cJSON_ParseWithOpts(text, &end, 1);
     CHECK(json && end && *end == '\0' && cJSON_IsObject(json));
     CHECK(cJSON_GetArraySize(json) == 4);
-    CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "readOnlyHint")));
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "readOnlyHint")) ==
+          (strcmp(tool->name, "self.audio_speaker.set_volume") != 0));
     CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "destructiveHint")));
     CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "idempotentHint")));
     CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "openWorldHint")));
@@ -192,7 +230,7 @@ esp_err_t esp_mcp_tool_set_annotations_json(esp_mcp_tool_t *tool, const char *te
 
 esp_err_t esp_mcp_add_tool(esp_mcp_t *mcp, esp_mcp_tool_t *tool)
 {
-    CHECK(mcp && mcp->count < 3 && tool && tool->annotations && !tool->owned);
+    CHECK(mcp && mcp->count < TOOL_COUNT && tool && tool->annotations && !tool->owned);
     if (++adds == fail_add) return ESP_FAIL;
     mcp->tools[mcp->count++] = tool;
     tool->owned = true;
@@ -202,6 +240,7 @@ esp_err_t esp_mcp_add_tool(esp_mcp_t *mcp, esp_mcp_tool_t *tool)
 esp_err_t esp_mcp_tool_destroy(esp_mcp_tool_t *tool)
 {
     CHECK(tool && !tool->owned && live_tools > 0);
+    free(tool->property);
     free(tool->annotations);
     free(tool->description);
     free(tool);
@@ -236,7 +275,7 @@ esp_err_t esp_mcp_tool_result_add_text(esp_mcp_tool_result_t *result, const char
 
 static esp_mcp_tool_callback_ex_t callback(esp_mcp_t *mcp, int index)
 {
-    CHECK(mcp->count == 3 && index >= 0 && index < 3);
+    CHECK(mcp->count == TOOL_COUNT && index >= 0 && index < TOOL_COUNT);
     return mcp->tools[index]->callback;
 }
 
@@ -271,6 +310,9 @@ static weather_t fixture(int variant)
     }
     for (int i = 0; i < WEATHER_HOURS; i++) {
         weather_hour_t *h = &w.hours[i];
+#if TEST_CURRENT_MCP
+        h->date = 20250101 + variant * 10 + (20 + i + variant) / 24;
+#endif
         h->hour = (20 + i + variant) % 24;
         h->temperature_c = -4.75f + i * 0.5f + variant * 20;
         h->code = (i * 7 + variant) % 100;
@@ -285,10 +327,10 @@ static void registration(void)
     CHECK(device_mcp_register(NULL) == ESP_ERR_INVALID_ARG);
     CHECK(creates == 0 && live_tools == 0);
     CHECK(device_mcp_register(&engine) == ESP_OK);
-    CHECK(engine.count == 3 && creates == 3 && annotates == 3 && adds == 3 && destroys == 0);
-    CHECK(esp_mcp_destroy(&engine) == ESP_OK && live_tools == 0 && destroys == 3);
+    CHECK(engine.count == TOOL_COUNT && creates == TOOL_COUNT && annotates == TOOL_COUNT && adds == TOOL_COUNT && destroys == 0);
+    CHECK(esp_mcp_destroy(&engine) == ESP_OK && live_tools == 0 && destroys == TOOL_COUNT);
     for (int stage = 0; stage < 3; stage++) {
-        for (int position = 1; position <= 3; position++) {
+        for (int position = 1; position <= TOOL_COUNT; position++) {
             creates = annotates = adds = destroys = 0;
             fail_create = stage == 0 ? position : 0;
             fail_annotation = stage == 1 ? position : 0;
@@ -309,8 +351,44 @@ static void registration(void)
             CHECK(atomic_load(&live_json) == 0);
         }
     }
-    puts("PASS registration: three extended read-only tools; nine failure/ownership paths");
+#if TEST_CURRENT_MCP
+    fail_create = fail_annotation = fail_add = 0;
+    fail_property_create = true;
+    creates = 0;
+    CHECK(device_mcp_register(&engine) == ESP_ERR_NO_MEM && engine.count == 4);
+    CHECK(esp_mcp_destroy(&engine) == ESP_OK && !live_tools);
+    fail_property_create = false;
+    fail_property_attach = true;
+    creates = 0;
+    CHECK(device_mcp_register(&engine) == ESP_FAIL && engine.count == 4);
+    CHECK(esp_mcp_destroy(&engine) == ESP_OK && !live_tools);
+#endif
+    printf("PASS registration: %d tools; %d failure/ownership paths\n", TOOL_COUNT, 3 * TOOL_COUNT);
 }
+
+#if TEST_CURRENT_MCP
+static void volume(esp_mcp_t *mcp)
+{
+    CHECK(mcp->tools[4]->property && mcp->tools[4]->property->min == 0 && mcp->tools[4]->property->max == 100);
+    char *text = invoke(mcp, 3);
+    CHECK(strstr(text, "60"));
+    free(text);
+    esp_mcp_tool_result_t result = {0};
+    esp_mcp_property_list_t args = {.volume = 28};
+    CHECK(callback(mcp, 4)(&args, &result) == ESP_OK && current_volume == 28 && result.calls == 1);
+    free(result.text);
+    result = (esp_mcp_tool_result_t){0};
+    args.volume = 101;
+    CHECK(callback(mcp, 4)(&args, &result) == ESP_ERR_INVALID_ARG && !result.calls && current_volume == 28);
+    args.volume = 0;
+    volume_error = ESP_FAIL;
+    CHECK(callback(mcp, 4)(&args, &result) == ESP_FAIL && !result.calls && current_volume == 28);
+    text = invoke(mcp, 3);
+    CHECK(strstr(text, "28"));
+    free(text);
+    puts("PASS MCP speaker status, set, range and failure");
+}
+#endif
 
 static void descriptions(esp_mcp_t *mcp)
 {
@@ -596,6 +674,9 @@ int main(int argc, char **argv)
         else if (strcmp(argv[1], "descriptions") == 0) descriptions(&engine);
         else if (strcmp(argv[1], "allocation") == 0) allocation_tests(&engine);
         else if (strcmp(argv[1], "concurrent") == 0) concurrent(&engine);
+#if TEST_CURRENT_MCP
+        else if (strcmp(argv[1], "volume") == 0) volume(&engine);
+#endif
         else CHECK(!"unknown scenario");
         CHECK(esp_mcp_destroy(&engine) == ESP_OK && live_tools == 0);
     }
@@ -639,7 +720,7 @@ def run(command, work, env, timeout=60):
     return result.stdout
 
 
-def expected_forecast(variant):
+def expected_forecast(variant, *, legacy=False):
     return {
         "city": "Other city" if variant else 'Cache "city"',
         "utc_offset_seconds": -12600 if variant else 28800,
@@ -656,6 +737,7 @@ def expected_forecast(variant):
         "hours": [
             {
                 "hour": (20 + i + variant) % 24,
+                **({} if legacy else {"date": f"2025-01-{1 + variant * 10 + (20 + i + variant) // 24:02d}"}),
                 "temperature_c": -4.75 + i * 0.5 + variant * 20,
                 "weather_code": (i * 7 + variant) % 100,
                 "precip_probability": i * 4.5 + variant,
@@ -712,9 +794,10 @@ def same_json(actual, expected):
 
 def validate_descriptions(output, *, legacy=False):
     records = parse_records(output)
-    require(set(records) == {
-        "self.get_current_time", "self.get_weather_forecast", "self.get_sensor_reading",
-    }, "descriptions: expected exactly the three registered tools")
+    names = {"self.get_current_time", "self.get_weather_forecast", "self.get_sensor_reading"}
+    if not legacy:
+        names.update(("self.get_device_status", "self.audio_speaker.set_volume"))
+    require(set(records) == names, "descriptions: unexpected tool list")
     for name, value in records.items():
         require(set(value) == {"description"} and isinstance(value["description"], str)
                 and value["description"].strip(), f"{name}: missing tool description")
@@ -722,10 +805,10 @@ def validate_descriptions(output, *, legacy=False):
         description = records["self.get_weather_forecast"]["description"].casefold()
         for phrase in (
             "wmo", "unknown", "percent", "monotonic seconds", "not observed rain",
-            "at fetch", "local hour", "not rolling",
+            "at fetch", "local date", "repeated local hour",
         ):
             require(phrase in description, f"weather description missing semantics: {phrase!r}")
-    print(f"PASS descriptions: three tools{' (legacy)' if legacy else '; forecast unit/time semantics'}")
+    print(f"PASS descriptions: {len(names)} tools{' (legacy)' if legacy else '; forecast unit/time semantics'}")
 
 
 def validate_behavior(output, *, legacy=False):
@@ -762,7 +845,7 @@ def validate_behavior(output, *, legacy=False):
         known = fetched_at is not None
         expect(label, {
             "available": True, "source": "Open-Meteo_cached_forecast", "retrying": retrying,
-            **expected_forecast(variant), "fetched_at_known": known, "fetched_at": fetched_at,
+            **expected_forecast(variant, legacy=legacy), "fetched_at_known": known, "fetched_at": fetched_at,
             "age": age, "stale": retrying or not known or age >= 1800,
             **(LEGACY_FORECAST_METADATA if legacy else {}),
         })
@@ -834,9 +917,13 @@ def compare_behavior(before, after):
                     del normalized[key]
                 else:
                     require(key not in old, f"{label}: unavailable baseline has metadata {key}")
-        require(same_json(new, normalized),
+        comparable = dict(new)
+        if "hours" in comparable:
+            comparable["hours"] = [{key: val for key, val in hour.items() if key != "date"}
+                                   for hour in comparable["hours"]]
+        require(same_json(comparable, normalized),
                 f"{label}: dynamic baseline/after mismatch\nbaseline {normalized!r}\nafter    {new!r}")
-    print("PASS baseline equivalence: 44 results; only four verified static forecast fields removed")
+    print("PASS baseline equivalence: 44 results; verified static metadata removal and additive hourly dates")
 
 
 def max_forecast_bytes(output):
@@ -889,11 +976,14 @@ def main():
             executable = work / f"device_mcp-{label}.out"
             run([
                 compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Dtime=device_test_time",
-                "-Wall", "-Wextra", "-Werror", "-O1", *flags,
+                f"-DTEST_CURRENT_MCP={int(label != 'baseline')}", "-Wall", "-Wextra", "-Werror", "-O1", *flags,
                 "-I", work / "stubs", "-I", source, "-I", sdk_include, "-I", cjson_dir,
                 source / "device_mcp.c", cjson_source, harness, "-pthread", "-lm", "-o", executable,
             ], work, env)
-            for scenario in ("registration", "behavior", "descriptions", "allocation", "concurrent"):
+            scenarios = ["registration", "behavior", "descriptions", "allocation", "concurrent"]
+            if label != "baseline":
+                scenarios.append("volume")
+            for scenario in scenarios:
                 output = run([executable, scenario], work, env)
                 if artifacts:
                     (artifacts / f"{label}-{scenario}.txt").write_text(output, encoding="utf-8")

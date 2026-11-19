@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "epd.h"
+#include "esp_timer.h"
 #include "font_icons.h"
 #include "net.h"
 
@@ -22,13 +23,13 @@
 
 // Hourly strip: 10 columns, one per hour, covering the current hour .. +9 h.
 #define HOUR_COLS   10
-#define HOUR_STEP   1
 #define HOUR_COL_W  28
 #define HOUR_GRID_X ((PANEL_H - HOUR_COLS * HOUR_COL_W) / 2)
 
 #define CLOCK_LEFT 230
-static char displayed_clock[6];
+static char displayed_clock[10];
 static bool clock_visible;
+static bool clock_local;
 static voice_feedback_t voice_feedback;
 static bool voice_known;
 static ui_status_t application_status;
@@ -37,8 +38,22 @@ static char header_city[24];
 static char header_label[32];
 static char retry_title[64];
 static bool retry_header;
+static bool daily_page;
+static char first_date[11];
+static bool first_is_today;
+static bool forecast_stale;
+static bool stamp_set;
+static forecast_stamp_t forecast_stamp;
+static weather_hour_t hourly_cache[WEATHER_HOURS];
+static bool hourly_available;
+static bool hourly_discontinuous;
+static int hourly_start;
 
-_Static_assert(WEATHER_HOURS >= (HOUR_COLS - 1) * HOUR_STEP + 1, "hourly strip needs 10 hours");
+static bool date_label(const char date[11], char label[6]);
+static void draw_first_date(void);
+static void draw_hourly_cells(void);
+
+_Static_assert(WEATHER_HOURS >= HOUR_COLS, "hourly strip needs 10 hours");
 
 static void text_center(int cx, int y_base, const aafont *f, const char *s)
 {
@@ -246,6 +261,15 @@ static void draw_status(void)
     const char *text = selected_status(buf, sizeof(buf));
     epd_fill_rect(STATUS_LEFT, 110, PANEL_H - STATUS_LEFT, EPD_H - 110, EPD_WHITE);
     int width = epd_text_w(&font_mid, text);
+    if (stamp_set && clock_local && forecast_stamp.fetched_at != 0) {
+        char updated[6];
+        struct tm local;
+        if (localtime_r(&forecast_stamp.fetched_at, &local) && strftime(updated, sizeof(updated), "%H:%M", &local) > 0
+            && epd_text_w(&font_small, updated) + width + 4 <= STATUS_MAX_W)
+        {
+            epd_text(STATUS_LEFT, 124, &font_small, updated);
+        }
+    }
     if (*text && width <= STATUS_MAX_W) {
         epd_text(STATUS_RIGHT - width, 124, &font_mid, text);
     }
@@ -258,17 +282,22 @@ void ui_draw_status(ui_status_t status, unsigned attempt)
     draw_status();
 }
 
-bool ui_update_clock(void)
+static bool clock_is_known(time_t now)
 {
-    if (!clock_visible) {
-        return false;
-    }
-    char buf[6];
-    time_t now = time(NULL);
+    return now >= NET_MIN_SYNCED_EPOCH && net_time_is_synced();
+}
+
+static bool render_clock(time_t now)
+{
+    char buf[sizeof(displayed_clock)] = "--:--";
     struct tm tm;
-    if (localtime_r(&now, &tm) == NULL || strftime(buf, sizeof(buf), "%H:%M", &tm) == 0
-        || strcmp(buf, displayed_clock) == 0)
-    {
+    if (clock_is_known(now)) {
+        struct tm *converted = clock_local ? localtime_r(&now, &tm) : gmtime_r(&now, &tm);
+        if (!converted || strftime(buf, sizeof(buf), clock_local ? "%H:%M" : "UTC %H:%M", &tm) == 0) {
+            strcpy(buf, "--:--");
+        }
+    }
+    if (strcmp(buf, displayed_clock) == 0) {
         return false;
     }
     epd_fill_rect(CLOCK_LEFT, 0, PANEL_H - CLOCK_LEFT, 22, EPD_WHITE);
@@ -277,11 +306,19 @@ bool ui_update_clock(void)
     return true;
 }
 
-static void show_clock(void)
+static void update_forecast_date(time_t now)
 {
-    clock_visible = true;
-    displayed_clock[0] = '\0';
-    (void)ui_update_clock();
+    first_is_today = false;
+    forecast_stale = stamp_set && forecast_is_stale(forecast_stamp, esp_timer_get_time());
+    struct tm local;
+    char today[11];
+    if (clock_local && first_date[0] && clock_is_known(now) && localtime_r(&now, &local)
+        && strftime(today, sizeof(today), "%Y-%m-%d", &local) > 0)
+    {
+        int relation = strcmp(today, first_date);
+        first_is_today = relation == 0;
+        forecast_stale = forecast_stale || relation > 0;
+    }
 }
 
 static void render_header(void)
@@ -298,9 +335,12 @@ static void render_header(void)
         epd_text(8, 16, &font_mid, retry_title);
     } else {
         draw_city(header_city);
-        text_center(174, 16, &font_mid, header_label);
+        text_center(174, 16, &font_mid,
+                    (forecast_stale || (daily_page && !first_is_today)) ? "预报待更新" : header_label);
     }
-    show_clock();
+    clock_visible = true;
+    displayed_clock[0] = '\0';
+    (void)render_clock(time(NULL));
 }
 
 static void draw_header(const weather_t *w, const char *label)
@@ -308,9 +348,93 @@ static void draw_header(const weather_t *w, const char *label)
     const char *city = w && w->ok ? w->city : "无数据";
     snprintf(header_city, sizeof(header_city), "%.*s", (int)sizeof(header_city) - 1, city);
     snprintf(header_label, sizeof(header_label), "%s", label);
+    clock_local = w && w->ok && w->utc_offset >= -14 * 3600 && w->utc_offset <= 14 * 3600 && w->utc_offset % 60 == 0;
+    char label_date[6];
+    if (w && w->ok && date_label(w->days[0].date, label_date)) {
+        memcpy(first_date, w->days[0].date, sizeof(first_date));
+    } else {
+        first_date[0] = '\0';
+    }
+    update_forecast_date(time(NULL));
     retry_header = false;
     render_header();
     epd_hline(6, 22, EPD_W - 12, EPD_BLACK);
+}
+
+void ui_set_forecast_stamp(const forecast_stamp_t *stamp)
+{
+    stamp_set = stamp != NULL;
+    if (stamp_set) {
+        forecast_stamp = *stamp;
+    }
+}
+
+static int date_key(const struct tm *local)
+{
+    return (local->tm_year + 1900) * 10000 + (local->tm_mon + 1) * 100 + local->tm_mday;
+}
+
+static int select_hourly_start(time_t now)
+{
+    struct tm local;
+    if (!hourly_available || !clock_local || !clock_is_known(now) || hourly_cache[0].date == 0
+        || !localtime_r(&now, &local))
+    {
+        return 0;
+    }
+    int date = date_key(&local);
+    int64_t current = (int64_t)date * 24 + local.tm_hour;
+    // Keep repeated or skipped DST hours in API order when the fetch timestamp
+    // anchors the first row. The device only has the last reported UTC offset.
+    if (hourly_discontinuous && stamp_set && forecast_stamp.fetched_at) {
+        struct tm fetched;
+        if (localtime_r(&forecast_stamp.fetched_at, &fetched) && date_key(&fetched) == hourly_cache[0].date
+            && fetched.tm_hour == hourly_cache[0].hour)
+        {
+            double hours = (difftime(now, forecast_stamp.fetched_at) + fetched.tm_min * 60 + fetched.tm_sec) / 3600;
+            return hours <= 0 ? 0 : hours >= WEATHER_HOURS ? WEATHER_HOURS : (int)hours;
+        }
+    }
+    for (int i = 0; i < WEATHER_HOURS; i++) {
+        int64_t hour = (int64_t)hourly_cache[i].date * 24 + hourly_cache[i].hour;
+        if (hour >= current) {
+            return i;
+        }
+    }
+    return WEATHER_HOURS;
+}
+
+bool ui_update_clock(void)
+{
+    if (!clock_visible) {
+        return false;
+    }
+    time_t now = time(NULL);
+    bool was_today = first_is_today;
+    bool was_stale = forecast_stale;
+    update_forecast_date(now);
+    bool date_changed = daily_page && was_today != first_is_today;
+    bool hours_changed = false;
+    if (!daily_page) {
+        int start = select_hourly_start(now);
+        if (start != hourly_start) {
+            hourly_start = start;
+            epd_fill_rect(0, 23, PANEL_H, 108 - 23, EPD_WHITE);
+            draw_hourly_cells();
+            hours_changed = true;
+        }
+    }
+    if (date_changed) {
+        epd_fill_rect(GRID_X, 23, COL_W, ICON_TOP - 23, EPD_WHITE);
+        draw_first_date();
+    }
+    if (date_changed || was_stale != forecast_stale) {
+        if (!retry_header && !(voice_known && voice_feedback.state == VOICE_STATE_ACTIVATION)) {
+            render_header();
+            return true;
+        }
+    }
+    return render_clock(now) || date_changed || hours_changed;
 }
 
 bool ui_update_voice(const voice_feedback_t *feedback)
@@ -383,6 +507,14 @@ static bool date_label(const char date[11], char label[6])
     return true;
 }
 
+static void draw_first_date(void)
+{
+    char date[6];
+    const char *label = date_label(first_date, date) ? date : "--/--";
+    text_center(GRID_X + COL_W / 2, DATE_BASE, first_is_today ? &font_mid : &font_small,
+                first_is_today ? "今天" : label);
+}
+
 static void forecast_range(int cx, const weather_day_t *day)
 {
     char low[48], high[48], buf[100];
@@ -412,15 +544,17 @@ void ui_draw_weather(const weather_t *w, const sensor_reading_t *sensor)
     bool have_weather = w && w->ok;
     epd_clear(EPD_WHITE);
 
+    daily_page = true;
     draw_header(w, today_hint(w));
+    draw_first_date();
 
     for (int i = 0; i < WEATHER_DAYS; i++) {
         int cx = GRID_X + COL_W / 2 + i * COL_W;
         char date[6];
-        bool known_date = have_weather && date_label(w->days[i].date, date);
-        // The leftmost column is today: the only CJK label in the row, so it uses font_mid.
-        text_center(cx, DATE_BASE, known_date && i == 0 ? &font_mid : &font_small,
-                    known_date ? (i == 0 ? "今天" : date) : "--/--");
+        if (i > 0) {
+            bool known_date = have_weather && date_label(w->days[i].date, date);
+            text_center(cx, DATE_BASE, &font_small, known_date ? date : "--/--");
+        }
         draw_icon(cx, have_weather ? w->days[i].code : -1, &font_icon_daily);
         forecast_range(cx, have_weather ? &w->days[i] : NULL);
         int probability = have_weather ? rounded_probability(w->days[i].precip_probability) : -1;
@@ -433,16 +567,12 @@ void ui_draw_weather(const weather_t *w, const sensor_reading_t *sensor)
     draw_sensor(sensor);
 }
 
-void ui_draw_hourly(const weather_t *w, const sensor_reading_t *sensor)
+static void draw_hourly_cells(void)
 {
     char buf[32];
-    bool have_weather = w && w->ok;
-    epd_clear(EPD_WHITE);
-
-    draw_header(w, "未来10小时");
-
     for (int i = 0; i < HOUR_COLS; i++) {
-        const weather_hour_t *hour = have_weather ? &w->hours[i * HOUR_STEP] : NULL;
+        int index = hourly_start + i;
+        const weather_hour_t *hour = hourly_available && index < WEATHER_HOURS ? &hourly_cache[index] : NULL;
         int cx = HOUR_GRID_X + HOUR_COL_W / 2 + i * HOUR_COL_W;
         if (hour) {
             snprintf(buf, sizeof(buf), "%02d", hour->hour);
@@ -483,7 +613,28 @@ void ui_draw_hourly(const weather_t *w, const sensor_reading_t *sensor)
         }
         text_center(cx, PRECIP_BASE, &font_small, probability >= 0 ? buf : "--%");
     }
+}
 
+void ui_draw_hourly(const weather_t *w, const sensor_reading_t *sensor)
+{
+    epd_clear(EPD_WHITE);
+    daily_page = false;
+    hourly_available = w && w->ok;
+    hourly_discontinuous = false;
+    if (hourly_available) {
+        memcpy(hourly_cache, w->hours, sizeof(hourly_cache));
+        for (int i = 1; i < WEATHER_HOURS; i++) {
+            const weather_hour_t *before = &hourly_cache[i - 1], *after = &hourly_cache[i];
+            if (before->date == after->date ? after->hour != before->hour + 1 : before->hour != 23 || after->hour != 0)
+            {
+                hourly_discontinuous = true;
+                break;
+            }
+        }
+    }
+    draw_header(w, "未来10小时");
+    hourly_start = select_hourly_start(time(NULL));
+    draw_hourly_cells();
     epd_hline(6, 108, EPD_W - 12, EPD_BLACK);
     draw_sensor(sensor);
 }

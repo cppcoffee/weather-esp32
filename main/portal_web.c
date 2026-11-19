@@ -331,7 +331,7 @@ static esp_err_t save_post(httpd_req_t *req)
     esp_err_t voice_err = voice_settings_validate(&settings);
     if (voice_err != ESP_OK) {
         nvs_close(h);
-        return reply(req, "语音地址无效", "请填写服务信息地址（OTA），例如 http://PC局域网IP:8003/xiaozhi/ota/", false);
+        return reply(req, "语音地址无效", "请填写服务信息地址（OTA），例如 http://PC局域网IP:8000/xiaozhi/ota/", false);
     }
     esp_err_t err = nvs_set_str(h, "ssid", ssid);
     if (err == ESP_OK) {

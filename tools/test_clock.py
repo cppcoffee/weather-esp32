@@ -27,6 +27,8 @@ HARNESS = r'''
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "device_mcp.h"
+#include "button.h"
+#include "freertos/queue.h"
 #include "epd.h"
 #include "esp_err.h"
 #include "ui.h"
@@ -36,12 +38,20 @@ void app_main(void);
 static pthread_mutex_t display = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
-static pthread_t app_thread, clock_thread;
+static pthread_t app_thread, clock_thread, button_thread;
 static _Thread_local bool clock_worker, display_held;
 static void (*clock_entry)(void *);
+static void (*button_entry)(void *);
+static button_event_t queued[8];
+static unsigned queued_count, sample_target, sample_done;
+static atomic_int pin_level = 1;
+static atomic_bool synced;
 static atomic_llong wall_time = 1735689540LL; /* 2024-12-31 23:59:00 UTC */
+static atomic_llong uptime;
 static unsigned generation, completed, frames;
-static bool ready, blocked, stopping;
+static bool allow_forecast_pixels, allow_hourly_pixels, allow_page_switch;
+static unsigned forecast_pixels;
+static bool ready, blocked, stopping, allow_weather_return, erased, reprovisioned;
 enum { FRAME_BYTES = PANEL_W / 8 * PANEL_H };
 static unsigned char frame[FRAME_BYTES];
 
@@ -50,6 +60,7 @@ time_t time(time_t *out) {
     if (out) *out = now;
     return now;
 }
+int64_t esp_timer_get_time(void) { return atomic_load(&uptime); }
 void *xSemaphoreCreateMutex(void) { return &display; }
 int xSemaphoreTake(void *semaphore, unsigned timeout) {
     assert(semaphore == &display && !display_held);
@@ -62,8 +73,66 @@ int xSemaphoreGive(void *semaphore) {
 static void *clock_start(void *arg) {
     clock_worker = true; clock_entry(arg); return NULL;
 }
+static void *button_start(void *arg) {
+    button_entry(arg); return NULL;
+}
+unsigned xTaskGetTickCount(void) { return 0; }
+void xTaskDelayUntil(unsigned *last, unsigned ms) {
+    assert(last && ms == BUTTON_POLL_MS);
+    pthread_mutex_lock(&gate);
+    sample_done = *last;
+    pthread_cond_broadcast(&changed);
+    while (sample_done == sample_target && !stopping) pthread_cond_wait(&changed, &gate);
+    bool stop = stopping;
+    (*last)++;
+    pthread_mutex_unlock(&gate);
+    if (stop) pthread_exit(NULL);
+}
+void *xQueueCreate(unsigned capacity, size_t size) {
+    assert(capacity == 8 && size == sizeof(button_event_t)); return queued;
+}
+int xQueueSend(void *q, const void *item, unsigned timeout) {
+    assert(q == queued && timeout == 0);
+    pthread_mutex_lock(&gate);
+    assert(queued_count < 8);
+    queued[queued_count++] = *(const button_event_t *)item;
+    pthread_mutex_unlock(&gate);
+    return 1;
+}
+int xQueueReceive(void *q, void *item, unsigned timeout) {
+    assert(q == queued && timeout == 0);
+    pthread_mutex_lock(&gate);
+    bool ready = queued_count != 0;
+    if (ready) {
+        *(button_event_t *)item = queued[0];
+        memmove(queued, queued + 1, --queued_count * sizeof(*queued));
+    }
+    pthread_mutex_unlock(&gate);
+    return ready;
+}
+int xQueueReset(void *q) {
+    assert(q == queued);
+    pthread_mutex_lock(&gate);
+    queued_count = 0;
+    pthread_mutex_unlock(&gate);
+    return 1;
+}
+static void sample_button(int level, unsigned n) {
+    pthread_mutex_lock(&gate);
+    atomic_store(&pin_level, level);
+    sample_target += n;
+    pthread_cond_broadcast(&changed);
+    while (sample_done != sample_target) pthread_cond_wait(&changed, &gate);
+    pthread_mutex_unlock(&gate);
+}
 int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle) {
-    assert(!strcmp(name, "clock") && stack >= 2048);
+    assert(stack >= 2048);
+    if (!strcmp(name, "button")) {
+        button_entry = entry;
+        assert(!pthread_create(&button_thread, NULL, button_start, arg));
+        return 1;
+    }
+    assert(!strcmp(name, "clock"));
     clock_entry = entry;
     assert(!pthread_create(&clock_thread, NULL, clock_start, arg));
     return 1;
@@ -82,7 +151,7 @@ void vTaskDelay(unsigned ms) {
 }
 int gpio_config(const gpio_config_t *cfg) { return 0; }
 int gpio_set_level(int pin, int level) { return 0; }
-int gpio_get_level(int pin) { return pin == 4 ? 1 : 0; } /* Idle button, idle EPD BUSY. */
+int gpio_get_level(int pin) { return pin == 4 ? atomic_load(&pin_level) : 0; } /* Idle button, idle EPD BUSY. */
 int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *transaction) {
     if (transaction->length == FRAME_BYTES * 8) {
         assert(display_held);
@@ -101,22 +170,27 @@ void voice_net_ready(void) {}
 void voice_net_pause(void) {}
 bool voice_weather_begin(void) { return true; }
 void voice_weather_end(void) {}
-void device_mcp_publish(const weather_t *w, const sensor_reading_t *sensor, bool retrying, bool updated) {}
+forecast_stamp_t device_mcp_publish(const weather_t *w, const sensor_reading_t *sensor, bool retrying, bool updated) {
+    return (forecast_stamp_t){0};
+}
 void net_init(void) {}
 bool net_try_stored(int timeout) { return true; }
 bool net_has_stored(void) { return true; }
-void net_forget_creds(void) {}
-void net_portal(void) { abort(); }
+void net_forget_creds(void) { assert(!display_held); erased = true; }
+void net_portal(void) {
+    assert(erased && !display_held);
+    reprovisioned = true;
+    pthread_exit(NULL);
+}
 const char *net_ap_ssid(void) { return "weather-DEMO"; }
 void net_apply_tz(int offset) {}
-void net_time_sync(void) {}
+bool net_time_is_synced(void) { return atomic_load(&synced); }
 bool weather_update(weather_t *weather) {
     assert(!display_held); /* A network wait must not prevent the clock from drawing. */
     pthread_mutex_lock(&gate);
     blocked = true; pthread_cond_broadcast(&changed);
-    while (!stopping) pthread_cond_wait(&changed, &gate);
+    while (!allow_weather_return) pthread_cond_wait(&changed, &gate);
     pthread_mutex_unlock(&gate);
-    pthread_exit(NULL);
     return false;
 }
 static void *app_start(void *arg) { app_main(); return NULL; }
@@ -131,14 +205,29 @@ static void advance(long seconds, bool expect_refresh) {
     while (completed != generation) pthread_cond_wait(&changed, &gate);
     assert(frames == previous_frames + (expect_refresh ? 1 : 0));
     unsigned pixels = 0;
+    forecast_pixels = 0;
     for (int x = 0; x < 296; x++) for (int y = 0; y < 128; y++) {
         int px = 127 - y, index = x * 16 + (px >> 3), mask = 0x80 >> (px & 7);
         if ((before[index] ^ frame[index]) & mask) {
-            assert(x >= 230 && y < 22); pixels++;
+            bool clock_pixel = x >= 230 && y < 22;
+            bool forecast_pixel = (x >= 110 && x < 230 && y < 22)
+                                  || (x >= 18 && x < 70 && y > 22 && y < 46);
+            assert(clock_pixel || (allow_forecast_pixels && forecast_pixel) || (allow_hourly_pixels && y > 22 && y < 108)
+                   || allow_page_switch);
+            forecast_pixels += !clock_pixel;
+            pixels++;
         }
     }
     assert((pixels != 0) == expect_refresh);
     pthread_mutex_unlock(&gate);
+}
+
+static void assert_hour_column(const unsigned char *before, int before_x, int after_x) {
+    for (int x = 0; x < 28; x++) for (int y = 24; y < 108; y++) {
+        int px = 127 - y, mask = 0x80 >> (px & 7);
+        assert((before[(before_x + x) * 16 + (px >> 3)] & mask)
+               == (frame[(after_x + x) * 16 + (px >> 3)] & mask));
+    }
 }
 
 int main(void) {
@@ -147,13 +236,26 @@ int main(void) {
     pthread_mutex_lock(&gate);
     while (!ready || !blocked) pthread_cond_wait(&changed, &gate);
     pthread_mutex_unlock(&gate);
-    advance(59, false);
+    sample_button(0, 8); sample_button(1, 3);
+    assert(queued_count == 1 && queued[0] == BUTTON_TAP);
+    allow_page_switch = true;
+    advance(0, true); /* The visible page switches while the HTTP stub stays blocked. */
+    assert(queued_count == 0);
+    allow_page_switch = false;
+    sample_button(0, 8); sample_button(1, 3);
+    assert(queued_count == 1 && queued[0] == BUTTON_TAP);
+    sample_button(0, BUTTON_LONG_PRESS_MS / BUTTON_POLL_MS + 10);
+    sample_button(1, 3);
+    assert(queued_count == 1 && queued[0] == BUTTON_HOLD); /* Continues while HTTP blocks. */
+    advance(59, false); /* No refresh while the clock is unsynchronized. */
+    atomic_store(&synced, true);
+    advance(0, true);  /* UTC becomes visible while the HTTP request is still blocked. */
     advance(1, true); /* Midnight: 23:59 -> 00:00, with no weather response. */
     unsigned char updated[FRAME_BYTES];
     xSemaphoreTake(&display, 0);
     memcpy(updated, frame, sizeof(updated));
     weather_t weather = {0}; sensor_reading_t sensor = {0};
-    ui_draw_weather(&weather, &sensor); ui_draw_status(UI_STATUS_FETCHING, 0); epd_refresh();
+    ui_draw_hourly(&weather, &sensor); ui_draw_status(UI_STATUS_FETCHING, 0); epd_refresh();
     assert(!memcmp(updated, frame, sizeof(frame))); /* Old digits were completely erased. */
     xSemaphoreGive(&display);
     advance(59, false);
@@ -178,11 +280,83 @@ int main(void) {
     xSemaphoreGive(&display);
     advance(60, true); /* Clock resumes after leaving setup. */
     for (unsigned minute = 0; minute < 60; minute++) advance(60, true);
+
+    /* With a real calendar date on screen, midnight changes only annotations. */
+    xSemaphoreTake(&display, 0);
+    atomic_store(&wall_time, 1735689540LL);
+    weather.ok = true;
+    strcpy(weather.city, "Test");
+    strcpy(weather.days[0].date, "2024-12-31");
+    ui_draw_weather(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
+    memcpy(updated, frame, sizeof(updated));
+    forecast_stamp_t stamp = {.fetched_at = time(NULL)};
+    ui_set_forecast_stamp(&stamp);
+    ui_draw_weather(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
+    /* A known fetch adds the update timestamp to the footer and nowhere else. */
+    assert(memcmp(updated, frame, sizeof(updated)) != 0);
+    for (int x = 0; x < 296; x++) for (int y = 0; y < 128; y++) {
+        int px = 127 - y, index = x * 16 + (px >> 3), mask = 0x80 >> (px & 7);
+        if ((updated[index] ^ frame[index]) & mask) assert(x >= 200 && y >= 110);
+    }
+    xSemaphoreGive(&display);
+    allow_forecast_pixels = true;
+    atomic_store(&uptime, 1800000000LL);
+    advance(0, true); /* The monotonic age reaches 30 minutes at the same wall time. */
+    assert(forecast_pixels > 0);
+    advance(60, true); /* Midnight removes the old "today" label even without a new fetch. */
+    assert(forecast_pixels > 0);
+    xSemaphoreTake(&display, 0);
+    memcpy(updated, frame, sizeof(updated));
+    ui_draw_weather(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
+    assert(!memcmp(updated, frame, sizeof(frame)));
+    xSemaphoreGive(&display);
+
+    /* Across midnight, the next cached hour and its weather move into column one. */
+    xSemaphoreTake(&display, 0);
+    atomic_store(&wall_time, 1735689540LL);
+    for (int i = 0; i < WEATHER_HOURS; i++) {
+        weather.hours[i] = (weather_hour_t){.date = i ? 20250101 : 20241231,
+                                           .hour = i ? i - 1 : 23, .temperature_c = 5 + i};
+    }
+    ui_draw_hourly(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
+    memcpy(updated, frame, sizeof(updated));
+    xSemaphoreGive(&display);
+    allow_hourly_pixels = true;
+    advance(60, true);
+    assert_hour_column(updated, 36, 8);
+    advance(20 * 3600, true); /* All 21 cached hours have expired. */
+    memcpy(updated, frame, sizeof(updated));
+    xSemaphoreTake(&display, 0);
+    ui_draw_hourly(NULL, &sensor); epd_refresh();
+    assert_hour_column(updated, 8, 8);
+    assert_hour_column(updated, 260, 260);
+    xSemaphoreGive(&display);
+
+    /* A repeated wall hour still advances in chronological API order. */
+    xSemaphoreTake(&display, 0);
+    atomic_store(&wall_time, 1735689540LL);
+    weather.hours[1].date = 20241231;
+    weather.hours[1].hour = 23;
+    for (int i = 2; i < WEATHER_HOURS; i++) weather.hours[i].hour = i - 2;
+    ui_draw_hourly(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
+    memcpy(updated, frame, sizeof(updated));
+    xSemaphoreGive(&display);
+    advance(60, true);
+    assert_hour_column(updated, 36, 8);
+    advance(3600, true);
+    assert_hour_column(updated, 64, 8);
+
+    assert(!erased && !reprovisioned); /* WiFi credentials stay intact during HTTP I/O. */
+    pthread_mutex_lock(&gate);
+    allow_weather_return = true; pthread_cond_broadcast(&changed);
+    pthread_mutex_unlock(&gate);
+    assert(!pthread_join(app_thread, NULL));
+    assert(erased && reprovisioned);
     pthread_mutex_lock(&gate);
     stopping = true; pthread_cond_broadcast(&changed);
     pthread_mutex_unlock(&gate);
-    assert(!pthread_join(app_thread, NULL)); assert(!pthread_join(clock_thread, NULL));
-    puts("PASS clock: blocked request, 60 consecutive minutes, unchanged minute, midnight, clock corrections, redraw erasure, hourly, retry, setup/resume; clock pixels isolated; display serialized");
+    assert(!pthread_join(clock_thread, NULL)); assert(!pthread_join(button_thread, NULL));
+    puts("PASS clock: blocked HTTP taps and hold, UTC fallback, midnight, clock corrections, retry, setup/resume, forecast expiry and hourly rollover including repeated hours");
 }
 '''
 
@@ -199,6 +373,8 @@ def main():
         for name, contents in HEADERS.items():
             path = work / "stubs" / name
             path.parent.mkdir(parents=True, exist_ok=True)
+            if name == "esp_timer.h":
+                contents = "#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n"
             path.write_text(contents)
         (work / "clock.c").write_text(HARNESS)
         sources = ["main.c", "button.c", "ui.c", "epd.c", "fonts_aa.c", "font_clock.c", "font_icons.c"]

@@ -54,13 +54,13 @@
                     <label for="voice-url">服务信息地址（OTA）</label>
                     <input type="url" name="voice_url" id="voice-url" required maxlength="255" value="{{VOICE_URL}}" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-url-help voice-host-help">
                     <p class="hint" id="voice-url-help">必填，没有默认地址。xiaozhi-server-rs 使用：
-                        <code>http://PC局域网IP:8003/xiaozhi/ota/</code>
+                        <code>http://PC局域网IP:8000/xiaozhi/ota/</code>
                     </p>
                 </div>
                 <p class="hint" id="voice-host-help">请将 PC局域网IP 换成运行服务的电脑的局域网 IP，设备不能填写 localhost。</p>
                 <label class="followup">
                     <input type="checkbox" name="voice_followup" value="1" {{VOICE_FOLLOWUP}}>
-                    回复后允许免唤醒追问
+                    回复后允许免唤醒追问（默认开启）
                 </label>
                 <p class="hint">播完后在约 6 秒内直接说话。检测到开口才上传音频。建议搭配支持连续追问的小智服务。</p>
             </section>

@@ -24,6 +24,8 @@ BOUNDARIES = (
     ("static esp_err_t play_response(bool *played)", "// Returns with the network lock held again, including on timeout or disconnect."),
     ("static bool wait_followup(void)", "static esp_err_t run_turn(void)"),
     ("static esp_err_t run_turn(void)", "static void voice_task(void *arg)"),
+    ("bool voice_weather_begin(void)", "void voice_weather_end(void)"),
+    ("void voice_weather_end(void)", "/* end of voice code */"),
 )
 
 STUB_HEADERS = {
@@ -67,6 +69,7 @@ typedef struct { int len; uint8_t data[VOICE_RX_OPUS_MAX]; } voice_packet_t;
 #define pdTRUE 1
 #define pdFALSE 0
 #define pdMS_TO_TICKS(ms) (ms)
+#define portTICK_PERIOD_MS 1
 #define portMAX_DELAY UINT32_MAX
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(tag, ...) do { if (0) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -96,8 +99,8 @@ static TickType_t ticks;
 
 enum turn_case { EARLY, BEFORE_TTS, BURST, OVERFLOW, SLOW_FIRST, NO_FIRST, STALL, DROP_LISTEN, DROP_PLAY, BARGE,
                  FOLLOWUP, SILENT, BUSY_WEATHER, GOODBYE_LISTEN, GOODBYE_PLAY, GOODBYE_WINDOW, WS_LOST_WINDOW,
-                 EMPTY_RESULT };
-enum info_case { NO_SETTINGS, INFO_FAILURE, NO_WS, CODE, EMPTY_CODE, CHALLENGE, BOUND, CHAT_INIT_ERROR };
+                 EMPTY_RESULT, WEATHER_RECOVERS, LOCAL_ENDPOINT };
+enum info_case { NO_SETTINGS, INFO_FAILURE, NO_WS, CODE, EMPTY_CODE, CHALLENGE, BOUND, CHAT_INIT_ERROR, CONNECT_TIMEOUT };
 static enum turn_case turn_case;
 static enum info_case info_case;
 static const char *code;
@@ -105,7 +108,7 @@ static unsigned info_requests, info_frees, chat_inits, chat_starts, chat_stops, 
 static unsigned listens, closes, aborts, writes;
 static int16_t played[VOICE_RX_QUEUE_LEN];
 static bool injected, locked;
-static unsigned windows;
+static unsigned windows, drains, lock_attempts, uploads;
 static int *s_network_lock = &ref;
 static int16_t captured[VOICE_FRAME_SAMPLES * 3];
 static size_t captured_samples;
@@ -113,6 +116,9 @@ static unsigned vad_frames, vad_trigger_frame;
 static void *s_vad;
 static int16_t (*s_vad_history)[FOLLOWUP_SAMPLES];
 static size_t s_vad_fill, s_vad_next, s_vad_count;
+static int16_t s_endpoint_frame[FOLLOWUP_SAMPLES];
+static size_t s_endpoint_fill;
+static bool s_endpoint_heard_speech;
 #define VAD_SPEECH 1
 
 static int vad_process_with_trigger(void *vad, int16_t *frame) {
@@ -126,8 +132,15 @@ static int xSemaphoreGive(int *lock) {
     return pdTRUE;
 }
 static int xSemaphoreTake(int *lock, TickType_t wait) {
-    assert(lock == s_network_lock && !locked);
-    if (turn_case == BUSY_WEATHER && wait != portMAX_DELAY) return pdFALSE;
+    assert(lock == s_network_lock);
+    if (locked) {
+        assert(wait == 0);
+        return pdFALSE;
+    }
+    if (wait != portMAX_DELAY && (turn_case == BUSY_WEATHER || (turn_case == WEATHER_RECOVERS && lock_attempts++ < 3))) {
+        ticks += wait;
+        return pdFALSE;
+    }
     locked = true;
     return pdTRUE;
 }
@@ -201,6 +214,9 @@ static int opus_decoder_ctl(OpusDecoder *value, int op) { assert(value == &decod
 static int opus_encode(OpusEncoder *value, const int16_t *pcm, int samples, uint8_t *out, size_t cap) {
     assert(VOICE_NETWORK_READY(event_bits));
     assert(value == &encoder && pcm == s_mono && samples == VOICE_FRAME_SAMPLES && cap == sizeof(s_tx_opus));
+    if (turn_case == LOCAL_ENDPOINT) {
+        for (int i = 0; i < samples; i++) assert(pcm[i] == (i < samples / 2 ? 1 : 0));
+    }
     out[0] = 42;
     return 1;
 }
@@ -227,14 +243,21 @@ static void packet(uint8_t original) {
 
 static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask, int clear, int all, TickType_t wait) {
     assert(group == s_events && !clear && !all);
-    if (mask == VOICE_END_BITS) {
+    if (mask == VOICE_BIT_WS_READY) {
+        assert(wait == VOICE_CONNECT_TIMEOUT_MS);
+        return *group; /* No ticks: the real connect normally completes before the wait. */
+    }
+    if (mask == (VOICE_END_BITS | VOICE_BIT_INTERRUPT)) {
         assert(locked && wait == AUDIO_PLAYBACK_TAIL_MS + 1 && !muted);
+        drains++;
     } else {
         assert(!locked && mask == (VOICE_BIT_SPEECH | VOICE_END_BITS) && wait == VOICE_FOLLOWUP_MS);
-        assert(muted && (event_bits & VOICE_BIT_FOLLOWUP) && !(event_bits & (VOICE_BIT_RECEIVING | VOICE_BIT_CAPTURE)));
+        assert(muted && (event_bits & VOICE_BIT_FOLLOWUP)
+               && !(event_bits & (VOICE_BIT_RECEIVING | VOICE_BIT_CAPTURE | VOICE_BIT_LOCAL_EOS)));
         windows++;
-        if ((turn_case == FOLLOWUP && windows == 1) || turn_case == BUSY_WEATHER) {
+        if (((turn_case == FOLLOWUP || turn_case == WEATHER_RECOVERS) && windows == 1) || turn_case == BUSY_WEATHER) {
             event_bits |= VOICE_BIT_SPEECH;
+            if (turn_case == WEATHER_RECOVERS) event_bits |= VOICE_BIT_LOCAL_EOS;
         } else if (turn_case == GOODBYE_WINDOW) {
             on_chat_lifecycle(NULL, NULL, ESP_XIAOZHI_CHAT_EVENT_SERVER_GOODBYE, NULL);
         } else if (turn_case == WS_LOST_WINDOW) {
@@ -246,9 +269,22 @@ static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask, int
 }
 
 static size_t xStreamBufferReceive(int *buffer, void *data, size_t len, TickType_t wait) {
+    if (turn_case == WEATHER_RECOVERS && listens == 2) {
+        assert(wait == 0 && (event_bits & VOICE_BIT_LOCAL_EOS) && !(event_bits & VOICE_BIT_CAPTURE));
+        return 0;
+    }
+    if (turn_case == LOCAL_ENDPOINT && injected) {
+        assert(wait == 0 && (event_bits & VOICE_BIT_LOCAL_EOS));
+        return 0;
+    }
     assert(buffer == s_microphone && wait == VOICE_POLL_MS && listens && !injected);
     injected = true;
     ticks += wait;
+    if (turn_case == LOCAL_ENDPOINT) {
+        for (size_t i = 0; i < len / sizeof(int16_t) / 2; i++) ((int16_t *)data)[i] = 1;
+        event_bits = (event_bits & ~VOICE_BIT_CAPTURE) | VOICE_BIT_LOCAL_EOS;
+        return len / 2;
+    }
     if (turn_case == DROP_LISTEN) {
         event_bits = (event_bits & ~VOICE_BIT_NET) | VOICE_BIT_RESET;
         return len; /* A complete frame was buffered before the disconnect. */
@@ -309,7 +345,7 @@ static int xQueueReceive(voice_packet_t *q, voice_packet_t *packet_out, TickType
 
 esp_err_t voice_settings_load(voice_settings_t *settings) {
     if (info_case != NO_SETTINGS) strcpy(settings->info_url, "https://fixture.invalid/info");
-    settings->followup = turn_case >= FOLLOWUP;
+    settings->followup = turn_case >= FOLLOWUP && turn_case != LOCAL_ENDPOINT;
     return ESP_OK;
 }
 esp_err_t esp_xiaozhi_chat_get_info_with_url(const char *url, esp_xiaozhi_chat_info_t *info) {
@@ -339,7 +375,13 @@ esp_err_t esp_xiaozhi_chat_init(esp_xiaozhi_chat_config_t *config, esp_xiaozhi_c
     *chat = 1;
     return ESP_OK;
 }
-esp_err_t esp_xiaozhi_chat_start(esp_xiaozhi_chat_handle_t chat) { assert(chat == 1); chat_starts++; return ESP_OK; }
+esp_err_t esp_xiaozhi_chat_start(esp_xiaozhi_chat_handle_t chat) {
+    assert(chat == 1);
+    chat_starts++;
+    // The SDK posts CONNECTED from its own task; the stub delivers it before we wait.
+    if (info_case != CONNECT_TIMEOUT) on_chat_lifecycle(NULL, NULL, ESP_XIAOZHI_CHAT_EVENT_CONNECTED, NULL);
+    return ESP_OK;
+}
 esp_err_t esp_xiaozhi_chat_stop(esp_xiaozhi_chat_handle_t chat) { assert(chat == 1); chat_stops++; return ESP_OK; }
 esp_err_t esp_xiaozhi_chat_deinit(esp_xiaozhi_chat_handle_t chat) { assert(chat == 1); return ESP_OK; }
 esp_err_t esp_xiaozhi_chat_open_audio_channel(esp_xiaozhi_chat_handle_t chat, const esp_xiaozhi_chat_audio_t *audio,
@@ -360,9 +402,18 @@ esp_err_t esp_xiaozhi_chat_send_start_listening(esp_xiaozhi_chat_handle_t chat, 
     injected = false;
     return ESP_OK;
 }
-esp_err_t esp_xiaozhi_chat_send_stop_listening(esp_xiaozhi_chat_handle_t chat) { assert(chat == 1); return ESP_OK; }
+esp_err_t esp_xiaozhi_chat_send_stop_listening(esp_xiaozhi_chat_handle_t chat) {
+    assert(chat == 1);
+    if (turn_case == LOCAL_ENDPOINT || (turn_case == WEATHER_RECOVERS && listens == 2)) {
+        tts(ESP_XIAOZHI_CHAT_TTS_STATE_START);
+        packet(listens == 1 ? 7 : 9);
+        tts(ESP_XIAOZHI_CHAT_TTS_STATE_STOP);
+    }
+    return ESP_OK;
+}
 esp_err_t esp_xiaozhi_chat_send_audio_data(esp_xiaozhi_chat_handle_t chat, const char *data, size_t len) {
     assert(chat == 1 && len == 1 && data[0] == 42);
+    uploads++;
     return ESP_OK;
 }
 esp_err_t esp_xiaozhi_chat_close_audio_channel(esp_xiaozhi_chat_handle_t chat) {
@@ -409,14 +460,21 @@ static void test_pairing(void) {
     assert(chat_starts == 1);
     close_session();
     assert(chat_stops == 1 && mcp_destroys == 2 && !s_chat && !s_mcp && !s_encoder && !s_decoder);
-    puts("PASS 13 pairing/setup cases");
+    // A socket that never connects must not produce a `chat ready` the wake word cannot use.
+    info_case = CONNECT_TIMEOUT;
+    event_bits = 0;
+    assert(open_session() == ESP_ERR_TIMEOUT);
+    assert(chat_starts == 2 && chat_stops == 2 && !s_chat && !s_mcp && !s_encoder && !s_decoder);
+    // A retained activation code deliberately survives this failure with a retryable state.
+    assert(voice_feedback_get().state == VOICE_STATE_ACTIVATION);
+    puts("PASS 14 pairing/setup cases");
 }
 
 static void test_turn(enum turn_case scenario) {
     turn_case = scenario;
     info_case = BOUND;
     event_bits = VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_CAPTURE;
-    count = writes = listens = closes = aborts = ticks = windows = 0;
+    count = writes = listens = closes = aborts = ticks = windows = drains = lock_attempts = uploads = 0;
     locked = true;
     assert(open_session() == ESP_OK);
     packet(1);  /* No active audio channel yet. */
@@ -430,9 +488,10 @@ static void test_turn(enum turn_case scenario) {
     } else if (scenario == STALL) {
         assert(result == ESP_ERR_TIMEOUT && writes == 1 && played[0] == 7);
         assert(ticks >= VOICE_RESPONSE_TIMEOUT_MS && ticks < VOICE_FIRST_AUDIO_TIMEOUT_MS);
-    } else if (scenario == FOLLOWUP) {
+    } else if (scenario == FOLLOWUP || scenario == WEATHER_RECOVERS) {
         assert(result == ESP_OK && !aborts && listens == 2 && writes == 2 && windows == 2);
-        assert(played[0] == 7 && played[1] == 9);
+        assert(played[0] == 7 && played[1] == 9 && drains == 2);
+        if (scenario == WEATHER_RECOVERS) assert(lock_attempts > 3);
     } else if (scenario == GOODBYE_LISTEN || scenario == GOODBYE_PLAY) {
         assert(result == ESP_FAIL && !writes && !windows && ticks < 200);
         assert(event_bits & VOICE_BIT_HANGUP);
@@ -443,18 +502,21 @@ static void test_turn(enum turn_case scenario) {
         assert(result == ESP_OK && !writes && !windows);
     } else if (scenario == SILENT || scenario == BUSY_WEATHER) {
         assert(result == ESP_OK && !aborts && listens == 1 && writes == 1 && windows == 1);
+        if (scenario == BUSY_WEATHER) assert(ticks >= VOICE_FOLLOWUP_LOCK_MS);
     } else if (scenario == BARGE) {
         assert(result == ESP_OK && aborts == 1 && listens == 2 && writes == 2);
         assert(played[0] == 7 && played[1] == 9);
     } else {
         unsigned expected = scenario == BURST ? VOICE_RX_QUEUE_LEN : 1;
-        assert(result == ESP_OK && writes == expected);
+        assert(result == ESP_OK && writes == expected && drains == 1);
+        if (scenario == LOCAL_ENDPOINT) assert(uploads == 1);
         for (unsigned i = 0; i < expected; i++) assert(played[i] == (int16_t)(7 + i));
     }
     bool remote_end = scenario == DROP_LISTEN || scenario == DROP_PLAY || scenario == GOODBYE_LISTEN
                       || scenario == GOODBYE_PLAY || scenario == GOODBYE_WINDOW || scenario == WS_LOST_WINDOW;
     assert(closes == !remote_end && !count && muted && locked);
-    assert(!(event_bits & (VOICE_BIT_RECEIVING | VOICE_BIT_CAPTURE | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH)));
+    assert(!(event_bits & (VOICE_BIT_RECEIVING | VOICE_BIT_CAPTURE | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH
+                          | VOICE_BIT_LOCAL_EOS)));
     close_session();
 }
 
@@ -473,7 +535,31 @@ static void test_capture(void) {
     assert((event_bits & VOICE_BIT_SPEECH) && !(event_bits & VOICE_BIT_CAPTURE));
     assert(captured_samples == FOLLOWUP_HISTORY_FRAMES * FOLLOWUP_SAMPLES + 5);
     assert(memcmp(captured, frames + 4 * FOLLOWUP_SAMPLES, captured_samples * sizeof(*captured)) == 0);
-    puts("PASS local VAD buffer: no pre-trigger upload, speech pre-roll in order");
+    event_bits = VOICE_BIT_CAPTURE;
+    s_endpoint_heard_speech = false; /* New WakeNet-triggered question. */
+    vad_trigger_frame = vad_frames + 2;
+    detect_endpoint(frames, FOLLOWUP_SAMPLES);
+    assert(event_bits == VOICE_BIT_CAPTURE); /* Silence before speech cannot end a turn. */
+    detect_endpoint(frames, FOLLOWUP_SAMPLES - 1);
+    assert(!s_endpoint_heard_speech);
+    detect_endpoint(frames, 1);
+    assert(event_bits == VOICE_BIT_CAPTURE && s_endpoint_heard_speech);
+    detect_endpoint(frames, FOLLOWUP_SAMPLES);
+    assert(event_bits == VOICE_BIT_LOCAL_EOS);
+    puts("PASS local VAD: speech pre-roll in order and endpoint only after speech");
+}
+
+static void test_weather_priority(void) {
+    event_bits = VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_FOLLOWUP;
+    assert(voice_weather_begin() && locked);
+    assert(!voice_weather_begin());
+    voice_weather_end();
+    const EventBits_t pending[] = {VOICE_BIT_TRIGGER, VOICE_BIT_SPEECH, VOICE_BIT_CAPTURE, VOICE_BIT_RECEIVING};
+    for (unsigned i = 0; i < sizeof(pending) / sizeof(*pending); i++) {
+        event_bits = pending[i];
+        assert(!voice_weather_begin() && !locked);
+    }
+    puts("PASS idle follow-up allows weather and pending speech wins the network lock");
 }
 
 int main(int argc, char **argv) {
@@ -485,9 +571,14 @@ int main(int argc, char **argv) {
         test_capture();
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "weather-priority")) {
+        test_weather_priority();
+        return 0;
+    }
     const char *names[] = {"early", "before-tts", "burst", "overflow", "slow-first", "no-first", "stall",
                            "drop-listen", "drop-play", "barge", "followup", "silent", "busy-weather", "goodbye-listen",
-                           "goodbye-play", "goodbye-window", "ws-lost-window", "empty-result"};
+                           "goodbye-play", "goodbye-window", "ws-lost-window", "empty-result",
+                           "weather-recovers", "local-endpoint"};
     for (unsigned i = 0; i < sizeof(names) / sizeof(*names); i++) {
         if (argc == 1 || !strcmp(argv[1], names[i])) {
             fprintf(stderr, "Testing %s\n", names[i]);
@@ -503,14 +594,15 @@ int main(int argc, char **argv) {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sanitize", action="store_true")
-    parser.add_argument("scenario", nargs="?", choices=("pairing", "capture", "early", "before-tts", "burst", "overflow",
+    parser.add_argument("scenario", nargs="?", choices=("pairing", "capture", "weather-priority", "early",
+                        "before-tts", "burst", "overflow",
                         "slow-first", "no-first", "stall", "drop-listen", "drop-play", "barge",
                         "followup", "silent", "busy-weather", "goodbye-listen", "goodbye-play",
-                        "goodbye-window", "ws-lost-window", "empty-result"))
+                        "goodbye-window", "ws-lost-window", "empty-result", "weather-recovers", "local-endpoint"))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     source = root / "main/voice.c"
-    functions, _ = extract(source.read_text(encoding="utf-8"), source, BOUNDARIES)
+    functions, _ = extract(source.read_text(encoding="utf-8") + "\n/* end of voice code */\n", source, BOUNDARIES)
     capture = root / "main/voice_capture.c"
     capture_source = capture.read_text(encoding="utf-8")
     macros = re.findall(r"^#define FOLLOWUP_[A-Z_]+ [^\n]+", capture_source, re.MULTILINE)
@@ -519,6 +611,8 @@ def main():
         ("static void buffer_microphone(const int16_t *mono, size_t samples)",
          "static void detect_followup(const int16_t *mono, size_t samples)"),
         ("static void detect_followup(const int16_t *mono, size_t samples)",
+         "static void detect_endpoint(const int16_t *mono, size_t samples)"),
+        ("static void detect_endpoint(const int16_t *mono, size_t samples)",
          "// Capture owns speech detection. Only the session task can start network capture."),
     ))
     flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"] if args.sanitize else []
@@ -535,7 +629,7 @@ def main():
         run([shutil.which("cc") or "cc", "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror",
              "-I", work, "-I", root / "main", "-I", root / "components/esp_xiaozhi/include", *flags,
              harness, root / "main/voice_audio.c", root / "main/voice_feedback.c", "-o", exe], work, env, 60)
-        routes = [[args.scenario]] if args.scenario else [["pairing"], ["capture"], []]
+        routes = [[args.scenario]] if args.scenario else [["pairing"], ["capture"], ["weather-priority"], []]
         for route in routes:
             print(run([exe, *route], work, env, 10), end="", flush=True)
 

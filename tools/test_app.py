@@ -127,10 +127,22 @@ static inline int64_t esp_timer_get_time(void) { return 0; }
 #define pdMS_TO_TICKS(ms) (ms)
 #define portMAX_DELAY (~0U)
 #define pdPASS 1
+#define pdTRUE 1
+typedef unsigned TickType_t;
 """,
     "freertos/task.h": """#pragma once
 void vTaskDelay(unsigned ms);
+unsigned xTaskGetTickCount(void);
+void xTaskDelayUntil(unsigned *last, unsigned ms);
 int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle);
+""",
+    "freertos/queue.h": """#pragma once
+#include <stddef.h>
+typedef void *QueueHandle_t;
+QueueHandle_t xQueueCreate(unsigned capacity, size_t item_size);
+int xQueueSend(QueueHandle_t queue, const void *item, unsigned timeout);
+int xQueueReceive(QueueHandle_t queue, void *item, unsigned timeout);
+int xQueueReset(QueueHandle_t queue);
 """,
     "freertos/semphr.h": """#pragma once
 typedef void *SemaphoreHandle_t;
@@ -190,6 +202,7 @@ static weather_t sample_weather(unsigned cycle) {
         w.days[i].precip_probability = probabilities[index];
     }
     for (int i = 0; i < WEATHER_HOURS; i++) {
+        w.hours[i].date = i < 16 ? 20241229 : 20241230;
         w.hours[i].hour = (8 + i) % 24;
         w.hours[i].temperature_c = 14.5f + cycle + i * 0.5f;
         w.hours[i].code = codes[(cycle + i) % (sizeof(codes) / sizeof(codes[0]))];
@@ -270,6 +283,8 @@ HARNESS = r'''
 #include "net.h"
 #include "ui.h"
 #include "device_mcp.h"
+#include "button.h"
+#include "freertos/queue.h"
 #include "voice_feedback.h"
 #include "fixtures.h"
 
@@ -287,7 +302,18 @@ int xSemaphoreGive(void *semaphore) {
     assert(semaphore && display_locked); display_locked = false; return 1;
 }
 int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle) {
-    assert(entry && !strcmp(name, "clock") && stack >= 2048); return 1;
+    assert(entry && (!strcmp(name, "clock") || !strcmp(name, "button")) && stack >= 2048); return 1;
+}
+unsigned xTaskGetTickCount(void) { abort(); }
+void xTaskDelayUntil(unsigned *last, unsigned ms) { abort(); }
+void *xQueueCreate(unsigned cap, size_t size) { assert(cap == 8 && size == sizeof(button_event_t)); return (void *)2; }
+int xQueueSend(void *queue, const void *item, unsigned timeout) { abort(); }
+int xQueueReset(void *queue) { assert(queue == (void *)2); return 1; }
+int xQueueReceive(void *queue, void *item, unsigned timeout) {
+    assert(queue == (void *)2 && timeout == 0);
+    button_event_t event = button_poll(BUTTON_POLL_MS);
+    *(button_event_t *)item = event;
+    return event != BUTTON_NONE;
 }
 /* voice.c needs the real esp_xiaozhi/opus stack, so the app harness links stubs. */
 esp_err_t voice_init(void) { return ESP_OK; }
@@ -409,7 +435,7 @@ void vTaskDelay(unsigned ms) {
 }
 
 time_t time(time_t *out) {
-    time_t fixed = 1730622600;
+    time_t fixed = 1735461000;
     if (out) *out = fixed;
     return fixed;
 }
@@ -498,8 +524,8 @@ static void check_app_frame(unsigned char *fb) {
         epd_text(8, 16, &font_mid, heading);
         time_t now = time(NULL);
         struct tm tm;
-        localtime_r(&now, &tm);
-        strftime(heading, sizeof(heading), "%H:%M", &tm);
+        if (have_weather) localtime_r(&now, &tm); else gmtime_r(&now, &tm);
+        strftime(heading, sizeof(heading), have_weather ? "%H:%M" : "UTC %H:%M", &tm);
         epd_text(292 - epd_text_w(&font_clock, heading), 16, &font_clock, heading);
     }
     ui_draw_status(success ? UI_STATUS_UPDATED : UI_STATUS_RETRY, attempt);
@@ -617,6 +643,7 @@ void net_portal(void) {
     if (portal_attempts > 0) portal_attempts--;
 }
 const char *net_ap_ssid(void) { return "weather-123ABC"; }
+bool net_time_is_synced(void) { return true; }
 const char *net_ap_pass(void) { return "weather123ABC"; }
 void net_forget_creds(void) {
     assert(reset_test && reset_frames == 1 && !display_locked && !credentials_erased);
@@ -624,8 +651,7 @@ void net_forget_creds(void) {
     credentials_erased = true;
     puts("forget");
 }
-void net_time_sync(void) { assert(weather_reserved); puts("time_sync"); }
-void device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying, bool updated) {
+forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying, bool updated) {
     static weather_t previous;
     static bool published;
     assert(weather_reserved && sensor && !sensor->valid);
@@ -640,6 +666,7 @@ void device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor
     } else {
         assert(weather == NULL);
     }
+    return (forecast_stamp_t){.fetched_at = published ? time(NULL) : 0, .retrying = retrying};
 }
 void net_apply_tz(int offset) {
     assert(offset == 28800 || offset == 19800);
@@ -747,9 +774,9 @@ int main(int argc, char **argv) {
         }
         printf("],\"hours\":[");
         for (int i = 0; i < WEATHER_HOURS; i++) {
-            printf("%s{\"hour\":%d,\"temperature\":%.9g,\"code\":%d,"
+            printf("%s{\"date\":%d,\"hour\":%d,\"temperature\":%.9g,\"code\":%d,"
                 "\"precip_probability\":%.9g}",
-                i ? "," : "", w.hours[i].hour, (double)w.hours[i].temperature_c,
+                i ? "," : "", w.hours[i].date, w.hours[i].hour, (double)w.hours[i].temperature_c,
                 w.hours[i].code, (double)w.hours[i].precip_probability);
         }
     }
@@ -787,11 +814,12 @@ int gpio_set_level(int pin, int level) { (void)pin; (void)level; return 0; }
 int gpio_get_level(int pin) { (void)pin; return 0; }
 void vTaskDelay(unsigned ms) { assert(ms < 1000); }
 time_t time(time_t *out) {
-    time_t fixed = 1730622600;
+    time_t fixed = 1735461000;
     if (out) *out = fixed;
     return fixed;
 }
 const char *net_ap_ssid(void) { return "weather-123ABC"; }
+bool net_time_is_synced(void) { return true; }
 
 void traced_text(int x, int y, const aafont *font, const char *text) {
     int pen = x;
@@ -912,6 +940,9 @@ int main(int argc, char **argv) {
                 snprintf(text, sizeof(text), "%02u:%02u", hour, minute);
                 int width = epd_text_w(&font_clock, text);
                 assert(width > 0 && 292 - width >= 250);
+                char utc[10];
+                snprintf(utc, sizeof(utc), "UTC %s", text);
+                assert(292 - epd_text_w(&font_clock, utc) >= 230);
             }
         }
         printf("clock:1440:%u:%u\n", ink[0], ink[1]);
@@ -1090,7 +1121,8 @@ def weather_cases():
              "tmin": daily["temperature_2m_min"][i], "code": daily["weather_code"][i],
              "precip_probability": daily["precipitation_probability_max"][i]}
             for i in range(5)], "hours": [
-            {"hour": int(hourly["time"][i][11:13]),
+            {"date": int(hourly["time"][i][:10].replace("-", "")),
+             "hour": int(hourly["time"][i][11:13]),
              "temperature": hourly["temperature_2m"][i],
              "code": hourly["weather_code"][i],
              "precip_probability": hourly["precipitation_probability"][i]}
@@ -1572,6 +1604,15 @@ def validate_weather(trace, case, expected):
                 got[field], want[field], rel_tol=2e-7, abs_tol=1e-6),
                 f"{context}: day {i}: expected {field}={want[field]}, got {got[field]}")
 
+    require(len(actual["hours"]) == 21, f"{context}: expected all 21 parsed hours")
+    for i, (got, want) in enumerate(zip(actual["hours"], expected["hours"])):
+        for field in ("date", "hour", "code"):
+            require(got[field] == want[field],
+                    f"{context}: hour {i}: expected {field}={want[field]}, got {got[field]}")
+        for field in ("temperature", "precip_probability"):
+            require(math.isclose(got[field], want[field], rel_tol=2e-7, abs_tol=1e-6),
+                    f"{context}: hour {i}: expected {field}={want[field]}, got {got[field]}")
+
 
 def ui_capture(executable, work, mode, day=None, value=None):
     command = [executable, mode] + ([] if day is None else [day])
@@ -1712,7 +1753,7 @@ def check_ui(executable, work, source):
     icon_fonts = check_icon_fonts(executable, work, source)
     codepoints = {code: cp for _, cp, codes in ICON_ORACLE.values() for code in codes}
 
-    clock = time.strftime("%H:%M", time.gmtime(1730622600))
+    clock = time.strftime("%H:%M", time.gmtime(1735461000))
 
     # Row anchors of the five-day page (main/ui.c) with the exact pixel span each row may
     # paint, so a row that silently moves is a failure instead of a shrug: 今天 is the
@@ -1746,9 +1787,10 @@ def check_ui(executable, work, source):
         else:
             require(city == ("Chengdu" if available else "无数据"),
                     f"ui: unexpected normal/no-forecast city: {city!r}")
-        require(any(e["text"] == clock and e["font"] == "clock" and e["y"] == 16 and
-                    e["x"] + e["width"] == 292 and e["x"] >= 250 and
-                    250 <= e["bounds"][0] <= e["bounds"][2] < 292 and
+        clock_text = clock if available else f"UTC {clock}"
+        require(any(e["text"] == clock_text and e["font"] == "clock" and e["y"] == 16 and
+                    e["x"] + e["width"] == 292 and e["x"] >= 230 and
+                    230 <= e["bounds"][0] <= e["bounds"][2] < 292 and
                     0 <= e["bounds"][1] <= e["bounds"][3] < 22 for e in entries),
                 "ui: clock text must use the bold clock font and stay right-aligned")
 
@@ -1770,7 +1812,8 @@ def check_ui(executable, work, source):
             today_code = int(value)
         elif day == 0 and mode == "day_prob":
             today_probability = float(value)
-        header(result, expected_advice(today_code, today_probability, available),
+        advice = "预报待更新" if mode == "day_date" and day == 0 else expected_advice(today_code, today_probability, available)
+        header(result, advice,
                available, mode == "city_long")
         return result
 
@@ -1859,11 +1902,10 @@ def check_ui(executable, work, source):
             changed = capture(f"day_{field}", i)
             delta = forecast["ink"] ^ changed["ink"]
             if field == "date" and i == 0:
-                # Column one is the fixed 今天 label, so its date string is invisible.
-                require(not delta and any(e["text"] == "今天" and e["y"] == DATE_BASE
-                                         for e in changed["texts"]),
-                        "ui: day 1 must keep the 今天 label whatever its date string is")
-                continue
+                require(any(e["text"] == "09/19" and e["y"] == DATE_BASE for e in changed["texts"])
+                        and not any(e["text"] == "今天" for e in changed["texts"]),
+                        "ui: a first date different from the current day must show its actual date")
+                delta = {(x, y) for x, y in delta if y >= 22}
             y0, y1 = bands[field]
             require(delta and all(boundaries[i] <= x < boundaries[i + 1] and y0 <= y < y1
                                   for x, y in delta),
@@ -2238,9 +2280,6 @@ def validate(trace, case, label, success_frames=None):
             expected.append(f"request:{WEATHER_URL}")
         if outcome == "S":
             expected.append(f"timezone:{28800 if cycle < 3 else 19800}")
-            if not have_weather:
-                expected.append("status")  # footer status: syncing
-                expected.append("time_sync")
             have_weather = True
             retries = 0
             sleep_ms = 1800000

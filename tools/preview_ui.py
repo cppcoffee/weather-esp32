@@ -110,6 +110,7 @@ static unsigned call_count;
 
 void vTaskDelay(unsigned ms) { (void)ms; }
 const char *net_ap_ssid(void) { return "weather-DEMO"; }
+bool net_time_is_synced(void) { return true; }
 time_t time(time_t *out) {
     time_t fixed = @EPOCH@;
     if (out) *out = fixed;
@@ -305,7 +306,7 @@ static void forecast_unchanged(const unsigned char *previous) {
         for (int x = 0; x < EPD_W; ++x)
             assert(pixel(previous, x, y) == pixel(frame, x, y));
 }
-static void retry_preserves_body(const unsigned char *previous, unsigned attempt) {
+static void retry_preserves_body(const unsigned char *previous, unsigned attempt, const char *clock) {
     call_count = 0;
     weather_scene = false;
     ui_draw_retry(attempt, 30);
@@ -325,7 +326,7 @@ static void retry_preserves_body(const unsigned char *previous, unsigned attempt
     epd_fill_rect(0, 0, EPD_W, 22, EPD_WHITE);
     snprintf(heading, sizeof(heading), "无网络 30s后重试 #%u", attempt);
     preview_real_epd_text(8, 16, &font_mid, heading);
-    preview_real_epd_text(292 - epd_text_w(&font_clock, "08:30"), 16, &font_clock, "08:30");
+    preview_real_epd_text(292 - epd_text_w(&font_clock, clock), 16, &font_clock, clock);
     epd_refresh();
     assert(!memcmp(retried, frame, sizeof(frame)));
 }
@@ -333,7 +334,7 @@ static void expect_forecast(const weather_t *w) {
     for (int i = 0; i < 5; ++i) {
         int cx = GRID_X + COL_W / 2 + i * COL_W;
         char text[100];
-        if (i == 0) {
+        if (i == 0 && !strcmp(w->days[i].date, "2026-11-14")) {
             /* Today is the row's only CJK label, so it needs the 16px mid font. */
             centered(cx, DATE_BASE, &font_mid, "今天");
         } else {
@@ -593,10 +594,10 @@ int main(void) {
     forecast_unchanged(unknown);
     emit("sensor");
     memcpy(saved, frame, sizeof(saved));
-    retry_preserves_body(saved, 1);
+    retry_preserves_body(saved, 1, "08:30");
     emit("retry");
     memcpy(saved, frame, sizeof(saved));
-    retry_preserves_body(saved, 12);
+    retry_preserves_body(saved, 12, "08:30");
 
     s.temperature_c = -123.4f;
     s.humidity_percent = 100;
@@ -683,7 +684,7 @@ int main(void) {
     memcpy(saved, frame, sizeof(saved));
     render(NULL, NULL);
     assert(!memcmp(saved, frame, sizeof(frame)));
-    retry_preserves_body(saved, 1);
+    retry_preserves_body(saved, 1, "UTC 08:30");
     emit("initial-failure");
     empty = w;
     empty.ok = false;

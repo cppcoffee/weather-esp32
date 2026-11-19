@@ -5,6 +5,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "net.h"
@@ -15,22 +16,22 @@
 
 static const char *TAG = "app";
 static SemaphoreHandle_t s_display_lock;
+static QueueHandle_t s_button_events;
 
-// Network and SNTP waits run on the main task. The clock owns no application state
-// and can update while they block; the mutex covers drawing through SPI/BUSY completion.
-static void clock_task(void *arg)
+static void button_task(void *arg)
 {
     (void)arg;
+    TickType_t last_sample = xTaskGetTickCount();
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        voice_feedback_t feedback = voice_feedback_get();
-        xSemaphoreTake(s_display_lock, portMAX_DELAY);
-        bool changed = ui_update_voice(&feedback);
-        changed = ui_update_clock() || changed;
-        if (changed) {
-            epd_refresh();
+        xTaskDelayUntil(&last_sample, pdMS_TO_TICKS(BUTTON_POLL_MS));
+        button_event_t event = button_poll(BUTTON_POLL_MS);
+        if (event == BUTTON_HOLD) {
+            // Reset takes precedence over page changes that have not been drawn yet.
+            xQueueReset(s_button_events);
         }
-        xSemaphoreGive(s_display_lock);
+        if (event != BUTTON_NONE) {
+            xQueueSend(s_button_events, &event, 0);
+        }
     }
 }
 
@@ -48,6 +49,7 @@ typedef enum { APP_PHASE_CONNECT, APP_PHASE_WEATHER } app_phase_t;
 typedef struct {
     weather_t w;     // result of the last update; w.ok is false before the first success
     weather_t shown; // last good forecast, kept because weather_update resets w on failure
+    forecast_stamp_t stamp;
     sensor_reading_t sensor;
     bool have_weather;
     bool retrying;
@@ -59,6 +61,8 @@ typedef struct {
     app_phase_t phase;
     bool boot_wait_done;
     unsigned connect_attempt;
+    bool network_busy;
+    bool deferred_hold;
 } app_t;
 
 // Stepped retry interval: 5, 10, 20, 40, 60, 60, ... seconds.
@@ -74,12 +78,13 @@ static unsigned retry_seconds(unsigned failures)
 
 static const weather_t *current_weather(const app_t *app)
 {
-    return app->have_weather ? &app->shown : &app->w;
+    return app->have_weather ? &app->shown : NULL;
 }
 
 static void draw_page(const app_t *app)
 {
     const weather_t *w = current_weather(app);
+    ui_set_forecast_stamp(app->have_weather ? &app->stamp : NULL);
     if (app->view == VIEW_HOURLY) {
         ui_draw_hourly(w, &app->sensor);
     } else {
@@ -105,18 +110,56 @@ static void set_status(app_t *app, ui_status_t status, unsigned attempt, bool sh
     }
 }
 
-// Routine updates use the driver's partial-refresh cadence. Page switches use their own
-// 1..7 partial / 8th full cadence, so they do not advance the ordinary refresh count.
-static void present(app_t *app, bool page_switch)
+// Page switches have their own refresh count.
+static void switch_page(app_t *app)
+{
+    app->view = app->view == VIEW_DAILY ? VIEW_HOURLY : VIEW_DAILY;
+    draw_page(app);
+}
+
+static void present(const app_t *app)
 {
     xSemaphoreTake(s_display_lock, portMAX_DELAY);
     draw_page(app);
-    if (page_switch) {
-        epd_refresh_page_switch();
-    } else {
-        epd_refresh();
-    }
+    epd_refresh();
     xSemaphoreGive(s_display_lock);
+}
+
+static void set_network_busy(app_t *app, bool busy)
+{
+    xSemaphoreTake(s_display_lock, portMAX_DELAY);
+    app->network_busy = busy;
+    xSemaphoreGive(s_display_lock);
+}
+
+// While the main task blocks on network I/O, its display data stays stable.
+// The clock can use that snapshot for taps. WiFi resets still belong to main.
+static void clock_task(void *arg)
+{
+    app_t *app = arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        voice_feedback_t feedback = voice_feedback_get();
+        xSemaphoreTake(s_display_lock, portMAX_DELAY);
+        bool changed = ui_update_voice(&feedback);
+        changed = ui_update_clock() || changed;
+        bool switched = false;
+        button_event_t event;
+        if (app->network_busy && !app->deferred_hold && xQueueReceive(s_button_events, &event, 0) == pdTRUE) {
+            if (event == BUTTON_HOLD) {
+                app->deferred_hold = true;
+            } else {
+                switch_page(app);
+                switched = true;
+            }
+        }
+        if (switched) {
+            epd_refresh_page_switch();
+        } else if (changed) {
+            epd_refresh();
+        }
+        xSemaphoreGive(s_display_lock);
+    }
 }
 
 static void show_portal(void)
@@ -128,9 +171,16 @@ static void show_portal(void)
 }
 
 // Returns true when a long hold clears the stored credentials and opens the portal.
-static bool button_service(app_t *app, unsigned slice_ms)
+static bool button_service(app_t *app)
 {
-    switch (button_poll(slice_ms)) {
+    button_event_t event;
+    if (app->deferred_hold) {
+        app->deferred_hold = false;
+        event = BUTTON_HOLD;
+    } else if (xQueueReceive(s_button_events, &event, 0) != pdTRUE) {
+        return false;
+    }
+    switch (event) {
     case BUTTON_HOLD:
         ESP_LOGW(TAG, "button held: erasing stored credentials");
         voice_net_pause();
@@ -143,11 +193,14 @@ static bool button_service(app_t *app, unsigned slice_ms)
         vTaskDelay(pdMS_TO_TICKS(RESET_NOTICE_MS));
         show_portal();
         net_portal();
+        xQueueReset(s_button_events);
         return true;
 
     case BUTTON_TAP:
-        app->view = app->view == VIEW_DAILY ? VIEW_HOURLY : VIEW_DAILY;
-        present(app, true);
+        xSemaphoreTake(s_display_lock, portMAX_DELAY);
+        switch_page(app);
+        epd_refresh_page_switch();
+        xSemaphoreGive(s_display_lock);
         return false;
 
     default:
@@ -164,7 +217,7 @@ static bool wait_serviced(unsigned ms, app_t *app)
         unsigned slice = remaining < BUTTON_POLL_MS ? remaining : BUTTON_POLL_MS;
         vTaskDelay(pdMS_TO_TICKS(slice));
         remaining -= slice;
-        if (button_service(app, slice)) {
+        if (button_service(app)) {
             return true;
         }
     }
@@ -180,7 +233,14 @@ static void run_connect_phase(app_t *app)
         }
     }
 
-    if (net_try_stored(CONNECT_TIMEOUT_MS)) {
+    set_network_busy(app, true);
+    bool connected = net_try_stored(CONNECT_TIMEOUT_MS);
+    set_network_busy(app, false);
+    if (app->deferred_hold && button_service(app)) {
+        app->connect_attempt = 0;
+        return;
+    }
+    if (connected) {
         ESP_LOGI(TAG, "network ready");
         app->connect_attempt = 0;
         app->phase = APP_PHASE_WEATHER;
@@ -191,6 +251,7 @@ static void run_connect_phase(app_t *app)
         voice_net_pause();
         show_portal();
         net_portal();
+        xQueueReset(s_button_events);
         app->connect_attempt = 0;
         return;
     }
@@ -215,16 +276,21 @@ static void run_weather_phase(app_t *app)
         return;
     }
     set_status(app, UI_STATUS_FETCHING, 0, true);
+    set_network_busy(app, true);
     bool updated = weather_update(&app->w);
+    set_network_busy(app, false);
+    if (app->deferred_hold) {
+        voice_weather_end();
+        (void)button_service(app);
+        app->connect_attempt = 0;
+        app->phase = APP_PHASE_CONNECT;
+        return;
+    }
     unsigned wait_s = REFRESH_S;
     if (updated) {
         xSemaphoreTake(s_display_lock, portMAX_DELAY);
         net_apply_tz(app->w.utc_offset);
         xSemaphoreGive(s_display_lock);
-        if (!app->have_weather) {
-            set_status(app, UI_STATUS_SYNCING, 0, true);
-            net_time_sync();
-        }
         app->have_weather = true;
         app->retrying = false;
         app->retry_attempt = 0;
@@ -239,10 +305,10 @@ static void run_weather_phase(app_t *app)
         ESP_LOGW(TAG, "update failed, retry #%u in %us", app->retry_attempt, app->retry_delay);
     }
 
-    device_mcp_publish(app->have_weather ? &app->shown : NULL, &app->sensor, app->retrying, updated);
+    app->stamp = device_mcp_publish(app->have_weather ? &app->shown : NULL, &app->sensor, app->retrying, updated);
     voice_weather_end();
     voice_net_ready();
-    present(app, false);
+    present(app);
     if (wait_serviced(wait_s * 1000u, app)) {
         app->connect_attempt = 0;
         app->phase = APP_PHASE_CONNECT;
@@ -254,13 +320,16 @@ void app_main(void)
     ESP_LOGI(TAG, "boot");
     s_display_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(s_display_lock != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    s_button_events = xQueueCreate(8, sizeof(button_event_t));
+    ESP_ERROR_CHECK(s_button_events != NULL ? ESP_OK : ESP_ERR_NO_MEM);
     epd_init();
+    net_init();
     esp_err_t audio_err = audio_init();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "audio unavailable: %s", esp_err_to_name(audio_err));
     }
-    net_init();
     button_init();
+    ESP_ERROR_CHECK(xTaskCreate(button_task, "button", 2048, NULL, 2, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     // Voice stays idle until the network is up; it runs in its own task so a microphone
     // read or a chat turn never stalls the weather loop.
     if (voice_init() != ESP_OK) {
@@ -279,7 +348,7 @@ void app_main(void)
     draw_page(&app);
     epd_refresh_full();
     xSemaphoreGive(s_display_lock);
-    ESP_ERROR_CHECK(xTaskCreate(clock_task, "clock", 2048, NULL, 1, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(clock_task, "clock", 4096, &app, 1, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     for (;;) {
         switch (app.phase) {

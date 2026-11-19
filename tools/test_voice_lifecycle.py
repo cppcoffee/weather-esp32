@@ -72,7 +72,10 @@ PRELUDE = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 #include <string.h>
+#include <sys/time.h>
+#include "net.h"
 #include "voice_feedback.h"
 #include "voice_internal.h"
 
@@ -106,6 +109,29 @@ static EventBits_t wifi_events;
 static EventBits_t events;
 static unsigned wifi_connects;
 static void esp_wifi_connect(void) { wifi_connects++; }
+static void start_time_sync(void);
+static atomic_bool s_time_synced;
+static bool s_sntp_initialized;
+static unsigned sntp_starts, sntp_inits;
+static void (*sntp_callback)(struct timeval *);
+typedef struct {
+    const char *server;
+    void (*sync_cb)(struct timeval *);
+    bool start, wait_for_sync;
+} esp_sntp_config_t;
+#define ESP_NETIF_SNTP_DEFAULT_CONFIG(name) ((esp_sntp_config_t){.server = name, .start = true, .wait_for_sync = true})
+static esp_err_t esp_netif_sntp_init(const esp_sntp_config_t *cfg) {
+    CHECK(cfg->start && !cfg->wait_for_sync && cfg->sync_cb);
+    CHECK(!strcmp(cfg->server, "pool.ntp.org"));
+    if (++sntp_inits == 1) return ESP_FAIL;
+    sntp_callback = cfg->sync_cb;
+    return ESP_OK;
+}
+static esp_err_t esp_netif_sntp_start(void) {
+    CHECK(sntp_callback);
+    sntp_starts++;
+    return ESP_OK;
+}
 static EventBits_t *s_events = &events;
 static int lock_token, queue_token;
 static void *s_network_lock = &lock_token, *s_rx_queue = &queue_token;
@@ -482,11 +508,21 @@ int main(int argc, char **argv)
     wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
     wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
     CHECK(wifi_events == GOT_IP && events == VOICE_BIT_NET && !network_ready());
+    CHECK(sntp_inits == 1 && !sntp_starts && !net_time_is_synced()); /* Initial allocation failed. */
     disconnect();
     CHECK(wifi_connects == 2 && events == 0);
     wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    CHECK(sntp_inits == 2 && sntp_callback && !sntp_starts && !net_time_is_synced());
+    sntp_callback(NULL);
+    sntp_callback(&(struct timeval){.tv_sec = 100});
+    CHECK(!net_time_is_synced());
+    sntp_callback(&(struct timeval){.tv_sec = NET_MIN_SYNCED_EPOCH});
+    CHECK(net_time_is_synced());
     wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
     CHECK(wifi_connects == 2 && wifi_events == 0 && events == 0);
+    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    CHECK(sntp_inits == 2 && sntp_starts == 1 && net_time_is_synced());
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
     make_script(argv[1], failures);
     if (setjmp(finished) == 0) voice_task(NULL);
     CHECK(current == script_count && !locked && takes == gives && failures_left == 0);
@@ -525,6 +561,9 @@ def main():
     net = source.with_name("net.c")
     handler, net_ranges = extract(net.read_text(encoding="utf-8"), net, (
         ("static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)", "void net_init(void)"),
+        ("static void on_time_sync(struct timeval *tv)", "bool net_time_is_synced(void)"),
+        ("bool net_time_is_synced(void)", "static void start_time_sync(void)"),
+        ("static void start_time_sync(void)", "int net_http_get(const char *url, char *buf, size_t cap)"),
     ))
     handler = "#define s_events (&wifi_events)\n" + handler + "\n#undef s_events\n"
     print("Extracting unchanged source (not the whole voice.c):", flush=True)
@@ -549,6 +588,7 @@ def main():
                 for deinit_error in range(2):
                     print(run([executable, route, failures, deinit_error], work, env, 5), end="", flush=True)
     print(f"PASS 36 lifecycle scenarios{' (ASan/UBSan)' if args.sanitize else ''}")
+    print("PASS STA SNTP start, initialization retry, reconnect and validated sync callback")
     print("Scope: does not validate the real SDK stop timing, audio, WakeNet, or all of voice.c.")
 
 

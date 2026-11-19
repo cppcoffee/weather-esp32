@@ -36,3 +36,6 @@ esp_err_t audio_read(void *buffer, size_t length, size_t *bytes_read);
 esp_err_t audio_write(void *buffer, size_t length, size_t *bytes_written);
 
 esp_err_t audio_set_mute(bool muted);
+// Speaker volume is an integer 0–100, restored from NVS at boot.
+esp_err_t audio_get_volume(int *volume);
+esp_err_t audio_set_volume(int volume);

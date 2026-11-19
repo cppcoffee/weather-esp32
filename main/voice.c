@@ -132,6 +132,13 @@ static void on_chat_lifecycle(void *arg, esp_event_base_t base, int32_t id, void
     (void)arg;
     (void)base;
     (void)data;
+    if (id == ESP_XIAOZHI_CHAT_EVENT_CONNECTED) {
+        xEventGroupSetBits(s_events, VOICE_BIT_WS_READY);
+        return;
+    }
+    if (id == ESP_XIAOZHI_CHAT_EVENT_DISCONNECTED) {
+        xEventGroupClearBits(s_events, VOICE_BIT_WS_READY);
+    }
     if (id == ESP_XIAOZHI_CHAT_EVENT_SERVER_GOODBYE) {
         ESP_LOGI(TAG, "server goodbye");
         xEventGroupSetBits(s_events, VOICE_BIT_HANGUP);
@@ -245,6 +252,14 @@ static esp_err_t open_session(void)
     if (err != ESP_OK) {
         goto failed;
     }
+    // `chat ready` must mean the socket is up, otherwise the first wake word is dropped.
+    if (!(xEventGroupWaitBits(s_events, VOICE_BIT_WS_READY, pdFALSE, pdFALSE,
+                              pdMS_TO_TICKS(VOICE_CONNECT_TIMEOUT_MS))
+          & VOICE_BIT_WS_READY)) {
+        ESP_LOGW(TAG, "websocket not connected after %d ms", VOICE_CONNECT_TIMEOUT_MS);
+        err = ESP_ERR_TIMEOUT;
+        goto failed;
+    }
 
     int opus_error = OPUS_OK;
     s_encoder = opus_encoder_create(VOICE_SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_error);
@@ -297,10 +312,17 @@ static esp_err_t stream_microphone(void)
         if (bits & VOICE_BIT_TTS_STARTED) {
             return ESP_OK;
         }
+        bool ending = (bits & VOICE_BIT_LOCAL_EOS) != 0;
         filled += xStreamBufferReceive(s_microphone, (uint8_t *)s_mono + filled, sizeof(s_mono) - filled,
-                                       pdMS_TO_TICKS(VOICE_POLL_MS));
+                                       ending ? 0 : pdMS_TO_TICKS(VOICE_POLL_MS));
         if (filled < sizeof(s_mono)) {
-            continue;
+            if (!ending) {
+                continue;
+            }
+            if (!filled) {
+                return ESP_OK;
+            }
+            memset((uint8_t *)s_mono + filled, 0, sizeof(s_mono) - filled);
         }
         if (!turn_can_continue()) {
             return ESP_FAIL;
@@ -361,7 +383,7 @@ static esp_err_t play_response(bool *played)
             }
             voice_mono_to_stereo(s_mono, s_stereo, (size_t)samples);
             size_t written = 0;
-            esp_err_t write_err = audio_set_mute(false);
+            esp_err_t write_err = received_audio ? ESP_OK : audio_set_mute(false);
             if (write_err == ESP_OK) {
                 write_err = audio_write(s_stereo, (size_t)samples * 4, &written);
             }
@@ -383,9 +405,6 @@ static esp_err_t play_response(bool *played)
             break;
         }
     }
-    // Leave arming to the turn owner: it re-arms WakeNet once this turn is finished.
-    xEventGroupClearBits(s_events, VOICE_BIT_ARMED);
-    xStreamBufferReset(s_reference);
     *played = received_audio;
     return err;
 }
@@ -393,12 +412,7 @@ static esp_err_t play_response(bool *played)
 // Returns with the network lock held again, including on timeout or disconnect.
 static bool wait_followup(void)
 {
-    // A successful write can leave up to one DMA ring of speech queued.
-    xEventGroupWaitBits(s_events, VOICE_END_BITS, pdFALSE, pdFALSE, pdMS_TO_TICKS(AUDIO_PLAYBACK_TAIL_MS) + 1);
-    if (!turn_can_continue() || audio_set_mute(true) != ESP_OK) {
-        return false;
-    }
-    xEventGroupClearBits(s_events, VOICE_BIT_SPEECH);
+    xEventGroupClearBits(s_events, VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS);
     xEventGroupSetBits(s_events, VOICE_BIT_FOLLOWUP);
     xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING);
     voice_feedback_publish(VOICE_STATE_LISTENING, NULL);
@@ -408,17 +422,22 @@ static bool wait_followup(void)
                                            pdMS_TO_TICKS(VOICE_FOLLOWUP_MS));
     bool speech = (bits & VOICE_BIT_SPEECH) && turn_can_continue();
     if (speech) {
-        xEventGroupSetBits(s_events, VOICE_BIT_CAPTURE | VOICE_BIT_RECEIVING);
+        xEventGroupSetBits(s_events, VOICE_BIT_RECEIVING | ((bits & VOICE_BIT_LOCAL_EOS) ? 0 : VOICE_BIT_CAPTURE));
     }
     xEventGroupClearBits(s_events, VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH);
 
-    if (xSemaphoreTake(s_network_lock, pdMS_TO_TICKS(VOICE_POLL_MS)) != pdTRUE) {
-        // A weather request already owns the budget. Drop the unstarted follow-up.
+    TickType_t started = xTaskGetTickCount();
+    do {
+        if (xSemaphoreTake(s_network_lock, pdMS_TO_TICKS(VOICE_POLL_MS)) == pdTRUE) {
+            return speech && turn_can_continue();
+        }
+    } while (speech && turn_can_continue() && xTaskGetTickCount() - started < pdMS_TO_TICKS(VOICE_FOLLOWUP_LOCK_MS));
+    // A stalled fetch must not keep recording or leave the turn holding stale audio.
+    if (speech) {
         xEventGroupClearBits(s_events, VOICE_BIT_CAPTURE);
-        xSemaphoreTake(s_network_lock, portMAX_DELAY);
-        return false;
     }
-    return speech && turn_can_continue();
+    xSemaphoreTake(s_network_lock, portMAX_DELAY);
+    return false;
 }
 
 static esp_err_t run_turn(void)
@@ -480,13 +499,25 @@ static esp_err_t run_turn(void)
         if (err != ESP_OK || !turn_can_continue()) {
             break;
         }
+        if (played && !(xEventGroupGetBits(s_events) & VOICE_BIT_INTERRUPT)) {
+            // I2S write completes before all samples from its DMA ring reach the speaker.
+            xEventGroupWaitBits(s_events, VOICE_END_BITS | VOICE_BIT_INTERRUPT, pdFALSE, pdFALSE,
+                                pdMS_TO_TICKS(AUDIO_PLAYBACK_TAIL_MS) + 1);
+            err = audio_set_mute(true);
+            if (err != ESP_OK || !turn_can_continue()) {
+                break;
+            }
+        }
+        xEventGroupClearBits(s_events, VOICE_BIT_ARMED);
+        xStreamBufferReset(s_reference);
         interrupted = (xEventGroupGetBits(s_events) & VOICE_BIT_INTERRUPT) != 0;
         if (!interrupted && !(s_followup_enabled && played && wait_followup())) {
             break;
         }
     }
-    EventBits_t bits = xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING | VOICE_BIT_ARMED | VOICE_BIT_INTERRUPT
-                                                          | VOICE_BIT_CAPTURE | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH);
+    EventBits_t bits =
+        xEventGroupClearBits(s_events, VOICE_BIT_RECEIVING | VOICE_BIT_ARMED | VOICE_BIT_INTERRUPT | VOICE_BIT_CAPTURE
+                                           | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS);
     audio_set_mute(true);
     if (channel_open && VOICE_NETWORK_READY(bits) && !(bits & (VOICE_BIT_WS_LOST | VOICE_BIT_HANGUP))) {
         esp_xiaozhi_chat_close_audio_channel(s_chat);
@@ -644,6 +675,8 @@ esp_err_t voice_init(void)
     err = ESP_ERR_NO_MEM;
     s_events = xEventGroupCreate();
     if (s_events != NULL) {
+        ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_CONNECTED,
+                                                   on_chat_lifecycle, NULL));
         ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_SERVER_GOODBYE,
                                                    on_chat_lifecycle, NULL));
         ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_DISCONNECTED,
@@ -724,7 +757,7 @@ void voice_net_pause(void)
     if (s_events != NULL) {
         xEventGroupClearBits(s_events, VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_RECEIVING
                                            | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE | VOICE_BIT_INTERRUPT
-                                           | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH);
+                                           | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS);
         voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL);
         xEventGroupSetBits(s_events, VOICE_BIT_RESET);
     }
@@ -732,7 +765,18 @@ void voice_net_pause(void)
 
 bool voice_weather_begin(void)
 {
-    return s_network_lock == NULL || xSemaphoreTake(s_network_lock, 0) == pdTRUE;
+    if (s_network_lock == NULL) {
+        return true;
+    }
+    if (xSemaphoreTake(s_network_lock, 0) != pdTRUE) {
+        return false;
+    }
+    if (xEventGroupGetBits(s_events) & (VOICE_BIT_TRIGGER | VOICE_BIT_SPEECH | VOICE_BIT_CAPTURE | VOICE_BIT_RECEIVING))
+    {
+        xSemaphoreGive(s_network_lock);
+        return false;
+    }
+    return true;
 }
 
 void voice_weather_end(void)

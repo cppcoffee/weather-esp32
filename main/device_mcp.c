@@ -6,41 +6,40 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "audio.h"
 #include "cJSON.h"
 #include "esp_mcp_engine.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "net.h"
 
-#define FORECAST_STALE_SECONDS (30 * 60)
-#define MIN_SYNCED_EPOCH       1704067200 // 2024-01-01; reject an unset/reset system clock
-
 typedef struct {
     weather_t weather;
     sensor_reading_t sensor;
-    bool retrying;
-    time_t fetched_at;
-    int64_t fetched_uptime_us;
+    forecast_stamp_t stamp;
 } device_snapshot_t;
 
 static device_snapshot_t s_snapshot;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
-void device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying, bool forecast_updated)
+forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying,
+                                    bool forecast_updated)
 {
     time_t now = time(NULL);
-    bool clock_known = net_time_is_synced() && now >= MIN_SYNCED_EPOCH;
+    bool clock_known = net_time_is_synced() && now >= NET_MIN_SYNCED_EPOCH;
     int64_t uptime = esp_timer_get_time();
     portENTER_CRITICAL(&s_lock);
     if (forecast_updated && weather && weather->ok) {
         s_snapshot.weather = *weather;
 
-        s_snapshot.fetched_at = clock_known ? now : 0;
-        s_snapshot.fetched_uptime_us = uptime;
+        s_snapshot.stamp.fetched_at = clock_known ? now : 0;
+        s_snapshot.stamp.fetched_uptime_us = uptime;
     }
     s_snapshot.sensor = sensor ? *sensor : (sensor_reading_t){0};
-    s_snapshot.retrying = retrying;
+    s_snapshot.stamp.retrying = retrying;
+    forecast_stamp_t stamp = s_snapshot.stamp;
     portEXIT_CRITICAL(&s_lock);
+    return stamp;
 }
 
 static device_snapshot_t snapshot(void)
@@ -72,7 +71,7 @@ static esp_err_t get_time(const esp_mcp_property_list_t *properties, esp_mcp_too
     time_t now = time(NULL);
     int offset = copy.weather.utc_offset;
     bool timezone_known = copy.weather.ok && offset >= -14 * 3600 && offset <= 14 * 3600 && offset % 60 == 0;
-    bool synchronized = net_time_is_synced() && now >= MIN_SYNCED_EPOCH && timezone_known;
+    bool synchronized = net_time_is_synced() && now >= NET_MIN_SYNCED_EPOCH && timezone_known;
     char iso[40] = {0};
     if (synchronized) {
         // Use the same numeric UTC offset as the forecast; do not race global TZ updates.
@@ -147,6 +146,14 @@ static cJSON *hour_json(const weather_hour_t *hour)
         cJSON_Delete(json);
         return NULL;
     }
+    if (hour->date > 0 && hour->date <= 99991231) {
+        char date[16];
+        snprintf(date, sizeof(date), "%04d-%02d-%02d", hour->date / 10000, hour->date / 100 % 100, hour->date % 100);
+        if (!cJSON_AddStringToObject(json, "date", date)) {
+            cJSON_Delete(json);
+            return NULL;
+        }
+    }
     return json;
 }
 
@@ -154,16 +161,17 @@ static esp_err_t get_forecast(const esp_mcp_property_list_t *properties, esp_mcp
 {
     (void)properties;
     device_snapshot_t copy = snapshot();
-    double age = (double)(esp_timer_get_time() - copy.fetched_uptime_us) / 1000000.0;
+    int64_t uptime = esp_timer_get_time();
+    double age = (double)(uptime - copy.stamp.fetched_uptime_us) / 1000000.0;
     if (age < 0) {
         age = 0;
     }
-    bool fetched_at_known = copy.fetched_at >= MIN_SYNCED_EPOCH;
-    bool stale = copy.retrying || !fetched_at_known || age >= FORECAST_STALE_SECONDS;
+    bool fetched_at_known = copy.stamp.fetched_at != 0;
+    bool stale = forecast_is_stale(copy.stamp, uptime);
     cJSON *json = cJSON_CreateObject();
     bool ok = json && cJSON_AddBoolToObject(json, "available", copy.weather.ok)
               && cJSON_AddStringToObject(json, "source", "Open-Meteo_cached_forecast")
-              && cJSON_AddBoolToObject(json, "retrying", copy.retrying);
+              && cJSON_AddBoolToObject(json, "retrying", copy.stamp.retrying);
     if (!copy.weather.ok) {
         ok = ok && cJSON_AddStringToObject(json, "reason", "forecast_not_available");
         return send_json(result, json, ok);
@@ -171,7 +179,7 @@ static esp_err_t get_forecast(const esp_mcp_property_list_t *properties, esp_mcp
     ok = ok && cJSON_AddStringToObject(json, "city", copy.weather.city)
          && cJSON_AddNumberToObject(json, "utc_offset_seconds", copy.weather.utc_offset)
          && cJSON_AddBoolToObject(json, "fetched_at_known", fetched_at_known)
-         && (fetched_at_known ? cJSON_AddNumberToObject(json, "fetched_at", (double)copy.fetched_at)
+         && (fetched_at_known ? cJSON_AddNumberToObject(json, "fetched_at", (double)copy.stamp.fetched_at)
                               : cJSON_AddNullToObject(json, "fetched_at"))
          && cJSON_AddNumberToObject(json, "age", age) && cJSON_AddBoolToObject(json, "stale", stale);
     cJSON *days = ok ? cJSON_AddArrayToObject(json, "days") : NULL;
@@ -194,6 +202,26 @@ static esp_err_t get_forecast(const esp_mcp_property_list_t *properties, esp_mcp
     return send_json(result, json, ok);
 }
 
+static esp_err_t get_device_status(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
+{
+    (void)properties;
+    int volume;
+    esp_err_t err = audio_get_volume(&volume);
+    if (err != ESP_OK) {
+        return err;
+    }
+    cJSON *json = cJSON_CreateObject();
+    cJSON *speaker = json ? cJSON_AddObjectToObject(json, "audio_speaker") : NULL;
+    return send_json(result, json, speaker && cJSON_AddNumberToObject(speaker, "volume", volume));
+}
+
+static esp_err_t set_volume(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
+{
+    int volume = esp_mcp_property_list_get_property_int(properties, "volume");
+    esp_err_t err = audio_set_volume(volume);
+    return err == ESP_OK ? esp_mcp_tool_result_add_text(result, "Speaker volume saved.") : err;
+}
+
 esp_err_t device_mcp_register(esp_mcp_t *mcp)
 {
     if (!mcp) {
@@ -203,24 +231,40 @@ esp_err_t device_mcp_register(esp_mcp_t *mcp)
         const char *name;
         const char *description;
         esp_mcp_tool_callback_ex_t callback;
+        bool volume_arg;
     } tools[] = {
-        {"self.get_current_time", "Read device local time; synchronized=false means time is unavailable.", get_time},
+        {"self.get_current_time", "Read device local time; synchronized=false means time is unavailable.", get_time,
+         false},
         {"self.get_weather_forecast",
          "Read cached five-day/21-hour forecast; no network. age: monotonic seconds; weather_code: WMO, "
          "unmapped=unknown. "
-         "precip_probability: forecast percent, not observed rain. Hours: ordered at fetch, local hour only, not "
-         "rolling.",
-         get_forecast},
+         "precip_probability: forecast percent, not observed rain. Hours: API order at fetch, each with local date "
+         "(YYYY-MM-DD) and hour. A repeated local hour may appear twice near a clock change.",
+         get_forecast, false},
         {"self.get_sensor_reading", "Read actual local temperature/humidity; available=false means no valid reading.",
-         get_sensor},
+         get_sensor, false},
+        {"self.get_device_status", "Read the device speaker's current volume (0–100).", get_device_status, false},
+        {"self.audio_speaker.set_volume", "Set and save the speaker volume as an integer from 0 to 100.", set_volume,
+         true},
     };
     for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
         esp_mcp_tool_t *tool = esp_mcp_tool_create_ex(tools[i].name, NULL, tools[i].description, tools[i].callback);
         if (!tool) {
             return ESP_ERR_NO_MEM;
         }
+        bool volume_arg = tools[i].volume_arg;
         esp_err_t err = esp_mcp_tool_set_annotations_json(
-            tool, "{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}");
+            tool,
+            volume_arg
+                ? "{\"readOnlyHint\":false,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}"
+                : "{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}");
+        if (err == ESP_OK && volume_arg) {
+            esp_mcp_property_t *property = esp_mcp_property_create_with_range("volume", 0, 100);
+            err = property ? esp_mcp_tool_add_property(tool, property) : ESP_ERR_NO_MEM;
+            if (property && err != ESP_OK) {
+                esp_mcp_property_destroy(property);
+            }
+        }
         if (err == ESP_OK) {
             err = esp_mcp_add_tool(mcp, tool);
         }

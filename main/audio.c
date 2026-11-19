@@ -17,6 +17,9 @@ _Static_assert(!PSRAM_PIN_IN_USE(AUDIO_PA_EN_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "nvs.h"
 
 #define AUDIO_I2C_PORT            I2C_NUM_0
 #define AUDIO_I2S_PORT            I2S_NUM_0
@@ -35,6 +38,8 @@ static const audio_codec_data_if_t *s_data_if;
 static const audio_codec_gpio_if_t *s_gpio_if;
 static const audio_codec_if_t *s_codec_if;
 static bool s_ready;
+static SemaphoreHandle_t s_control_lock;
+static int s_volume = AUDIO_DEFAULT_VOLUME;
 
 static esp_err_t check_codec_result(int result, const char *operation)
 {
@@ -47,6 +52,10 @@ static esp_err_t check_codec_result(int result, const char *operation)
 
 static void cleanup_failed_init(void)
 {
+    if (s_control_lock) {
+        vSemaphoreDelete(s_control_lock);
+        s_control_lock = NULL;
+    }
     if (s_codec) {
         esp_codec_dev_delete(s_codec);
         s_codec = NULL;
@@ -144,6 +153,20 @@ static esp_err_t init_i2c(void)
     return i2c_new_master_bus(&bus_config, &s_i2c_bus);
 }
 
+static int load_volume(void)
+{
+    int volume = AUDIO_DEFAULT_VOLUME;
+    nvs_handle_t nvs;
+    if (nvs_open("audio", NVS_READONLY, &nvs) == ESP_OK) {
+        uint8_t saved;
+        if (nvs_get_u8(nvs, "volume", &saved) == ESP_OK && saved <= 100) {
+            volume = saved;
+        }
+        nvs_close(nvs);
+    }
+    return volume;
+}
+
 static esp_err_t init_codec(void)
 {
     audio_codec_i2c_cfg_t i2c_config = {
@@ -222,7 +245,8 @@ static esp_err_t init_codec(void)
     if (err != ESP_OK) {
         return err;
     }
-    err = check_codec_result(esp_codec_dev_set_out_vol(s_codec, AUDIO_DEFAULT_VOLUME), "set speaker volume");
+    s_volume = load_volume();
+    err = check_codec_result(esp_codec_dev_set_out_vol(s_codec, s_volume), "set speaker volume");
     if (err != ESP_OK) {
         return err;
     }
@@ -265,6 +289,11 @@ esp_err_t audio_init(void)
         return err;
     }
 
+    s_control_lock = xSemaphoreCreateMutex();
+    if (!s_control_lock) {
+        cleanup_failed_init();
+        return ESP_ERR_NO_MEM;
+    }
     s_ready = true;
     ESP_LOGI(TAG, "ES8311 audio ready: %d Hz, %d-bit stereo, PA GPIO %d", AUDIO_SAMPLE_RATE_HZ, AUDIO_BITS_PER_SAMPLE,
              AUDIO_PA_EN_GPIO);
@@ -305,13 +334,61 @@ esp_err_t audio_set_mute(bool muted)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
+    xSemaphoreTake(s_control_lock, portMAX_DELAY);
     // The codec mute only gates the DAC. Drive the PA enable too so the amplifier (and any
     // LED sharing that net) is off whenever nothing is playing.
     esp_err_t err =
         check_codec_result(esp_codec_dev_set_out_mute(s_codec, muted), muted ? "mute speaker" : "unmute speaker");
-    if (err != ESP_OK) {
-        return err;
+    if (err == ESP_OK) {
+        err = check_codec_result(s_gpio_if->set(AUDIO_PA_EN_GPIO, !muted),
+                                 muted ? "disable speaker amp" : "enable speaker amp");
     }
-    return check_codec_result(s_gpio_if->set(AUDIO_PA_EN_GPIO, !muted),
-                              muted ? "disable speaker amp" : "enable speaker amp");
+    xSemaphoreGive(s_control_lock);
+    return err;
+}
+
+esp_err_t audio_get_volume(int *volume)
+{
+    if (!volume) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_control_lock, portMAX_DELAY);
+    *volume = s_volume;
+    xSemaphoreGive(s_control_lock);
+    return ESP_OK;
+}
+
+esp_err_t audio_set_volume(int volume)
+{
+    if (volume < 0 || volume > 100) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_control_lock, portMAX_DELAY);
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("audio", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = check_codec_result(esp_codec_dev_set_out_vol(s_codec, volume), "set speaker volume");
+        if (err == ESP_OK) {
+            int previous = s_volume;
+            s_volume = volume;
+            err = nvs_set_u8(nvs, "volume", (uint8_t)volume);
+            if (err == ESP_OK) {
+                err = nvs_commit(nvs);
+            }
+            if (err != ESP_OK
+                && check_codec_result(esp_codec_dev_set_out_vol(s_codec, previous), "restore speaker volume") == ESP_OK)
+            {
+                s_volume = previous;
+            }
+        }
+        nvs_close(nvs);
+    }
+    xSemaphoreGive(s_control_lock);
+    return err;
 }

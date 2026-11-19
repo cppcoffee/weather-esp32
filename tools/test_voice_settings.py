@@ -326,7 +326,8 @@ static void expect_failed_load(esp_err_t expected)
 
 static void test_load(void)
 {
-    const voice_settings_t zeroed = {0};
+    // Nothing saved: follow-up listening is on by default.
+    const voice_settings_t zeroed = {.followup = 1};
     voice_settings_t output;
     reset_nvs();
     namespace_present = false;
@@ -364,7 +365,9 @@ static void test_load(void)
     blob_length = VOICE_URL_CAP;
     memset(&output, 0xa5, sizeof(output));
     assert(voice_settings_load(&output) == ESP_OK);
-    assert(memcmp(&output, &legacy, sizeof(output)) == 0 && !output.followup);
+    voice_settings_t upgraded = legacy;
+    upgraded.followup = 1;
+    assert(memcmp(&output, &upgraded, sizeof(output)) == 0 && output.followup);
     ++checks;
 
     // Any size other than the current and legacy layouts must fail.

@@ -200,7 +200,7 @@ def build_harness(directory, assets):
         # Fixed-width octal escapes preserve UTF-8 bytes without C escape ambiguity.
         literal = "".join(f"\\{byte:03o}" for byte in data)
         definitions.append(f'static const char {symbol}[] = "{literal}";\n')
-    ap_url = extract((ROOT / "main/net.h").read_text(), r'(^#define NET_AP_URL "[^"\n]+")')
+    ap_url = extract((ROOT / "main/net.h").read_text(), r'(^#define NET_AP_URL[ \t]+"[^"\n]+")')
     declarations = [
         extract(source, r"(^#define MAX_APS\s+\d+)"),
         extract(source, r"(^typedef struct \{[^{}]*\} scan_ap_t;)"),

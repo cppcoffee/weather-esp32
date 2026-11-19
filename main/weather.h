@@ -1,8 +1,23 @@
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
+#include <time.h>
 
-#define WEATHER_DAYS  5
-#define WEATHER_HOURS 21 // the current local hour plus the next 20
+#define WEATHER_DAYS           5
+#define WEATHER_HOURS          21 // the current local hour plus the next 20
+#define FORECAST_STALE_SECONDS (30 * 60)
+
+typedef struct {
+    time_t fetched_at; // UTC, zero if the clock was unsynchronized at fetch time
+    int64_t fetched_uptime_us;
+    bool retrying;
+} forecast_stamp_t;
+
+static inline bool forecast_is_stale(forecast_stamp_t stamp, int64_t uptime_us)
+{
+    return stamp.retrying || stamp.fetched_at == 0
+           || uptime_us - stamp.fetched_uptime_us >= (int64_t)FORECAST_STALE_SECONDS * 1000000;
+}
 
 typedef struct {
     char date[11]; // YYYY-MM-DD, consecutive local dates starting today
@@ -12,6 +27,7 @@ typedef struct {
 } weather_day_t;
 
 typedef struct {
+    int date; // local YYYYMMDD, retained from the API for midnight/DST transitions
     int hour; // local hour from the API timestamp, 0..23 (may wrap past midnight)
     float temperature_c;
     int code;
