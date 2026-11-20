@@ -9,12 +9,15 @@ BraceWrapping:
     AfterFunction: true
     AfterControlStatement: MultiLine
 BreakBeforeBinaryOperators: NonAssignment
-SeparateDefinitionBlocks: Leave
+SpaceBeforeParens: ControlStatements
+SeparateDefinitionBlocks: Always
 AlignConsecutiveMacros: Consecutive
+AllowShortEnumsOnASingleLine: false
 AllowShortFunctionsOnASingleLine: None
 AllowShortIfStatementsOnASingleLine: Never
 AllowShortLoopsOnASingleLine: false
 AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
 InsertBraces: true
 IndentCaseLabels: false
 ...

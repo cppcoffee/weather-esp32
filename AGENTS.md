@@ -56,7 +56,15 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 | `components/esp_xiaozhi/` | 上游 0.1.4 单份本地 override（`override_path`），勿另建副本 |
 
 - 保留 `main/`，不改 `src/`；新增 C 文件同步 `main/CMakeLists.txt` 与主机 harness。
-- 格式：`.clang-format`（4 空格、120 列、函数左花括号换行）；不要为局部修改重排字模文件。
+
+## C 代码风格
+
+以人工阅读和审查为先。命名、文件组织和控制流可参考 [NGINX 开发指南](https://nginx.org/en/docs/dev/development_guide.html#code_style) 和 [Linux 内核编码风格](https://docs.kernel.org/process/coding-style.html)。
+
+- 文件级变量用能说明用途的小写下划线名称，例如 `display_lock` 和 `sta_events`。局部变量在含义清楚时可以简短。
+- 一起初始化、更新或清理的状态可归入同一结构体。私有类型定义在使用它的 `.c` 文件里，跨文件需要完整定义的类型放在对应头文件。
+- 主路径按执行顺序展开，错误尽早处理。多条失败路径共用清理逻辑时，出口名称写清要释放的资源。注释说明约束、资源所有权或设计原因。
+- 排版以 `.clang-format` 为准（4 空格、120 列、函数左花括号换行）。字模文件通过生成器更新。
 
 ## 通用复用
 

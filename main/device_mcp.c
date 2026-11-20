@@ -19,6 +19,13 @@ struct device_snapshot {
     forecast_stamp_t stamp;
 };
 
+struct device_tool_spec {
+    const char *name;
+    const char *description;
+    esp_mcp_tool_callback_ex_t callback;
+    bool volume_arg;
+};
+
 static struct device_snapshot published_snapshot;
 static portMUX_TYPE snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -222,37 +229,33 @@ static esp_err_t set_volume(const esp_mcp_property_list_t *properties, esp_mcp_t
     return err == ESP_OK ? esp_mcp_tool_result_add_text(result, "Speaker volume saved.") : err;
 }
 
+static const struct device_tool_spec device_tools[] = {
+    {"self.get_current_time", "Read device local time; synchronized=false means time is unavailable.", get_time, false},
+    {"self.get_weather_forecast",
+     "Read cached five-day/21-hour forecast; no network. age: monotonic seconds; weather_code: WMO, "
+     "unmapped=unknown. "
+     "precip_probability: forecast percent, not observed rain. Hours: API order at fetch, each with local date "
+     "(YYYY-MM-DD) and hour. A repeated local hour may appear twice near a clock change.",
+     get_forecast, false},
+    {"self.get_sensor_reading", "Read actual local temperature/humidity; available=false means no valid reading.",
+     get_sensor, false},
+    {"self.get_device_status", "Read the device speaker's current volume (0–100).", get_device_status, false},
+    {"self.audio_speaker.set_volume", "Set and save the speaker volume as an integer from 0 to 100.", set_volume, true},
+};
+
 esp_err_t device_mcp_register(esp_mcp_t *mcp)
 {
     if (!mcp) {
         return ESP_ERR_INVALID_ARG;
     }
-    static const struct {
-        const char *name;
-        const char *description;
-        esp_mcp_tool_callback_ex_t callback;
-        bool volume_arg;
-    } tools[] = {
-        {"self.get_current_time", "Read device local time; synchronized=false means time is unavailable.", get_time,
-         false},
-        {"self.get_weather_forecast",
-         "Read cached five-day/21-hour forecast; no network. age: monotonic seconds; weather_code: WMO, "
-         "unmapped=unknown. "
-         "precip_probability: forecast percent, not observed rain. Hours: API order at fetch, each with local date "
-         "(YYYY-MM-DD) and hour. A repeated local hour may appear twice near a clock change.",
-         get_forecast, false},
-        {"self.get_sensor_reading", "Read actual local temperature/humidity; available=false means no valid reading.",
-         get_sensor, false},
-        {"self.get_device_status", "Read the device speaker's current volume (0–100).", get_device_status, false},
-        {"self.audio_speaker.set_volume", "Set and save the speaker volume as an integer from 0 to 100.", set_volume,
-         true},
-    };
-    for (size_t i = 0; i < sizeof(tools) / sizeof(tools[0]); i++) {
-        esp_mcp_tool_t *tool = esp_mcp_tool_create_ex(tools[i].name, NULL, tools[i].description, tools[i].callback);
+
+    for (size_t i = 0; i < sizeof(device_tools) / sizeof(device_tools[0]); i++) {
+        const struct device_tool_spec *spec = &device_tools[i];
+        esp_mcp_tool_t *tool = esp_mcp_tool_create_ex(spec->name, NULL, spec->description, spec->callback);
         if (!tool) {
             return ESP_ERR_NO_MEM;
         }
-        bool volume_arg = tools[i].volume_arg;
+        bool volume_arg = spec->volume_arg;
         esp_err_t err = esp_mcp_tool_set_annotations_json(
             tool,
             volume_arg

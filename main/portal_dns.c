@@ -4,6 +4,8 @@
 #include <stddef.h>
 
 #include "esp_netif.h"
+
+// dns_server.h uses the IP address type declared by esp_netif.h.
 #include "dns_server.h"
 
 static dns_server_handle_t dns_server;

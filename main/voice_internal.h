@@ -19,10 +19,10 @@
 #define VOICE_FIRST_AUDIO_TIMEOUT_MS 90000
 #define VOICE_RETRY_MS               30000
 // Bound on the first WebSocket connect; a wake during this window waits instead of failing.
-#define VOICE_CONNECT_TIMEOUT_MS     8000
-#define VOICE_POLL_MS                100
-#define VOICE_FOLLOWUP_MS            6000
-#define VOICE_FOLLOWUP_LOCK_MS       4000
+#define VOICE_CONNECT_TIMEOUT_MS 8000
+#define VOICE_POLL_MS            100
+#define VOICE_FOLLOWUP_MS        6000
+#define VOICE_FOLLOWUP_LOCK_MS   4000
 // Shorter poll while the reply plays so a wake word stops the speaker promptly.
 #define VOICE_PLAYBACK_POLL_MS 20
 #define WAKE_TASK_STACK        4096

@@ -21,8 +21,15 @@
 #define RETRY_MIN_S        5
 #define RETRY_MAX_S        60
 
-enum app_view { VIEW_DAILY, VIEW_HOURLY };
-enum app_phase { APP_PHASE_CONNECT, APP_PHASE_WEATHER };
+enum app_view {
+    VIEW_DAILY,
+    VIEW_HOURLY
+};
+
+enum app_phase {
+    APP_PHASE_CONNECT,
+    APP_PHASE_WEATHER
+};
 
 // Everything the button handlers need to repaint the current page.
 struct app_state {

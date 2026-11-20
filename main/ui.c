@@ -27,6 +27,7 @@
 #define HOUR_GRID_X ((PANEL_H - HOUR_COLS * HOUR_COL_W) / 2)
 
 #define CLOCK_LEFT 230
+
 static struct {
     char text[10];
     bool visible;

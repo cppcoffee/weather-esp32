@@ -223,7 +223,10 @@ static esp_err_t root_get(httpd_req_t *req)
     int n = scan_aps(aps, MAX_APS);
 
     // Two escaped copies of each 32-byte SSID plus the option markup fit in 8 KB.
-    enum { CAP = 8192 };
+    enum {
+        CAP = 8192
+    };
+
     char *options = calloc(1, CAP);
     if (!options) {
         return httpd_resp_send_500(req);
@@ -281,7 +284,10 @@ static esp_err_t reply(httpd_req_t *req, const char *title, const char *msg, boo
 
 static esp_err_t save_post(httpd_req_t *req)
 {
-    enum { BODY_CAP = 4096 };
+    enum {
+        BODY_CAP = 4096
+    };
+
     if (req->content_len == 0 || req->content_len >= BODY_CAP) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request body size");
     }
@@ -302,11 +308,9 @@ static esp_err_t save_post(httpd_req_t *req)
 
     char ssid[33], manual[33], pass[65];
     voice_settings_t settings = {.followup = 1};
-    bool valid = !memchr(body, 0, total)
-        && form_field(body, "ssid", ssid, sizeof(ssid))
-        && form_field(body, "ssid2", manual, sizeof(manual))
-        && form_field(body, "pass", pass, sizeof(pass))
-        && form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
+    bool valid = !memchr(body, 0, total) && form_field(body, "ssid", ssid, sizeof(ssid))
+                 && form_field(body, "ssid2", manual, sizeof(manual)) && form_field(body, "pass", pass, sizeof(pass))
+                 && form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
     free(body);
     if (!valid) {
         return reply(req, "表单无效", "请检查 WiFi 名称、密码和语音地址的长度后重试。", false);

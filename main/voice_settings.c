@@ -179,9 +179,7 @@ static bool valid_url(const char *url)
     if (memchr(url, '@', parsed.field_data[UF_HOST].off)) {
         return false;
     }
-    if (!field_equals(url, &parsed, UF_SCHEMA, "http")
-        && !field_equals(url, &parsed, UF_SCHEMA, "https"))
-    {
+    if (!field_equals(url, &parsed, UF_SCHEMA, "http") && !field_equals(url, &parsed, UF_SCHEMA, "https")) {
         return false;
     }
     return allowed_host(url, &parsed);
@@ -189,12 +187,10 @@ static bool valid_url(const char *url)
 
 esp_err_t voice_settings_validate(const voice_settings_t *settings)
 {
-    if (!settings || settings->followup > 1 || !memchr(settings->info_url, '\0', VOICE_URL_CAP))
-    {
+    if (!settings || settings->followup > 1 || !memchr(settings->info_url, '\0', VOICE_URL_CAP)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!valid_url(settings->info_url))
-    {
+    if (!valid_url(settings->info_url)) {
         return ESP_ERR_INVALID_ARG;
     }
     return ESP_OK;
