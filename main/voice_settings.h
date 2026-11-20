@@ -12,7 +12,7 @@
 
 typedef struct {
     char info_url[VOICE_URL_CAP];
-    uint8_t followup;
+    uint8_t followup; // Legacy NVS field retained for firmware compatibility.
 } voice_settings_t;
 
 // Only a missing namespace/key yields zeroed settings (未配置). Other errors leave

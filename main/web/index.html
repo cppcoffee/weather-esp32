@@ -3,71 +3,45 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>连接 WiFi</title>
+    <title>连接 Wi-Fi</title>
     <style>{{STYLE}}</style>
 </head>
 <body>
     <main>
-        <p class="kick">E-Paper Weather Panel</p>
-        <h1>连接 WiFi</h1>
-        <p class="sub">选一个网络，屏上就会显示当地天气。</p>
-        <hr>
+        <h1>连接 Wi-Fi</h1>
         <form method="post" action="/save">
-            <div class="f">
-                <span class="row">
-                    <span>可用网络</span>
-                    <a class="ghost" id="rescan" href="/">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round">
-                            <path d="M12 3a9 9 0 1 1-6.4 2.6" />
-                        </svg>
-                        重新扫描
-                    </a>
-                </span>
-                <div class="sel"><select name="ssid">{{OPTIONS}}</select></div>
+            <div class="row">
+                <label for="ssid">网络</label>
+                <a id="rescan" href="/">重新扫描</a>
             </div>
+            <select id="ssid" name="ssid">{{OPTIONS}}</select>
             <details>
-                <summary>找不到？手动输入名称</summary>
-                <div class="f">
-                    <input type="text" name="ssid2" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="WiFi 名称">
-                </div>
+                <summary>手动输入网络名称</summary>
+                <input type="text" name="ssid2" aria-label="网络名称" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Wi-Fi 名称">
             </details>
-            <div class="f">
-                <span>密码</span>
-                <div class="pw">
-                    <input id="pw" type="password" name="pass" autocomplete="off" placeholder="开放网络留空">
-                    <button class="eye" type="button" id="eye" aria-label="显示密码">
-                        <svg class="show" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
-                            <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z" />
-                            <circle cx="12" cy="12" r="3.1" />
-                        </svg>
-                        <svg class="hide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
-                            <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z" />
-                            <circle cx="12" cy="12" r="3.1" />
-                            <path d="M4 4l16 16" />
-                        </svg>
-                    </button>
-                </div>
+            <label for="pw">密码</label>
+            <div class="password">
+                <input id="pw" type="password" name="pass" autocomplete="off" placeholder="开放网络留空">
+                <button id="eye" type="button" aria-label="显示密码" hidden>
+                    <svg class="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                        <path d="M2 12s3.6-6.5 10-6.5 10 6.5 10 6.5-3.6 6.5-10 6.5S2 12 2 12Z"/>
+                        <circle cx="12" cy="12" r="3"/>
+                    </svg>
+                    <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+                        <path d="M10 5.7a10 10 0 0 1 2-.2c6.4 0 10 6.5 10 6.5a17 17 0 0 1-2.5 3.1m-2.7 2.2a9.8 9.8 0 0 1-4.8 1.2C5.6 18.5 2 12 2 12a17 17 0 0 1 4.1-4.4M3 3l18 18"/>
+                    </svg>
+                </button>
             </div>
-            <section class="voice" aria-labelledby="voice-title">
-                <h2 id="voice-title">小智语音</h2>
-                <div class="f">
-                    <label for="voice-url">服务信息地址（OTA）</label>
-                    <input type="url" name="voice_url" id="voice-url" required maxlength="255" value="{{VOICE_URL}}" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-url-help voice-host-help">
-                    <p class="hint" id="voice-url-help">必填，没有默认地址。xiaozhi-server-rs 使用：
-                        <code>http://PC局域网IP:8000/xiaozhi/ota/</code>
-                    </p>
-                </div>
-                <p class="hint" id="voice-host-help">请将 PC局域网IP 换成运行服务的电脑的局域网 IP，设备不能填写 localhost。</p>
-                <label class="followup">
-                    <input type="checkbox" name="voice_followup" value="1" {{VOICE_FOLLOWUP}}>
-                    回复后允许免唤醒追问（默认开启）
-                </label>
-                <p class="hint">播完后在约 6 秒内直接说话。检测到开口才上传音频。建议搭配支持连续追问的小智服务。</p>
+            <section aria-labelledby="voice-title">
+                <h2 id="voice-title">语音设置</h2>
+                <label for="voice-url">服务信息地址（OTA）</label>
+                <input type="url" name="voice_url" id="voice-url" required maxlength="255" value="{{VOICE_URL}}" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-url-help">
+                <p class="hint" id="voice-url-help">填写服务电脑的局域网地址，例如 <code>http://192.168.1.2:8000/xiaozhi/ota/</code></p>
             </section>
-            <button class="send" type="submit">保存并连接</button>
+            <button class="save" type="submit">保存并连接</button>
         </form>
-        <script>{{SCRIPT}}</script>
-        <footer>扫到 {{COUNT}} 个网络 · {{AP_URL}} · {{AP_SSID}}</footer>
+        <footer>{{AP_SSID}} · {{AP_URL}}</footer>
     </main>
+    <script>{{SCRIPT}}</script>
 </body>
 </html>

@@ -49,7 +49,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 | `main/voice.c` / `.h` | 小智会话生命周期、单轮与追问、Opus 编解码、AEC 打断后重新聆听 |
 | `main/voice_capture.c` / `.h` | 采集任务：I²S 读、AEC 前端、WakeNet、端点检测；只操作事件组 + 两个流缓冲 |
 | `main/voice_internal.h` | 两语音任务共享的采样格式、缓冲尺寸、事件位契约 |
-| `main/voice_settings.c` / `.h` | OTA 地址与追问开关的 NVS 存取、URL 校验 |
+| `main/voice_settings.c` / `.h` | OTA 地址的 NVS 存取、URL 校验 |
 | `main/voice_audio.c` / `.h` | 纯函数：立体声↔单声道（无 SDK 依赖，主机可测） |
 | `main/device_mcp.c` / `.h` | 发布屏幕同源快照，注册时间/天气/传感器/音量工具 |
 | `main/fonts_aa.c`、`main/font_clock.c`、`main/font_icons.c` | 生成的 1bpp 字模，勿手改 |
@@ -102,7 +102,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 - `voice_init()` 载模型建任务；联网后取配置建会话；返回激活码时复制到反馈快照（1–16 个无空格可打印 ASCII）并上屏/串口，等待绑定后重试，不打开未激活会话。challenge 激活未实现。
 - 唤醒：WakeNet（`esp-sr` 2.4.7 `wn9_xiaoluxiaolu_tts2`）只在本地；命中后才开麦上传。模型必须在 `model` 分区；无 PSRAM 时跳过语音。
 - 建连：`open_session()` 在 `chat_start` 后等 `ESP_XIAOZHI_CHAT_EVENT_CONNECTED`（≤ `VOICE_CONNECT_TIMEOUT_MS`），超时按失败重试——`chat ready` 表示套接字已通。断网/STA 停止后停止接收并清会话；快速恢复 IP 也要先清旧会话；普通断线保留激活码，重配网清除。
-- 追问（默认开启，配网页可关）：播放结束静音后开 6 s 本地 VAD 窗口；确认开口带 ≤120 ms 前滚，复用同一通道 `listen start/stop`；窗口内取数最多等 4 s（网络锁）。沉默退回待唤醒。
+- 追问（VAD 可用时自动启用）：播放结束静音后开 6 s 本地 VAD 窗口；确认开口带 ≤120 ms 前滚，复用同一通道 `listen start/stop`；窗口内取数最多等 4 s（网络锁）。沉默退回待唤醒。
 - 端点：本地 VAD 约 660 ms 静默结束录音，录音上限 15 s，随后发 `listen stop`；服务端收尾另行保留。
 - 播放：正常结束等 I²S DMA 尾帧（`AUDIO_PLAYBACK_TAIL_MS`）再静音；打断/断线/出错立即停。
 - AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考），参考信号是 `play_response()` 实际写入 I²S 的 PCM（`s_reference`，按写入顺序，不加延迟）。WakeNet 在 AFE 之外，检测 AEC 输出；播放期间保持 `ARMED`，命中后置 `VOICE_BIT_INTERRUPT`，由 `run_turn()` 静音、丢音频、发 `abort`(wake_word_detected)、同通道重新 `listen start`。AFE 失败则回退为播放期不检测。
@@ -117,7 +117,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 
 - 热点 `weather-XXXXXX`（开放），`192.168.1.1`，扫描或手填 SSID；凭据明文 HTTP 存 NVS，不先验证连接。不写编译期凭据、不提交真实密码。
 - 模板替换**不转义、不递归**；SSID 先 `html_escape()`。新增 token 同步替换表 + `test_portal.py`。
-- 表单字段：`ssid`/`ssid2`（手填优先）/`pass`/`voice_url`（必填）/`voice_followup`（`1` = 开，未保存过设置时按开）。服务设置与 WiFi 凭据同一 `wifi` NVS 事务；长按重配网只清 WiFi 部分。旧版只存 URL 的配置按追问开启处理。
+- 表单字段：`ssid`/`ssid2`（手填优先）/`pass`/`voice_url`（必填）。服务设置与 WiFi 凭据同一 `wifi` NVS 事务；长按重配网只清 WiFi 部分。旧版 NVS 中的追问开关值不影响运行行为。
 - `send_page()` 分块发送并内联 CSS/JS；结果页自包含（保存后热点即关闭）。改页面后跑 `test_portal.py` + ESP-IDF 构建。
 
 ## 屏幕驱动与刷新

@@ -183,7 +183,7 @@ static void xStreamBufferSend(int *buffer, const void *data, size_t len, TickTyp
     }
 }
 static bool voice_capture_has_aec(void) { return turn_case == BARGE; }
-static bool voice_capture_prepare_vad(void) { return true; }
+static bool voice_capture_prepare_vad(void) { return turn_case >= FOLLOWUP && turn_case != LOCAL_ENDPOINT; }
 esp_err_t audio_set_mute(bool mute) { muted = mute; return ESP_OK; }
 esp_err_t audio_write(void *data, size_t len, size_t *written) {
     const int16_t *pcm = data;
@@ -345,7 +345,7 @@ static int xQueueReceive(voice_packet_t *q, voice_packet_t *packet_out, TickType
 
 esp_err_t voice_settings_load(voice_settings_t *settings) {
     if (info_case != NO_SETTINGS) strcpy(settings->info_url, "https://fixture.invalid/info");
-    settings->followup = turn_case >= FOLLOWUP && turn_case != LOCAL_ENDPOINT;
+    settings->followup = 0; /* Older firmware had a switch; its saved value must be ignored. */
     return ESP_OK;
 }
 esp_err_t esp_xiaozhi_chat_get_info_with_url(const char *url, esp_xiaozhi_chat_info_t *info) {

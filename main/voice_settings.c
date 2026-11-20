@@ -200,7 +200,7 @@ esp_err_t voice_settings_validate(const voice_settings_t *settings)
     return ESP_OK;
 }
 
-// Follow-up listening is on unless the setup page explicitly turned it off.
+// Keep the legacy settings field enabled for compatibility with older firmware.
 static void voice_settings_defaults(voice_settings_t *settings)
 {
     memset(settings, 0, sizeof(*settings));

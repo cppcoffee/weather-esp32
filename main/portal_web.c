@@ -3,6 +3,7 @@
 #include "net.h"
 #include "voice_settings.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,40 +121,37 @@ static int addf(char *buf, size_t cap, int pos, const char *fmt, ...)
     return pos + n;
 }
 
-static int url_decode(char *s)
+// ESP-IDF extracts the complete encoded field. Apply the destination limit
+// after decoding, since each original byte can occupy three encoded bytes.
+static bool form_field(const char *body, const char *name, char *out, size_t cap)
 {
-    char *o = s;
-    for (char *p = s; *p; p++) {
-        if (*p == '+') {
-            *o++ = ' ';
-        } else if (*p == '%' && p[1] && p[2]) {
-            char hex[3] = {p[1], p[2], 0};
-            *o++ = (char)strtol(hex, NULL, 16);
-            p += 2;
-        } else {
-            *o++ = *p;
-        }
-    }
-    *o = 0;
-    return o - s;
-}
-
-static void form_field(const char *body, const char *name, char *out, size_t cap)
-{
-    char key[16];
-    snprintf(key, sizeof(key), "%s=", name);
-    const char *p = strstr(body, key);
+    char encoded[3 * (VOICE_URL_CAP - 1) + 1];
     out[0] = 0;
-    if (!p) {
-        return;
+    esp_err_t err = httpd_query_key_value(body, name, encoded, sizeof(encoded));
+    if (err != ESP_OK) {
+        return err == ESP_ERR_NOT_FOUND;
     }
-    p += strlen(key);
-    size_t i = 0;
-    while (*p && *p != '&' && i + 1 < cap) {
-        out[i++] = *p++;
+
+    size_t len = 0;
+    for (const char *p = encoded; *p; p++) {
+        unsigned char byte = *p;
+        if (byte == '+') {
+            byte = ' ';
+        } else if (byte == '%') {
+            if (!isxdigit((unsigned char)p[1]) || !isxdigit((unsigned char)p[2])) {
+                return false;
+            }
+            char hex[] = {p[1], p[2], 0};
+            byte = (unsigned char)strtoul(hex, NULL, 16);
+            p += 2;
+        }
+        if (!byte || len == cap - 1) {
+            return false;
+        }
+        out[len++] = (char)byte;
     }
-    out[i] = 0;
-    url_decode(out);
+    out[len] = 0;
+    return true;
 }
 
 // Text assets are NUL-terminated by EMBED_TXTFILES. Inline CSS/JS in the response so
@@ -251,7 +249,6 @@ static esp_err_t root_get(httpd_req_t *req)
         return httpd_resp_send_500(req);
     }
 
-    char count[12];
     char escaped_voice_url[VOICE_URL_CAP * 6];
     voice_settings_t settings = {0};
     if (voice_settings_load(&settings) != ESP_OK) {
@@ -259,16 +256,13 @@ static esp_err_t root_get(httpd_req_t *req)
         memset(&settings, 0, sizeof(settings));
     }
     html_escape(settings.info_url, escaped_voice_url, sizeof(escaped_voice_url));
-    snprintf(count, sizeof(count), "%d", n);
     const page_value_t values[] = {
         {"{{STYLE}}", portal_style},
         {"{{SCRIPT}}", portal_script},
         {"{{OPTIONS}}", options},
-        {"{{COUNT}}", count},
         {"{{AP_URL}}", NET_AP_URL},
         {"{{AP_SSID}}", own},
         {"{{VOICE_URL}}", escaped_voice_url},
-        {"{{VOICE_FOLLOWUP}}", settings.followup ? "checked" : ""},
     };
     esp_err_t err = send_page(req, portal_index, values, sizeof(values) / sizeof(values[0]));
     free(options);
@@ -292,48 +286,51 @@ static esp_err_t reply(httpd_req_t *req, const char *title, const char *msg, boo
 static esp_err_t save_post(httpd_req_t *req)
 {
     enum { BODY_CAP = 4096 };
-    char body[BODY_CAP];
-    if (req->content_len <= 0 || req->content_len >= BODY_CAP) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "request body too large");
+    if (req->content_len == 0 || req->content_len >= BODY_CAP) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid request body size");
     }
-    int total = 0;
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        return httpd_resp_send_500(req);
+    }
+    size_t total = 0;
     while (total < req->content_len) {
         int received = httpd_req_recv(req, body + total, req->content_len - total);
         if (received <= 0) {
+            free(body);
             return httpd_resp_send_500(req);
         }
         total += received;
     }
     body[total] = 0;
 
-    // 列表里选的和手动输入的二选一，手填的优先。
     char ssid[33], manual[33], pass[65];
-    form_field(body, "ssid", ssid, sizeof(ssid));
-    form_field(body, "ssid2", manual, sizeof(manual));
-    form_field(body, "pass", pass, sizeof(pass));
-    if (manual[0]) {
-        memcpy(ssid, manual, sizeof(ssid));
+    voice_settings_t settings = {.followup = 1};
+    bool valid = !memchr(body, 0, total)
+        && form_field(body, "ssid", ssid, sizeof(ssid))
+        && form_field(body, "ssid2", manual, sizeof(manual))
+        && form_field(body, "pass", pass, sizeof(pass))
+        && form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
+    free(body);
+    if (!valid) {
+        return reply(req, "表单无效", "请检查 WiFi 名称、密码和语音地址的长度后重试。", false);
     }
-    if (strlen(ssid) < 1) {
+
+    // 列表里选的和手动输入的二选一，手填的优先。
+    const char *network = manual[0] ? manual : ssid;
+    if (!network[0]) {
         return reply(req, "没选网络", "回去选一个网络，或者手动输入名称。", false);
+    }
+
+    if (voice_settings_validate(&settings) != ESP_OK) {
+        return reply(req, "语音地址无效", "请填写服务信息地址（OTA），例如 http://PC局域网IP:8000/xiaozhi/ota/", false);
     }
 
     nvs_handle_t h;
     if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) {
         return httpd_resp_send_500(req);
     }
-    // 信息地址必填：固件没有内置默认 OTA 地址
-    voice_settings_t settings = {0};
-    form_field(body, "voice_url", settings.info_url, sizeof(settings.info_url));
-    char followup[8];
-    form_field(body, "voice_followup", followup, sizeof(followup));
-    settings.followup = strcmp(followup, "1") == 0;
-    esp_err_t voice_err = voice_settings_validate(&settings);
-    if (voice_err != ESP_OK) {
-        nvs_close(h);
-        return reply(req, "语音地址无效", "请填写服务信息地址（OTA），例如 http://PC局域网IP:8000/xiaozhi/ota/", false);
-    }
-    esp_err_t err = nvs_set_str(h, "ssid", ssid);
+    esp_err_t err = nvs_set_str(h, "ssid", network);
     if (err == ESP_OK) {
         err = nvs_set_str(h, "pass", pass);
     }
@@ -349,7 +346,7 @@ static esp_err_t save_post(httpd_req_t *req)
         return httpd_resp_send_500(req);
     }
 
-    ESP_LOGI(TAG, "stored credentials for %s", ssid);
+    ESP_LOGI(TAG, "stored credentials for %s", network);
     reply(req, "正在连接", "保存好了，屏幕稍后显示天气。", true);
     xEventGroupSetBits(portal_events(), CREDS_SAVED);
     return ESP_OK;

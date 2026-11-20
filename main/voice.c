@@ -278,8 +278,8 @@ static esp_err_t open_session(void)
         err = ESP_FAIL;
         goto failed;
     }
-    s_followup_enabled = settings.followup && voice_capture_prepare_vad();
-    if (settings.followup && !s_followup_enabled) {
+    s_followup_enabled = voice_capture_prepare_vad();
+    if (!s_followup_enabled) {
         ESP_LOGW(TAG, "follow-up VAD unavailable; waiting for wake word");
     }
     ESP_LOGI(TAG, "chat ready; internal heap free=%u, largest=%u",

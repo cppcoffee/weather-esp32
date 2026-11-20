@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Host regression for portal_web.c's real portal rendering functions and web assets.
+"""Host regression for portal rendering and credential submission.
 
-Only Python's standard library and cc/clang/gcc are required. Generated C and the
-executable live in TemporaryDirectory. HTTP, scanning and AP identity are stubs;
-this does not test browsers, JavaScript execution, ESP-IDF embedding/linking,
-WiFi, credential saving, captive-portal discovery or hardware behavior.
+Uses a host C compiler and the query parser from the ESP-IDF checkout (IDF_PATH).
+HTTP, NVS and WiFi operations are stubbed. Browser and hardware behavior are
+outside the scope of this test.
 
     python3 tools/test_portal.py
 """
 
 import html
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
 OWN = "weather-A1B2C3"
@@ -40,6 +41,8 @@ def function(source, name):
 
 STUBS = r'''
 #include <assert.h>
+#include <ctype.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -49,6 +52,12 @@ STUBS = r'''
 #include <sys/types.h>
 #define ESP_OK 0
 #define ESP_FAIL -1
+#define ESP_ERR_INVALID_ARG -2
+#define ESP_ERR_NOT_FOUND -3
+#define ESP_ERR_HTTPD_RESULT_TRUNC -4
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define ESP_LOGD(...) ((void)0)
+#define ESP_LOGI(...) ((void)0)
 #define SEND_ERROR -73
 #define HTTPD_RESP_USE_STRLEN -1
 #define HTTPD_400_BAD_REQUEST 400
@@ -58,7 +67,8 @@ typedef int esp_err_t;
 typedef struct {
     char body[131072];
     size_t used;
-    int content_len;
+    size_t content_len, read_offset;
+    const char *input;
     const char *status, *type;
     int calls, fail_at, finished;
 } httpd_req_t;
@@ -114,11 +124,9 @@ typedef struct {
     char info_url[256];
     unsigned char followup;
 } voice_settings_t;
-static bool followup;
 static int voice_settings_load(voice_settings_t *settings)
 {
     memset(settings, 0, sizeof(*settings));
-    settings->followup = followup;
     return 0;
 }
 static __attribute__((unused)) int voice_settings_validate(const voice_settings_t *settings)
@@ -139,10 +147,61 @@ static int scan_aps(scan_ap_t *out, int max)
 static const char *net_ap_ssid(void) { return "weather-A1B2C3"; }
 '''
 
+SAVE_STUBS = r'''
+#define NVS_READWRITE 1
+#define CREDS_SAVED 1
+typedef int nvs_handle_t;
+static int opened, committed, signaled, closed;
+static char saved_ssid[33], saved_pass[65];
+static voice_settings_t saved_settings;
+
+static int httpd_req_recv(httpd_req_t *r, char *dst, size_t len)
+{
+    assert(r->read_offset + len == r->content_len);
+    len = MIN(len, 7);
+    memcpy(dst, r->input + r->read_offset, len);
+    r->read_offset += len;
+    return (int)len;
+}
+static int nvs_open(const char *name, int mode, nvs_handle_t *h)
+{
+    assert(!strcmp(name, "wifi") && mode == NVS_READWRITE);
+    *h = ++opened;
+    return ESP_OK;
+}
+static int nvs_set_str(nvs_handle_t h, const char *key, const char *value)
+{
+    assert(h == 1);
+    if (!strcmp(key, "ssid")) {
+        assert(strlen(value) < sizeof(saved_ssid));
+        strcpy(saved_ssid, value);
+    } else {
+        assert(!strcmp(key, "pass") && strlen(value) < sizeof(saved_pass));
+        strcpy(saved_pass, value);
+    }
+    return ESP_OK;
+}
+static int voice_settings_store(nvs_handle_t h, const voice_settings_t *settings)
+{
+    assert(h == 1);
+    saved_settings = *settings;
+    return ESP_OK;
+}
+static int nvs_commit(nvs_handle_t h) { assert(h == 1); committed++; return ESP_OK; }
+static void nvs_close(nvs_handle_t h) { assert(h == 1); closed++; }
+static int portal_events(void) { return 1; }
+static void xEventGroupSetBits(int event, int bits)
+{
+    assert(event == 1 && bits == CREDS_SAVED && committed == 1);
+    signaled++;
+}
+'''
+
+
 RUNNER = r'''
 static esp_err_t invoke(httpd_req_t *r, int argc, char **argv)
 {
-    if (!strcmp(argv[1], "root") || !strcmp(argv[1], "root-followup")) return root_get(r);
+    if (!strcmp(argv[1], "root")) return root_get(r);
     if (!strcmp(argv[1], "reply")) {
         assert(argc == 5);
         return reply(r, argv[3], argv[4], !strcmp(argv[2], "ok"));
@@ -156,12 +215,28 @@ static esp_err_t invoke(httpd_req_t *r, int argc, char **argv)
 int main(int argc, char **argv)
 {
     assert(argc >= 2);
-    if (!strcmp(argv[1], "root") || !strcmp(argv[1], "root-followup")) {
-        followup = !strcmp(argv[1], "root-followup");
+    if (!strcmp(argv[1], "root")) {
         input_count = argc - 2;
         input_ssids = argv + 2;
     }
     httpd_req_t good = {.status = "200 OK"};
+    if (!strcmp(argv[1], "save")) {
+        assert(argc == 3 || argc == 6);
+        good.input = argv[2];
+        good.content_len = strlen(good.input);
+        assert(save_post(&good) == ESP_OK && good.finished == 1);
+        if (argc == 3) {
+            assert(!strcmp(good.status, "400 Bad Request"));
+            assert(!opened && !committed && !closed && !signaled);
+        } else {
+            assert(!strcmp(good.status, "200 OK"));
+            assert(opened == 1 && committed == 1 && closed == 1 && signaled == 1);
+            assert(!strcmp(saved_ssid, argv[3]) && !strcmp(saved_pass, argv[4]));
+            assert(!strcmp(saved_settings.info_url, argv[5]));
+            assert(saved_settings.followup == 1);
+        }
+        return 0;
+    }
     assert(invoke(&good, argc, argv) == ESP_OK);
     assert(good.finished == 1);
     assert(good.type && !strcmp(good.type, "text/html; charset=utf-8"));
@@ -206,10 +281,16 @@ def build_harness(directory, assets):
         extract(source, r"(^typedef struct \{[^{}]*\} scan_ap_t;)"),
         extract(source, r"(^typedef struct \{[^{}]*\} page_value_t;)"),
     ]
+    idf = Path(os.environ.get("IDF_PATH", Path.home() / ".espressif/v6.0.2/esp-idf"))
+    parser = idf / "components/esp_http_server/src/httpd_parse.c"
+    assert parser.is_file(), "Set IDF_PATH to the ESP-IDF checkout used to build the firmware"
+    query_parser = extract(
+        parser.read_text(), r"(^esp_err_t httpd_query_key_value\([^\n]*\)\n\{\n.*?^\})"
+    )
     code = "\n".join([
-        STUBS, ap_url, *declarations, SCAN_STUB, *definitions,
+        STUBS, ap_url, *declarations, SCAN_STUB, SAVE_STUBS, query_parser, *definitions,
         *(function(source, name) for name in
-          ("html_escape", "addf", "send_page", "root_get", "reply")), RUNNER,
+          ("html_escape", "addf", "form_field", "send_page", "root_get", "reply", "save_post")), RUNNER,
     ])
     path = directory / "portal.c"
     path.write_text(code, encoding="utf-8")
@@ -259,8 +340,8 @@ class Page(HTMLParser):
 def check_assets(assets):
     expected = {
         "index.html": {
-                "STYLE", "SCRIPT", "OPTIONS", "COUNT", "AP_URL", "AP_SSID",
-                "VOICE_URL", "VOICE_FOLLOWUP",
+                "STYLE", "SCRIPT", "OPTIONS", "AP_URL", "AP_SSID",
+                "VOICE_URL",
             },
         "result.html": {"STYLE", "TITLE", "MESSAGE"},
         "style.css": set(), "app.js": set(),
@@ -282,26 +363,23 @@ def run(executable, *args):
     return status, body
 
 
-def check_root(executable, assets, ap_url, ssids, followup=False):
-    status, body = run(executable, "root-followup" if followup else "root", *ssids)
+def check_root(executable, assets, ap_url, ssids):
+    status, body = run(executable, "root", *ssids)
     assert status == "200 OK"
     page = Page(body)
     assert page.sections["style"] == [assets["style.css"]]
     assert page.sections["script"] == [assets["app.js"]]
-    assert page.sections["footer"] == [f"扫到 {len(ssids)} 个网络 · {ap_url} · {OWN}"]
+    assert page.sections["footer"] == [f"{OWN} · {ap_url}"]
     forms = [a for tag, a in page.elements if tag == "form"]
     assert len(forms) == 1 and forms[0].get("method", "").lower() == "post"
     assert forms[0].get("action") == "/save"
     fields = {a.get("name"): (tag, a) for tag, a in page.elements if tag in {"input", "select"}}
-    assert set(fields) == {"ssid", "ssid2", "pass", "voice_url", "voice_followup"}
+    assert set(fields) == {"ssid", "ssid2", "pass", "voice_url"}
     assert fields["ssid"][0] == "select"
     assert(fields["ssid2"][1].get("type") == "text")
     assert(fields["pass"][1].get("type") == "password")
     assert(fields["voice_url"][1].get("type") == "url")
     assert "required" in fields["voice_url"][1]
-    assert fields["voice_followup"][1]["type"] == "checkbox"
-    assert fields["voice_followup"][1]["value"] == "1"
-    assert ("checked" in fields["voice_followup"][1]) == followup
     assert any(tag == "button" and a.get("type") == "submit" for tag, a in page.elements)
     wifi_options = [(attrs, text) for attrs, text in page.options]
     shown = [ssid for ssid in ssids if ssid != OWN]
@@ -321,6 +399,35 @@ def check_root(executable, assets, ap_url, ssids, followup=False):
         assert "没扫到网络" in text
 
 
+
+def check_save(executable):
+    url = "http://192.168.1.2:8000/xiaozhi/ota/"
+    max_url = url + "x" * (255 - len(url))
+    utf8_ssid = "天气" * 5 + "AB"
+    password = "p + % & ssid=intruder"
+    for pairs, expected in (
+        ([("other", "ignored"), ("xssid", "fake"), ("ssid", utf8_ssid),
+          ("pass", password), ("voice_url", url)],
+         (utf8_ssid, password, url)),
+        ([("ssid", "Selected"), ("ssid2", "Manual +%&"), ("voice_url", url)],
+         ("Manual +%&", "", url)),
+        ([("ssid", "A" * 32), ("pass", "+" * 64), ("voice_url", max_url)],
+         ("A" * 32, "+" * 64, max_url)),
+    ):
+        subprocess.run([executable, "save", urlencode(pairs), *expected], check=True, timeout=5)
+
+    url_field = urlencode({"voice_url": url})
+    for malformed in (
+        "other=ssid=wrong", "xssid=wrong", "ssid=", "ssid=bad%",
+        "ssid=bad%2", "ssid=bad%GG", "ssid=bad%00suffix",
+        "ssid=" + "X" * 33, "ssid=valid&pass=" + "%2B" * 65,
+    ):
+        subprocess.run([executable, "save", f"{malformed}&{url_field}"], check=True, timeout=5)
+    oversized_url = urlencode({"ssid": "Home", "voice_url": max_url + "x"})
+    subprocess.run([executable, "save", oversized_url], check=True, timeout=5)
+    print("PASS save: fragmented body, decoded byte limits, exact keys, manual SSID and voice options")
+    print("PASS save: malformed input rejected before NVS")
+
 def main():
     assets = {name: (ROOT / "main/web" / name).read_text(encoding="utf-8") for name in ASSETS.values()}
     check_assets(assets)
@@ -335,11 +442,10 @@ def main():
     }
     with tempfile.TemporaryDirectory(prefix="weather-portal-") as temp:
         executable, ap_url = build_harness(Path(temp), assets)
+        check_save(executable)
         for label, ssids in cases.items():
             check_root(executable, assets, ap_url, ssids)
             print(f"PASS root: {label}")
-        check_root(executable, assets, ap_url, [], followup=True)
-        print("PASS root: saved follow-up checkbox")
         for ok, status in (("ok", "200 OK"), ("bad", "400 Bad Request")):
             title, message = "配置结果", "已保存，请等待连接。" if ok == "ok" else "请输入 WiFi 名称。"
             actual, body = run(executable, "reply", ok, title, message)
