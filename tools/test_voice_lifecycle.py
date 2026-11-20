@@ -106,12 +106,13 @@ enum { WIFI_EVENT_STA_START, WIFI_EVENT_STA_DISCONNECTED, WIFI_EVENT_STA_STOP, I
 typedef int esp_event_base_t;
 #define GOT_IP 1u
 static EventBits_t wifi_events;
+static EventBits_t *sta_events = &wifi_events;
 static EventBits_t events;
 static unsigned wifi_connects;
 static void esp_wifi_connect(void) { wifi_connects++; }
 static void start_time_sync(void);
-static atomic_bool s_time_synced;
-static bool s_sntp_initialized;
+static atomic_bool time_synced;
+static bool sntp_initialized;
 static unsigned sntp_starts, sntp_inits;
 static void (*sntp_callback)(struct timeval *);
 typedef struct {
@@ -132,14 +133,21 @@ static esp_err_t esp_netif_sntp_start(void) {
     sntp_starts++;
     return ESP_OK;
 }
-static EventBits_t *s_events = &events;
+static EventBits_t *voice_events = &events;
 static int lock_token, queue_token;
-static void *s_network_lock = &lock_token, *s_rx_queue = &queue_token;
-static esp_xiaozhi_chat_handle_t s_chat, live_chat;
-static esp_mcp_t *s_mcp, *live_mcp;
-static OpusEncoder *s_encoder, *live_encoder;
-static OpusDecoder *s_decoder, *live_decoder;
-static bool s_cleanup_pending, locked, stopped, wake_on_wait, muted = true;
+static void *network_lock = &lock_token, *rx_audio_queue = &queue_token;
+static struct {
+    esp_xiaozhi_chat_handle_t chat;
+    esp_mcp_t *mcp;
+    OpusEncoder *encoder;
+    OpusDecoder *decoder;
+    bool cleanup_pending;
+} session;
+static esp_xiaozhi_chat_handle_t live_chat;
+static esp_mcp_t *live_mcp;
+static OpusEncoder *live_encoder;
+static OpusDecoder *live_decoder;
+static bool locked, stopped, wake_on_wait, muted = true;
 static int opens, stops, deinits, mcp_destroys, encoder_destroys, decoder_destroys;
 static int turns, takes, gives, waits, delays, failures_left;
 static bool deinit_error;
@@ -201,17 +209,17 @@ static void expect_state(const struct step *step)
     CHECK(opens == step->opens && stops == step->stops && turns == step->turns);
     CHECK(deinits == step->disposed && mcp_destroys == step->disposed);
     CHECK(encoder_destroys == step->disposed && decoder_destroys == step->disposed);
-    CHECK(s_cleanup_pending == step->pending && events == step->bits);
+    CHECK(session.cleanup_pending == step->pending && events == step->bits);
     CHECK(muted);
     bool live = step->opens != step->disposed;
-    CHECK((s_chat != 0) == live && s_chat == live_chat);
-    CHECK((s_mcp != NULL) == live && s_mcp == live_mcp);
-    CHECK((s_encoder != NULL) == live && s_encoder == live_encoder);
-    CHECK((s_decoder != NULL) == live && s_decoder == live_decoder);
+    CHECK((session.chat != 0) == live && session.chat == live_chat);
+    CHECK((session.mcp != NULL) == live && session.mcp == live_mcp);
+    CHECK((session.encoder != NULL) == live && session.encoder == live_encoder);
+    CHECK((session.decoder != NULL) == live && session.decoder == live_decoder);
     if (live) {
         CHECK(!stopped);
-        CHECK(s_chat == (unsigned)opens && s_mcp->generation == s_chat);
-        CHECK(s_encoder->generation == s_chat && s_decoder->generation == s_chat);
+        CHECK(session.chat == (unsigned)opens && session.mcp->generation == session.chat);
+        CHECK(session.encoder->generation == session.chat && session.decoder->generation == session.chat);
     }
 }
 
@@ -239,7 +247,7 @@ static void outer_boundary(void)
         break;
     case GOODBYE:
         /* Inject callback fact, not a copy of on_server_goodbye or capture_task. */
-        xEventGroupSetBits(s_events, VOICE_BIT_HANGUP | VOICE_BIT_RECEIVING);
+        xEventGroupSetBits(voice_events, VOICE_BIT_HANGUP | VOICE_BIT_RECEIVING);
         break;
     case PAUSE:
         voice_net_pause();
@@ -248,7 +256,7 @@ static void outer_boundary(void)
         CHECK(events & VOICE_BIT_RESET);
         break;
     case WAKE:
-        CHECK((events & VOICE_BIT_ARMED) && !s_cleanup_pending);
+        CHECK((events & VOICE_BIT_ARMED) && !session.cleanup_pending);
         wake_on_wait = true;
         break;
     case IDLE:
@@ -293,8 +301,8 @@ static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask,
         if (wake_on_wait) {
             /* Emulate only the capture task's event handoff, not WakeNet detection. */
             CHECK(events & VOICE_BIT_ARMED);
-            xEventGroupClearBits(s_events, VOICE_BIT_ARMED);
-            xEventGroupSetBits(s_events, VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE);
+            xEventGroupClearBits(voice_events, VOICE_BIT_ARMED);
+            xEventGroupSetBits(voice_events, VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE);
             wake_on_wait = false;
         }
     }
@@ -303,7 +311,7 @@ static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask,
 
 static int xSemaphoreTake(void *lock, TickType_t timeout)
 {
-    CHECK(lock == s_network_lock && !locked && timeout == pdMS_TO_TICKS(VOICE_POLL_MS));
+    CHECK(lock == network_lock && !locked && timeout == pdMS_TO_TICKS(VOICE_POLL_MS));
     locked = true;
     takes++;
     return pdTRUE;
@@ -311,7 +319,7 @@ static int xSemaphoreTake(void *lock, TickType_t timeout)
 
 static int xSemaphoreGive(void *lock)
 {
-    CHECK(lock == s_network_lock && locked);
+    CHECK(lock == network_lock && locked);
     locked = false;
     gives++;
     return pdTRUE;
@@ -325,7 +333,7 @@ static void vTaskDelay(TickType_t ticks)
 
 static int xQueueReset(void *queue)
 {
-    CHECK(queue == s_rx_queue && locked);
+    CHECK(queue == rx_audio_queue && locked);
     return pdTRUE;
 }
 
@@ -338,24 +346,24 @@ static esp_err_t audio_set_mute(bool mute)
 
 static esp_err_t open_session(void)
 {
-    CHECK(locked && network_ready() && !s_cleanup_pending);
-    CHECK(!s_chat && !s_mcp && !s_encoder && !s_decoder && !live_chat);
+    CHECK(locked && network_ready() && !session.cleanup_pending);
+    CHECK(!session.chat && !session.mcp && !session.encoder && !session.decoder && !live_chat);
     CHECK(!live_mcp && !live_encoder && !live_decoder);
-    s_mcp = live_mcp = calloc(1, sizeof(*s_mcp));
-    s_encoder = live_encoder = calloc(1, sizeof(*s_encoder));
-    s_decoder = live_decoder = calloc(1, sizeof(*s_decoder));
-    CHECK(s_mcp && s_encoder && s_decoder);
-    s_chat = live_chat = (unsigned)++opens;
-    s_mcp->generation = s_encoder->generation = s_decoder->generation = s_chat;
+    session.mcp = live_mcp = calloc(1, sizeof(*session.mcp));
+    session.encoder = live_encoder = calloc(1, sizeof(*session.encoder));
+    session.decoder = live_decoder = calloc(1, sizeof(*session.decoder));
+    CHECK(session.mcp && session.encoder && session.decoder);
+    session.chat = live_chat = (unsigned)++opens;
+    session.mcp->generation = session.encoder->generation = session.decoder->generation = session.chat;
     stopped = false;
     return ESP_OK;
 }
 
 static esp_err_t run_turn(void)
 {
-    CHECK(locked && network_ready() && !s_cleanup_pending);
-    CHECK(s_chat && s_chat == live_chat && !stopped && s_mcp == live_mcp);
-    CHECK(s_encoder && s_decoder && (events & VOICE_BIT_CAPTURE));
+    CHECK(locked && network_ready() && !session.cleanup_pending);
+    CHECK(session.chat && session.chat == live_chat && !stopped && session.mcp == live_mcp);
+    CHECK(session.encoder && session.decoder && (events & VOICE_BIT_CAPTURE));
     turns++;
     if (drop_in_turn) {
         drop_in_turn = false;
@@ -364,16 +372,16 @@ static esp_err_t run_turn(void)
         CHECK(!network_ready() && (events & VOICE_BIT_RESET));
         return ESP_FAIL;
     }
-    xEventGroupSetBits(s_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED);
+    xEventGroupSetBits(voice_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED);
     return ESP_OK;
 }
 
 static esp_err_t esp_xiaozhi_chat_stop(esp_xiaozhi_chat_handle_t chat)
 {
-    CHECK(locked && chat && chat == s_chat && chat == live_chat && !stopped);
+    CHECK(locked && chat && chat == session.chat && chat == live_chat && !stopped);
     CHECK(!(events & VOICE_BIT_RECEIVING));
-    CHECK(s_mcp && s_mcp == live_mcp && s_encoder && s_encoder == live_encoder);
-    CHECK(s_decoder && s_decoder == live_decoder);
+    CHECK(session.mcp && session.mcp == live_mcp && session.encoder && session.encoder == live_encoder);
+    CHECK(session.decoder && session.decoder == live_decoder);
     stops++;
     if (failures_left > 0) {
         failures_left--;
@@ -385,9 +393,9 @@ static esp_err_t esp_xiaozhi_chat_stop(esp_xiaozhi_chat_handle_t chat)
 
 static esp_err_t esp_xiaozhi_chat_deinit(esp_xiaozhi_chat_handle_t chat)
 {
-    CHECK(locked && stopped && chat && chat == s_chat && chat == live_chat);
-    CHECK(s_mcp == live_mcp && s_encoder == live_encoder && s_decoder == live_decoder);
-    CHECK(s_mcp && s_encoder && s_decoder);
+    CHECK(locked && stopped && chat && chat == session.chat && chat == live_chat);
+    CHECK(session.mcp == live_mcp && session.encoder == live_encoder && session.decoder == live_decoder);
+    CHECK(session.mcp && session.encoder && session.decoder);
     deinits++;
     live_chat = 0; /* Contract: consumed even if deinit reports an error. */
     return deinit_error ? ESP_FAIL : ESP_OK;
@@ -395,8 +403,8 @@ static esp_err_t esp_xiaozhi_chat_deinit(esp_xiaozhi_chat_handle_t chat)
 
 static esp_err_t esp_mcp_destroy(esp_mcp_t *mcp)
 {
-    CHECK(locked && stopped && !live_chat && !s_chat && !s_cleanup_pending);
-    CHECK(mcp && mcp == s_mcp && mcp == live_mcp);
+    CHECK(locked && stopped && !live_chat && !session.chat && !session.cleanup_pending);
+    CHECK(mcp && mcp == session.mcp && mcp == live_mcp);
     free(mcp);
     live_mcp = NULL;
     mcp_destroys++;
@@ -405,8 +413,8 @@ static esp_err_t esp_mcp_destroy(esp_mcp_t *mcp)
 
 static void opus_encoder_destroy(OpusEncoder *encoder)
 {
-    CHECK(locked && !live_chat && !live_mcp && !s_mcp);
-    CHECK(encoder && encoder == s_encoder && encoder == live_encoder);
+    CHECK(locked && !live_chat && !live_mcp && !session.mcp);
+    CHECK(encoder && encoder == session.encoder && encoder == live_encoder);
     free(encoder);
     live_encoder = NULL;
     encoder_destroys++;
@@ -414,8 +422,8 @@ static void opus_encoder_destroy(OpusEncoder *encoder)
 
 static void opus_decoder_destroy(OpusDecoder *decoder)
 {
-    CHECK(locked && !live_chat && !live_mcp && !live_encoder && !s_encoder);
-    CHECK(decoder && decoder == s_decoder && decoder == live_decoder);
+    CHECK(locked && !live_chat && !live_mcp && !live_encoder && !session.encoder);
+    CHECK(decoder && decoder == session.decoder && decoder == live_decoder);
     free(decoder);
     live_decoder = NULL;
     decoder_destroys++;
@@ -499,12 +507,12 @@ int main(int argc, char **argv)
     CHECK(failures >= 0 && failures <= 2);
     failures_left = failures;
     deinit_error = atoi(argv[3]) != 0;
-    s_events = NULL;
+    voice_events = NULL;
     voice_net_pause();
     voice_net_ready();
     voice_net_set_connected(true);
     CHECK(events == 0); /* No-op when voice_init never created events. */
-    s_events = &events;
+    voice_events = &events;
     wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
     wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
     CHECK(wifi_events == GOT_IP && events == VOICE_BIT_NET && !network_ready());
@@ -526,8 +534,8 @@ int main(int argc, char **argv)
     make_script(argv[1], failures);
     if (setjmp(finished) == 0) voice_task(NULL);
     CHECK(current == script_count && !locked && takes == gives && failures_left == 0);
-    CHECK(deinits == 2 && !s_chat && !live_chat && !s_cleanup_pending);
-    CHECK(!s_mcp && !s_encoder && !s_decoder && events == 0);
+    CHECK(deinits == 2 && !session.chat && !live_chat && !session.cleanup_pending);
+    CHECK(!session.mcp && !session.encoder && !session.decoder && events == 0);
     CHECK(delays == failures);
     printf("PASS %-11s stop_failures=%d deinit_error=%d (%d iterations, %d balanced lock pairs)\n",
            argv[1], failures, deinit_error, script_count, takes);
@@ -565,7 +573,6 @@ def main():
         ("bool net_time_is_synced(void)", "static void start_time_sync(void)"),
         ("static void start_time_sync(void)", "int net_http_get(const char *url, char *buf, size_t cap)"),
     ))
-    handler = "#define s_events (&wifi_events)\n" + handler + "\n#undef s_events\n"
     print("Extracting unchanged source (not the whole voice.c):", flush=True)
     for entry in ranges + net_ranges:
         print(f"  {entry}", flush=True)

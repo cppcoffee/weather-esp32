@@ -20,21 +20,24 @@ STUBS = r'''
 typedef int esp_err_t, nvs_handle_t;
 enum { ESP_OK, ESP_FAIL, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE };
 enum { NVS_READONLY, NVS_READWRITE, portMAX_DELAY = 1000 };
-static bool s_ready, locked, opened;
-static int s_control_lock, s_codec, s_volume;
+static struct {
+    int control_lock, codec, volume;
+    bool ready;
+} audio_device;
+static bool locked, opened;
 static int codec_volume, saved = -1, pending = -1;
 static bool fail_codec, fail_open, fail_set, fail_commit;
 
 static void xSemaphoreTake(int lock, int ticks) {
-    assert(lock == s_control_lock && ticks == portMAX_DELAY && !locked);
+    assert(lock == audio_device.control_lock && ticks == portMAX_DELAY && !locked);
     locked = true;
 }
 static void xSemaphoreGive(int lock) {
-    assert(lock == s_control_lock && locked && !opened);
+    assert(lock == audio_device.control_lock && locked && !opened);
     locked = false;
 }
 static int esp_codec_dev_set_out_vol(int codec, int volume) {
-    assert(codec == s_codec && locked && opened);
+    assert(codec == audio_device.codec && locked && opened);
     if (fail_codec) return ESP_FAIL;
     codec_volume = volume;
     return ESP_OK;
@@ -81,8 +84,8 @@ int main(void) {
     assert(load_volume() == AUDIO_DEFAULT_VOLUME);
     saved = 255;
     assert(load_volume() == AUDIO_DEFAULT_VOLUME);
-    s_ready = true;
-    codec_volume = s_volume = load_volume();
+    audio_device.ready = true;
+    codec_volume = audio_device.volume = load_volume();
     assert(audio_get_volume(NULL) == ESP_ERR_INVALID_ARG);
     assert(audio_set_volume(-1) == ESP_ERR_INVALID_ARG);
     assert(audio_set_volume(101) == ESP_ERR_INVALID_ARG);

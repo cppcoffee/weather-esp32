@@ -10,7 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const char *TAG = "epd";
+static const char *log_tag = "epd";
 
 #define ROW_BYTES (PANEL_W / 8)
 #define FB_SIZE   (ROW_BYTES * PANEL_H) // 4736 bytes, 1 = white, 0 = black
@@ -34,13 +34,13 @@ static const uint8_t ws_partial[LUT_BYTES] = {
     [67] = 0x01, [74] = 0x01, [144] = 0x22, [145] = 0x22, [146] = 0x22, [147] = 0x22, [148] = 0x22, [149] = 0x22,
 };
 
-static uint8_t fb[FB_SIZE];
-static spi_device_handle_t spi;
+static uint8_t framebuffer[FB_SIZE];
+static spi_device_handle_t panel_spi;
 
 static void tx(const uint8_t *buf, size_t n)
 {
     spi_transaction_t t = {.length = n * 8, .tx_buffer = buf};
-    ESP_ERROR_CHECK(spi_device_polling_transmit(spi, &t));
+    ESP_ERROR_CHECK(spi_device_polling_transmit(panel_spi, &t));
 }
 
 static void cmd(uint8_t c)
@@ -75,12 +75,12 @@ static void wait_idle(const char *what, uint32_t timeout_ms)
     int64_t t0 = esp_timer_get_time();
     while (gpio_get_level(EPD_BUSY) == 1) {
         if (esp_timer_get_time() - t0 > (int64_t)timeout_ms * 1000) {
-            ESP_LOGE(TAG, "%s: BUSY stuck high after %u ms", what, timeout_ms);
+            ESP_LOGE(log_tag, "%s: BUSY stuck high after %u ms", what, timeout_ms);
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
-    ESP_LOGI(TAG, "%s: busy %lld ms", what, (esp_timer_get_time() - t0) / 1000);
+    ESP_LOGI(log_tag, "%s: busy %lld ms", what, (esp_timer_get_time() - t0) / 1000);
 }
 
 static void panel_reset(void)
@@ -142,7 +142,7 @@ static void refresh_full(void)
     cmd1(0x3C, 0x05); // border waveform
     full_lut();
     cmd(0x24); // black/white RAM
-    data(fb, FB_SIZE);
+    data(framebuffer, FB_SIZE);
     cmd1(0x22, 0xC7); // full update sequence
     cmd(0x20);
     wait_idle("full refresh", 15000);
@@ -164,7 +164,7 @@ static void refresh_partial(void)
     wait_idle("partial prepare", 15000);
     window_full();
     cmd(0x24);
-    data(fb, FB_SIZE);
+    data(framebuffer, FB_SIZE);
     cmd1(0x22, 0x0F);
     cmd(0x20);
     wait_idle("partial refresh", 15000);
@@ -201,7 +201,7 @@ void epd_init(void)
         .spics_io_num = -1, // CS driven manually, must stay low across a command
         .queue_size = 1,
     };
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &spi));
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &panel_spi));
 
     panel_config(true);
     cmd1(0x3C, 0x05); // border waveform
@@ -210,7 +210,7 @@ void epd_init(void)
 
 void epd_clear(int color)
 {
-    memset(fb, color == EPD_BLACK ? 0x00 : 0xFF, sizeof(fb));
+    memset(framebuffer, color == EPD_BLACK ? 0x00 : 0xFF, sizeof(framebuffer));
 }
 
 void epd_pixel(int x, int y, int color)
@@ -227,7 +227,7 @@ void epd_pixel(int x, int y, int color)
     py = EPD_W - 1 - x;
 #endif
     uint8_t m = 0x80 >> (px & 7);
-    uint8_t *p = &fb[py * ROW_BYTES + (px >> 3)];
+    uint8_t *p = &framebuffer[py * ROW_BYTES + (px >> 3)];
     if (color == EPD_BLACK) {
         *p &= ~m;
     } else {
@@ -315,42 +315,44 @@ int epd_text_w(const aafont *f, const char *s)
 // clears the accumulated switch count because it also clears the residue that count bounds.
 #define PAGE_SWITCH_FULL_EVERY 8
 
-static unsigned refreshes = 1;
-static unsigned page_switches;
-static bool maintenance_full_pending;
+static struct {
+    unsigned ordinary_count;
+    unsigned page_switches;
+    bool maintenance_full_pending;
+} refresh_state = {.ordinary_count = 1};
 
 // consume_ordinary merges a due ordinary maintenance slot into this full refresh, so the next
 // epd_refresh() does not immediately flash the panel again.
 static void full_refresh_done(bool consume_ordinary)
 {
     refresh_full();
-    maintenance_full_pending = false;
-    page_switches = 0;
+    refresh_state.maintenance_full_pending = false;
+    refresh_state.page_switches = 0;
     if (consume_ordinary) {
-        refreshes++;
+        refresh_state.ordinary_count++;
     }
 }
 
 void epd_refresh(void)
 {
-    if (maintenance_full_pending || refreshes % FULL_REFRESH_EVERY == 0) {
+    if (refresh_state.maintenance_full_pending || refresh_state.ordinary_count % FULL_REFRESH_EVERY == 0) {
         full_refresh_done(true);
     } else {
         refresh_partial();
-        refreshes++;
+        refresh_state.ordinary_count++;
     }
 }
 
 void epd_refresh_page_switch(void)
 {
-    if (++page_switches >= PAGE_SWITCH_FULL_EVERY) {
-        bool due = maintenance_full_pending || refreshes % FULL_REFRESH_EVERY == 0;
+    if (++refresh_state.page_switches >= PAGE_SWITCH_FULL_EVERY) {
+        bool due = refresh_state.maintenance_full_pending || refresh_state.ordinary_count % FULL_REFRESH_EVERY == 0;
         full_refresh_done(due);
         return;
     }
     refresh_partial();
-    if (refreshes % FULL_REFRESH_EVERY == 0) {
-        maintenance_full_pending = true;
+    if (refresh_state.ordinary_count % FULL_REFRESH_EVERY == 0) {
+        refresh_state.maintenance_full_pending = true;
     }
 }
 

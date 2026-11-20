@@ -19,10 +19,10 @@
 #include "nvs_flash.h"
 #include "voice.h"
 
-static const char *TAG = "net";
-static EventGroupHandle_t s_events; // 仅 GOT_IP；配网握手由 portal_web.c 管理
-static atomic_bool s_time_synced;
-static bool s_sntp_initialized; // Owned by the default event loop.
+static const char *log_tag = "net";
+static EventGroupHandle_t sta_events; // 仅 GOT_IP；配网握手由 portal_web.c 管理
+static atomic_bool time_synced;
+static bool sntp_initialized; // Owned by the default event loop.
 #define GOT_IP BIT0
 
 static void start_time_sync(void);
@@ -34,16 +34,16 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && (id == WIFI_EVENT_STA_DISCONNECTED || id == WIFI_EVENT_STA_STOP)) {
-        xEventGroupClearBits(s_events, GOT_IP);
+        xEventGroupClearBits(sta_events, GOT_IP);
         voice_net_set_connected(false);
         if (id == WIFI_EVENT_STA_DISCONNECTED) {
-            ESP_LOGW(TAG, "disconnected, retrying");
+            ESP_LOGW(log_tag, "disconnected, retrying");
             esp_wifi_connect();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         start_time_sync();
         voice_net_set_connected(true);
-        xEventGroupSetBits(s_events, GOT_IP);
+        xEventGroupSetBits(sta_events, GOT_IP);
     }
 }
 
@@ -56,8 +56,8 @@ void net_init(void)
 
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
-    s_events = xEventGroupCreate();
-    ESP_ERROR_CHECK(s_events != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    sta_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(sta_events != NULL ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_event, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, NULL, NULL));
 }
@@ -66,7 +66,7 @@ void net_forget_creds(void)
 {
     nvs_handle_t h;
     if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) {
-        ESP_LOGW(TAG, "no stored credentials to erase");
+        ESP_LOGW(log_tag, "no stored credentials to erase");
         return;
     }
     esp_err_t ssid_err = nvs_erase_key(h, "ssid");
@@ -74,12 +74,12 @@ void net_forget_creds(void)
     if ((ssid_err != ESP_OK && ssid_err != ESP_ERR_NVS_NOT_FOUND)
         || (pass_err != ESP_OK && pass_err != ESP_ERR_NVS_NOT_FOUND))
     {
-        ESP_LOGW(TAG, "failed to erase WiFi credentials: %s / %s", esp_err_to_name(ssid_err),
+        ESP_LOGW(log_tag, "failed to erase WiFi credentials: %s / %s", esp_err_to_name(ssid_err),
                  esp_err_to_name(pass_err));
     }
     nvs_commit(h);
     nvs_close(h);
-    ESP_LOGW(TAG, "stored credentials erased");
+    ESP_LOGW(log_tag, "stored credentials erased");
 }
 
 static bool load_creds(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
@@ -104,18 +104,18 @@ static bool sta_connect(const char *ssid, const char *pass, int timeout_ms)
     memcpy(cfg.sta.ssid, ssid, strnlen(ssid, sizeof(cfg.sta.ssid)));
     memcpy(cfg.sta.password, pass, strnlen(pass, sizeof(cfg.sta.password)));
 
-    xEventGroupClearBits(s_events, GOT_IP);
+    xEventGroupClearBits(sta_events, GOT_IP);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "connecting to %s", ssid);
+    ESP_LOGI(log_tag, "connecting to %s", ssid);
 
-    EventBits_t bits = xEventGroupWaitBits(s_events, GOT_IP, pdFALSE, pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    EventBits_t bits = xEventGroupWaitBits(sta_events, GOT_IP, pdFALSE, pdTRUE, pdMS_TO_TICKS(timeout_ms));
     if (bits & GOT_IP) {
-        ESP_LOGI(TAG, "got ip");
+        ESP_LOGI(log_tag, "got ip");
         return true;
     }
-    ESP_LOGW(TAG, "connect timeout");
+    ESP_LOGW(log_tag, "connect timeout");
     esp_wifi_stop();
     return false;
 }
@@ -124,7 +124,7 @@ bool net_try_stored(int timeout_ms)
 {
     char ssid[33] = {0}, pass[65] = {0};
     if (!load_creds(ssid, sizeof(ssid), pass, sizeof(pass))) {
-        ESP_LOGW(TAG, "no stored credentials");
+        ESP_LOGW(log_tag, "no stored credentials");
         return false;
     }
     return sta_connect(ssid, pass, timeout_ms);
@@ -146,27 +146,27 @@ void net_apply_tz(int off)
     snprintf(tz, sizeof(tz), "XXX%c%02d:%02d", off < 0 ? '+' : '-', abs(hh), mm);
     setenv("TZ", tz, 1);
     tzset();
-    ESP_LOGI(TAG, "tz %s", tz);
+    ESP_LOGI(log_tag, "tz %s", tz);
 }
 
 static void on_time_sync(struct timeval *tv)
 {
     if (tv && tv->tv_sec >= NET_MIN_SYNCED_EPOCH) {
-        atomic_store(&s_time_synced, true);
+        atomic_store(&time_synced, true);
     }
 }
 
 bool net_time_is_synced(void)
 {
-    return atomic_load(&s_time_synced);
+    return atomic_load(&time_synced);
 }
 
 static void start_time_sync(void)
 {
-    if (s_sntp_initialized) {
+    if (sntp_initialized) {
         // Recover promptly after a reconnect, even if the last poll has backed off.
         if (esp_netif_sntp_start() != ESP_OK) {
-            ESP_LOGW(TAG, "sntp restart failed");
+            ESP_LOGW(log_tag, "sntp restart failed");
         }
         return;
     }
@@ -174,10 +174,10 @@ static void start_time_sync(void)
     cfg.sync_cb = on_time_sync;
     cfg.wait_for_sync = false;
     if (esp_netif_sntp_init(&cfg) != ESP_OK) {
-        ESP_LOGW(TAG, "sntp init failed");
+        ESP_LOGW(log_tag, "sntp init failed");
         return;
     }
-    s_sntp_initialized = true;
+    sntp_initialized = true;
 }
 
 int net_http_get(const char *url, char *buf, size_t cap)
@@ -204,7 +204,7 @@ int net_http_get(const char *url, char *buf, size_t cap)
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
     if (total == 0) {
-        ESP_LOGW(TAG, "empty response from %s", url);
+        ESP_LOGW(log_tag, "empty response from %s", url);
     }
     return total > 0 ? total : -1;
 }

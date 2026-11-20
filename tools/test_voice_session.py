@@ -65,7 +65,10 @@ PRELUDE = r'''
 typedef unsigned EventBits_t, TickType_t;
 typedef const char *esp_event_base_t;
 typedef int OpusEncoder, OpusDecoder;
-typedef struct { int len; uint8_t data[VOICE_RX_OPUS_MAX]; } voice_packet_t;
+struct voice_packet {
+    int len;
+    uint8_t data[VOICE_RX_OPUS_MAX];
+};
 #define pdTRUE 1
 #define pdFALSE 0
 #define pdMS_TO_TICKS(ms) (ms)
@@ -80,21 +83,32 @@ typedef struct { int len; uint8_t data[VOICE_RX_OPUS_MAX]; } voice_packet_t;
 #define OPUS_SET_COMPLEXITY(x) (x)
 #define OPUS_RESET_STATE 2
 
-static const char *WAKE_WORD = "wake";
+static const char *wake_word = "wake";
 static EventBits_t event_bits;
-static EventBits_t *s_events = &event_bits;
-static esp_xiaozhi_chat_handle_t s_chat;
-static esp_mcp_t *s_mcp, engine;
-static OpusEncoder *s_encoder, encoder;
-static OpusDecoder *s_decoder, decoder;
-static bool s_cleanup_pending, s_followup_enabled, muted = true;
+static EventBits_t *voice_events = &event_bits;
+static struct {
+    esp_xiaozhi_chat_handle_t chat;
+    esp_mcp_t *mcp;
+    OpusEncoder *encoder;
+    OpusDecoder *decoder;
+    bool cleanup_pending;
+    bool followup_enabled;
+} session;
+static esp_mcp_t engine;
+static OpusEncoder encoder;
+static OpusDecoder decoder;
+static bool muted = true;
 static int ref, mic;
-static int *s_reference = &ref, *s_microphone = &mic;
-static voice_packet_t queue[VOICE_RX_QUEUE_LEN], s_packet;
-static voice_packet_t *s_rx_queue = queue;
+static int *playback_ref_stream = &ref, *microphone_stream = &mic;
+static struct voice_packet queue[VOICE_RX_QUEUE_LEN];
+static struct voice_packet *rx_audio_queue = queue;
 static unsigned count;
-static int16_t s_mono[VOICE_FRAME_SAMPLES], s_stereo[VOICE_FRAME_SAMPLES * 2];
-static uint8_t s_tx_opus[VOICE_TX_OPUS_MAX];
+static struct {
+    int16_t mono[VOICE_FRAME_SAMPLES];
+    int16_t stereo[VOICE_FRAME_SAMPLES * 2];
+    uint8_t tx_opus[VOICE_TX_OPUS_MAX];
+    struct voice_packet packet;
+} voice_buffers;
 static TickType_t ticks;
 
 enum turn_case { EARLY, BEFORE_TTS, BURST, OVERFLOW, SLOW_FIRST, NO_FIRST, STALL, DROP_LISTEN, DROP_PLAY, BARGE,
@@ -109,16 +123,22 @@ static unsigned listens, closes, aborts, writes;
 static int16_t played[VOICE_RX_QUEUE_LEN];
 static bool injected, locked;
 static unsigned windows, drains, lock_attempts, uploads;
-static int *s_network_lock = &ref;
+static int *network_lock = &ref;
 static int16_t captured[VOICE_FRAME_SAMPLES * 3];
 static size_t captured_samples;
 static unsigned vad_frames, vad_trigger_frame;
-static void *s_vad;
-static int16_t (*s_vad_history)[FOLLOWUP_SAMPLES];
-static size_t s_vad_fill, s_vad_next, s_vad_count;
-static int16_t s_endpoint_frame[FOLLOWUP_SAMPLES];
-static size_t s_endpoint_fill;
-static bool s_endpoint_heard_speech;
+static struct {
+    EventBits_t *events;
+    int *microphone;
+    void *vad;
+    int16_t (*vad_history)[FOLLOWUP_SAMPLES];
+    size_t vad_fill, vad_next, vad_count;
+    size_t endpoint_fill;
+    bool endpoint_heard_speech;
+} capture_state = {.events = &event_bits, .microphone = &mic};
+static struct {
+    int16_t endpoint_frame[FOLLOWUP_SAMPLES];
+} capture_buffers;
 #define VAD_SPEECH 1
 
 static int vad_process_with_trigger(void *vad, int16_t *frame) {
@@ -127,12 +147,12 @@ static int vad_process_with_trigger(void *vad, int16_t *frame) {
 }
 
 static int xSemaphoreGive(int *lock) {
-    assert(lock == s_network_lock && locked);
+    assert(lock == network_lock && locked);
     locked = false;
     return pdTRUE;
 }
 static int xSemaphoreTake(int *lock, TickType_t wait) {
-    assert(lock == s_network_lock);
+    assert(lock == network_lock);
     if (locked) {
         assert(wait == 0);
         return pdFALSE;
@@ -156,30 +176,30 @@ static EventBits_t xEventGroupClearBits(EventBits_t *group, EventBits_t bits) {
 }
 static TickType_t xTaskGetTickCount(void) { return ticks; }
 
-static void xQueueReset(voice_packet_t *q) { assert(q == queue); count = 0; }
-static int xQueueSend(voice_packet_t *q, const voice_packet_t *packet, TickType_t wait) {
+static void xQueueReset(struct voice_packet *q) { assert(q == queue); count = 0; }
+static int xQueueSend(struct voice_packet *q, const struct voice_packet *packet, TickType_t wait) {
     assert(q == queue && wait == 0);
     if (count == VOICE_RX_QUEUE_LEN) return pdFALSE;
     q[count++] = *packet;
     return pdTRUE;
 }
-static int xQueueReceive(voice_packet_t *q, voice_packet_t *packet, TickType_t wait);
+static int xQueueReceive(struct voice_packet *q, struct voice_packet *packet, TickType_t wait);
 static void xStreamBufferReset(int *buffer) {
-    assert(buffer == s_reference || buffer == s_microphone);
-    if (buffer == s_microphone) captured_samples = 0;
+    assert(buffer == playback_ref_stream || buffer == microphone_stream);
+    if (buffer == microphone_stream) captured_samples = 0;
 }
 static size_t xStreamBufferSpacesAvailable(int *buffer) {
-    assert(buffer == s_microphone);
+    assert(buffer == microphone_stream);
     return (sizeof(captured) - captured_samples * sizeof(*captured));
 }
 static size_t xStreamBufferReceive(int *buffer, void *data, size_t len, TickType_t wait);
 static void xStreamBufferSend(int *buffer, const void *data, size_t len, TickType_t wait) {
-    if (buffer == s_microphone) {
+    if (buffer == microphone_stream) {
         assert(len <= xStreamBufferSpacesAvailable(buffer) && len % sizeof(*captured) == 0 && wait == 0);
         memcpy(captured + captured_samples, data, len);
         captured_samples += len / sizeof(*captured);
     } else {
-        assert(buffer == s_reference && data == s_mono && len == sizeof(*s_mono) && wait == 0);
+        assert(buffer == playback_ref_stream && data == voice_buffers.mono && len == sizeof(*voice_buffers.mono) && wait == 0);
     }
 }
 static bool voice_capture_has_aec(void) { return turn_case == BARGE; }
@@ -187,7 +207,7 @@ static bool voice_capture_prepare_vad(void) { return turn_case >= FOLLOWUP && tu
 esp_err_t audio_set_mute(bool mute) { muted = mute; return ESP_OK; }
 esp_err_t audio_write(void *data, size_t len, size_t *written) {
     const int16_t *pcm = data;
-    assert(!muted && data == s_stereo && len == 4 && pcm[0] == pcm[1] && writes < VOICE_RX_QUEUE_LEN);
+    assert(!muted && data == voice_buffers.stereo && len == 4 && pcm[0] == pcm[1] && writes < VOICE_RX_QUEUE_LEN);
     played[writes++] = pcm[0];
     *written = len;
     if (turn_case == BARGE && listens == 1) event_bits |= VOICE_BIT_INTERRUPT;
@@ -213,7 +233,7 @@ static int opus_encoder_ctl(OpusEncoder *value, int op) { assert(value == &encod
 static int opus_decoder_ctl(OpusDecoder *value, int op) { assert(value == &decoder && op == OPUS_RESET_STATE); return OPUS_OK; }
 static int opus_encode(OpusEncoder *value, const int16_t *pcm, int samples, uint8_t *out, size_t cap) {
     assert(VOICE_NETWORK_READY(event_bits));
-    assert(value == &encoder && pcm == s_mono && samples == VOICE_FRAME_SAMPLES && cap == sizeof(s_tx_opus));
+    assert(value == &encoder && pcm == voice_buffers.mono && samples == VOICE_FRAME_SAMPLES && cap == sizeof(voice_buffers.tx_opus));
     if (turn_case == LOCAL_ENDPOINT) {
         for (int i = 0; i < samples; i++) assert(pcm[i] == (i < samples / 2 ? 1 : 0));
     }
@@ -242,7 +262,7 @@ static void packet(uint8_t original) {
 }
 
 static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask, int clear, int all, TickType_t wait) {
-    assert(group == s_events && !clear && !all);
+    assert(group == voice_events && !clear && !all);
     if (mask == VOICE_BIT_WS_READY) {
         assert(wait == VOICE_CONNECT_TIMEOUT_MS);
         return *group; /* No ticks: the real connect normally completes before the wait. */
@@ -277,7 +297,7 @@ static size_t xStreamBufferReceive(int *buffer, void *data, size_t len, TickType
         assert(wait == 0 && (event_bits & VOICE_BIT_LOCAL_EOS));
         return 0;
     }
-    assert(buffer == s_microphone && wait == VOICE_POLL_MS && listens && !injected);
+    assert(buffer == microphone_stream && wait == VOICE_POLL_MS && listens && !injected);
     injected = true;
     ticks += wait;
     if (turn_case == LOCAL_ENDPOINT) {
@@ -322,7 +342,7 @@ static size_t xStreamBufferReceive(int *buffer, void *data, size_t len, TickType
     return 0;
 }
 
-static int xQueueReceive(voice_packet_t *q, voice_packet_t *packet_out, TickType_t wait) {
+static int xQueueReceive(struct voice_packet *q, struct voice_packet *packet_out, TickType_t wait) {
     assert(q == queue && wait == VOICE_PLAYBACK_POLL_MS);
     ticks += wait;
     if (turn_case == DROP_PLAY && !(event_bits & VOICE_BIT_RESET)) {
@@ -391,7 +411,7 @@ esp_err_t esp_xiaozhi_chat_open_audio_channel(esp_xiaozhi_chat_handle_t chat, co
     return ESP_OK;
 }
 esp_err_t esp_xiaozhi_chat_send_wake_word(esp_xiaozhi_chat_handle_t chat, const char *word) {
-    assert(chat == 1 && word == WAKE_WORD);
+    assert(chat == 1 && word == wake_word);
     return ESP_OK;
 }
 esp_err_t esp_xiaozhi_chat_send_start_listening(esp_xiaozhi_chat_handle_t chat, int mode) {
@@ -438,7 +458,7 @@ static void pairing(enum info_case reply, const char *value, esp_err_t result, v
     assert(info_requests == info_frees && chat_inits - previous == expected_inits);
     voice_feedback_t snapshot = voice_feedback_get();
     assert(snapshot.state == state && !strcmp(snapshot.activation_code, displayed));
-    assert((s_chat && s_mcp && s_encoder && s_decoder) == (result == ESP_OK));
+    assert((session.chat && session.mcp && session.encoder && session.decoder) == (result == ESP_OK));
 }
 
 static void test_pairing(void) {
@@ -459,12 +479,12 @@ static void test_pairing(void) {
     pairing(BOUND, NULL, ESP_OK, VOICE_STATE_ACTIVATION, "654321", 1);
     assert(chat_starts == 1);
     close_session();
-    assert(chat_stops == 1 && mcp_destroys == 2 && !s_chat && !s_mcp && !s_encoder && !s_decoder);
+    assert(chat_stops == 1 && mcp_destroys == 2 && !session.chat && !session.mcp && !session.encoder && !session.decoder);
     // A socket that never connects must not produce a `chat ready` the wake word cannot use.
     info_case = CONNECT_TIMEOUT;
     event_bits = 0;
     assert(open_session() == ESP_ERR_TIMEOUT);
-    assert(chat_starts == 2 && chat_stops == 2 && !s_chat && !s_mcp && !s_encoder && !s_decoder);
+    assert(chat_starts == 2 && chat_stops == 2 && !session.chat && !session.mcp && !session.encoder && !session.decoder);
     // A retained activation code deliberately survives this failure with a retryable state.
     assert(voice_feedback_get().state == VOICE_STATE_ACTIVATION);
     puts("PASS 14 pairing/setup cases");
@@ -479,7 +499,7 @@ static void test_turn(enum turn_case scenario) {
     assert(open_session() == ESP_OK);
     packet(1);  /* No active audio channel yet. */
     assert(count == 0);
-    queue[count++] = (voice_packet_t){.len = 1, .data = {2}}; /* Stale data must be cleared. */
+    queue[count++] = (struct voice_packet){.len = 1, .data = {2}}; /* Stale data must be cleared. */
     esp_err_t result = run_turn();
     if (scenario == OVERFLOW || scenario == DROP_LISTEN || scenario == DROP_PLAY) {
         assert(result == ESP_FAIL && !writes);
@@ -523,8 +543,8 @@ static void test_turn(enum turn_case scenario) {
 static void test_capture(void) {
     int16_t frames[9 * FOLLOWUP_SAMPLES];
     int16_t history[FOLLOWUP_HISTORY_FRAMES][FOLLOWUP_SAMPLES];
-    s_vad = &mic;
-    s_vad_history = history;
+    capture_state.vad = &mic;
+    capture_state.vad_history = history;
     for (size_t i = 0; i < sizeof(frames) / sizeof(*frames); i++) frames[i] = i / FOLLOWUP_SAMPLES + 1;
     event_bits = VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_FOLLOWUP;
     vad_trigger_frame = 8;
@@ -536,14 +556,14 @@ static void test_capture(void) {
     assert(captured_samples == FOLLOWUP_HISTORY_FRAMES * FOLLOWUP_SAMPLES + 5);
     assert(memcmp(captured, frames + 4 * FOLLOWUP_SAMPLES, captured_samples * sizeof(*captured)) == 0);
     event_bits = VOICE_BIT_CAPTURE;
-    s_endpoint_heard_speech = false; /* New WakeNet-triggered question. */
+    capture_state.endpoint_heard_speech = false; /* New WakeNet-triggered question. */
     vad_trigger_frame = vad_frames + 2;
     detect_endpoint(frames, FOLLOWUP_SAMPLES);
     assert(event_bits == VOICE_BIT_CAPTURE); /* Silence before speech cannot end a turn. */
     detect_endpoint(frames, FOLLOWUP_SAMPLES - 1);
-    assert(!s_endpoint_heard_speech);
+    assert(!capture_state.endpoint_heard_speech);
     detect_endpoint(frames, 1);
-    assert(event_bits == VOICE_BIT_CAPTURE && s_endpoint_heard_speech);
+    assert(event_bits == VOICE_BIT_CAPTURE && capture_state.endpoint_heard_speech);
     detect_endpoint(frames, FOLLOWUP_SAMPLES);
     assert(event_bits == VOICE_BIT_LOCAL_EOS);
     puts("PASS local VAD: speech pre-roll in order and endpoint only after speech");

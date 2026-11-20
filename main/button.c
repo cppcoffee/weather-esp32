@@ -20,36 +20,38 @@ void button_init(void)
 
 button_event_t button_poll(unsigned elapsed_ms)
 {
-    static bool stable; // debounced level, true = pressed
-    static unsigned streak;
-    static unsigned held_ms;
-    static bool hold_reported;
+    static struct {
+        bool stable; // debounced level, true = pressed
+        unsigned streak;
+        unsigned held_ms;
+        bool hold_reported;
+    } button_state;
 
     bool pressed = gpio_get_level(BUTTON_GPIO) == 0;
-    if (pressed != stable) {
-        if (++streak < SETTLE_SAMPLES) {
+    if (pressed != button_state.stable) {
+        if (++button_state.streak < SETTLE_SAMPLES) {
             return BUTTON_NONE;
         }
-        stable = pressed;
-        streak = 0;
+        button_state.stable = pressed;
+        button_state.streak = 0;
         if (pressed) {
-            held_ms = 0;
-            hold_reported = false;
+            button_state.held_ms = 0;
+            button_state.hold_reported = false;
             return BUTTON_NONE;
         }
-        if (hold_reported) {
-            hold_reported = false;
+        if (button_state.hold_reported) {
+            button_state.hold_reported = false;
             return BUTTON_NONE; // the hold was already reported while held
         }
         return BUTTON_TAP;
     }
-    streak = 0;
-    if (!stable) {
+    button_state.streak = 0;
+    if (!button_state.stable) {
         return BUTTON_NONE;
     }
-    held_ms += elapsed_ms;
-    if (!hold_reported && held_ms >= BUTTON_LONG_PRESS_MS) {
-        hold_reported = true;
+    button_state.held_ms += elapsed_ms;
+    if (!button_state.hold_reported && button_state.held_ms >= BUTTON_LONG_PRESS_MS) {
+        button_state.hold_reported = true;
         return BUTTON_HOLD;
     }
     return BUTTON_NONE;

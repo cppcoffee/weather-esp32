@@ -119,14 +119,14 @@ static bool validate_json_numbers(const char *text, size_t length)
     return true;
 }
 
-typedef struct {
+struct json_number_iter {
     const char *text;
     size_t length;
     size_t offset;
     bool failed;
-} json_number_iter_t;
+};
 
-static bool next_json_number(json_number_iter_t *iter, bool *integer_syntax)
+static bool next_json_number(struct json_number_iter *iter, bool *integer_syntax)
 {
     while (iter->offset < iter->length) {
         if (iter->text[iter->offset] == '"') {
@@ -147,7 +147,7 @@ static bool next_json_number(json_number_iter_t *iter, bool *integer_syntax)
     return false;
 }
 
-static void mark_integer_numbers(cJSON *item, json_number_iter_t *iter)
+static void mark_integer_numbers(cJSON *item, struct json_number_iter *iter)
 {
     for (; item; item = item->next) {
         if (cJSON_IsNumber(item)) {
@@ -188,7 +188,7 @@ cJSON *json_parse(const char *text, size_t length)
         return NULL;
     }
     // Preserve the strict integer contract without modifying the managed cJSON source.
-    json_number_iter_t iter = {.text = text, .length = length};
+    struct json_number_iter iter = {.text = text, .length = length};
     mark_integer_numbers(root, &iter);
     if (iter.failed || next_json_number(&iter, &(bool){false})) {
         cJSON_Delete(root);

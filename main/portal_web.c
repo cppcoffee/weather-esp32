@@ -17,28 +17,28 @@
 #include "freertos/task.h"
 #include "nvs.h"
 
-static const char *TAG = "portal_web";
+static const char *log_tag = "portal_web";
 
 #define CREDS_SAVED BIT0
 #define MAX_APS     16
 
-typedef struct {
+struct scanned_ap {
     char ssid[33];
-} scan_ap_t;
+};
 
-static EventGroupHandle_t s_events;
-static httpd_handle_t s_server;
+static EventGroupHandle_t portal_event_group;
+static httpd_handle_t portal_server;
 
 static EventGroupHandle_t portal_events(void)
 {
-    if (!s_events) {
-        s_events = xEventGroupCreate();
+    if (!portal_event_group) {
+        portal_event_group = xEventGroupCreate();
     }
-    return s_events;
+    return portal_event_group;
 }
 
 // 扫周边热点。扫描要求 WiFi 处于 STA/APSTA 模式，所以配网时开的是 APSTA（STA 不连）。
-static int scan_aps(scan_ap_t *out, int max)
+static int scan_aps(struct scanned_ap *out, int max)
 {
     // STA 正在重连时扫描会被直接拒掉（ESP_ERR_WIFI_STATE），隔一会儿重试。
     esp_err_t err = ESP_FAIL;
@@ -50,7 +50,7 @@ static int scan_aps(scan_ap_t *out, int max)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
+        ESP_LOGW(log_tag, "scan failed: %s", esp_err_to_name(err));
         return 0;
     }
     uint16_t found = 0;
@@ -76,7 +76,7 @@ static int scan_aps(scan_ap_t *out, int max)
         }
     }
     free(recs);
-    ESP_LOGI(TAG, "scan: %d APs", n);
+    ESP_LOGI(log_tag, "scan: %d APs", n);
     return n;
 }
 
@@ -161,20 +161,20 @@ extern const char portal_result[] asm("_binary_result_html_start");
 extern const char portal_style[] asm("_binary_style_css_start");
 extern const char portal_script[] asm("_binary_app_js_start");
 
-typedef struct {
+struct page_value {
     const char *token;
     const char *value;
-} page_value_t;
+};
 
 // Substitute only trusted template tokens; inserted values are never parsed again.
 // Callers must HTML-escape untrusted text before supplying it here.
-static esp_err_t send_page(httpd_req_t *req, const char *page, const page_value_t *values, size_t count)
+static esp_err_t send_page(httpd_req_t *req, const char *page, const struct page_value *values, size_t count)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     const char *cursor = page;
     const char *token;
     while ((token = strstr(cursor, "{{")) != NULL) {
-        const page_value_t *value = NULL;
+        const struct page_value *value = NULL;
         for (size_t i = 0; i < count; i++) {
             if (strncmp(token, values[i].token, strlen(values[i].token)) == 0) {
                 value = &values[i];
@@ -182,7 +182,7 @@ static esp_err_t send_page(httpd_req_t *req, const char *page, const page_value_
             }
         }
         if (!value) {
-            ESP_LOGE(TAG, "unknown portal template token");
+            ESP_LOGE(log_tag, "unknown portal template token");
             return ESP_FAIL;
         }
         esp_err_t err;
@@ -219,7 +219,7 @@ static esp_err_t any_get(httpd_req_t *req)
 
 static esp_err_t root_get(httpd_req_t *req)
 {
-    scan_ap_t aps[MAX_APS];
+    struct scanned_ap aps[MAX_APS];
     int n = scan_aps(aps, MAX_APS);
 
     // Two escaped copies of each 32-byte SSID plus the option markup fit in 8 KB.
@@ -252,17 +252,13 @@ static esp_err_t root_get(httpd_req_t *req)
     char escaped_voice_url[VOICE_URL_CAP * 6];
     voice_settings_t settings = {0};
     if (voice_settings_load(&settings) != ESP_OK) {
-        ESP_LOGW(TAG, "invalid saved voice settings; showing empty fields");
+        ESP_LOGW(log_tag, "invalid saved voice settings; showing empty fields");
         memset(&settings, 0, sizeof(settings));
     }
     html_escape(settings.info_url, escaped_voice_url, sizeof(escaped_voice_url));
-    const page_value_t values[] = {
-        {"{{STYLE}}", portal_style},
-        {"{{SCRIPT}}", portal_script},
-        {"{{OPTIONS}}", options},
-        {"{{AP_URL}}", NET_AP_URL},
-        {"{{AP_SSID}}", own},
-        {"{{VOICE_URL}}", escaped_voice_url},
+    const struct page_value values[] = {
+        {"{{STYLE}}", portal_style}, {"{{SCRIPT}}", portal_script}, {"{{OPTIONS}}", options},
+        {"{{AP_URL}}", NET_AP_URL},  {"{{AP_SSID}}", own},          {"{{VOICE_URL}}", escaped_voice_url},
     };
     esp_err_t err = send_page(req, portal_index, values, sizeof(values) / sizeof(values[0]));
     free(options);
@@ -275,7 +271,7 @@ static esp_err_t reply(httpd_req_t *req, const char *title, const char *msg, boo
     if (!ok) {
         httpd_resp_set_status(req, "400 Bad Request");
     }
-    const page_value_t values[] = {
+    const struct page_value values[] = {
         {"{{STYLE}}", portal_style},
         {"{{TITLE}}", title},
         {"{{MESSAGE}}", msg},
@@ -342,11 +338,11 @@ static esp_err_t save_post(httpd_req_t *req)
     }
     nvs_close(h);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "failed to save portal settings: %s", esp_err_to_name(err));
+        ESP_LOGE(log_tag, "failed to save portal settings: %s", esp_err_to_name(err));
         return httpd_resp_send_500(req);
     }
 
-    ESP_LOGI(TAG, "stored credentials for %s", network);
+    ESP_LOGI(log_tag, "stored credentials for %s", network);
     reply(req, "正在连接", "保存好了，屏幕稍后显示天气。", true);
     xEventGroupSetBits(portal_events(), CREDS_SAVED);
     return ESP_OK;
@@ -358,7 +354,7 @@ esp_err_t portal_web_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard; // 默认是精确匹配，"/*" 需要通配匹配器
-    esp_err_t err = httpd_start(&s_server, &cfg);
+    esp_err_t err = httpd_start(&portal_server, &cfg);
     if (err != ESP_OK) {
         return err;
     }
@@ -367,16 +363,16 @@ esp_err_t portal_web_start(void)
     httpd_uri_t save = {.uri = "/save", .method = HTTP_POST, .handler = save_post};
     // phones probe their own connectivity-check URLs; send them all to the config page
     httpd_uri_t any = {.uri = "/*", .method = HTTP_GET, .handler = any_get};
-    err = httpd_register_uri_handler(s_server, &root);
+    err = httpd_register_uri_handler(portal_server, &root);
     if (err == ESP_OK) {
-        err = httpd_register_uri_handler(s_server, &save);
+        err = httpd_register_uri_handler(portal_server, &save);
     }
     if (err == ESP_OK) {
-        err = httpd_register_uri_handler(s_server, &any);
+        err = httpd_register_uri_handler(portal_server, &any);
     }
     if (err != ESP_OK) {
-        httpd_stop(s_server);
-        s_server = NULL;
+        httpd_stop(portal_server);
+        portal_server = NULL;
     }
     return err;
 }
@@ -388,10 +384,10 @@ void portal_web_wait(void)
 
 void portal_web_stop(void)
 {
-    if (!s_server) {
+    if (!portal_server) {
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(300)); // let the response flush
-    httpd_stop(s_server);
-    s_server = NULL;
+    httpd_stop(portal_server);
+    portal_server = NULL;
 }

@@ -67,7 +67,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 ## 应用状态边界（违反会重复踩坑）
 
 - 主循环管网络与刷新；`clock` 任务每秒检查分钟/日期/语音快照。二者共用显示互斥锁串行化绘图+刷新+SPI 等待；网络与配网等待期间不得持锁。`ui.c` 只画帧缓冲，不联网、不刷新。
-- `app_t.w` = 本次请求结果（开始时被清空，失败可为脏数据）；`app_t.shown` = 最近成功快照。**失败重绘只读 `shown`**，不能靠 `w` 保留旧预报。
+- `app->w` = 本次请求结果（开始时被清空，失败可为脏数据）；`app->shown` = 最近成功快照。**失败重绘只读 `shown`**，不能靠 `w` 保留旧预报。
 - 失败时 `present()` 用旧快照（首次失败用占位）重画，再覆盖顶部重试标题与底栏状态；正文像素不动。
 - 首列显示 `今天` 仅当日期等于已同步当地日期。
 - 底栏温湿度只取 `sensor_reading_t`；未接驱动时 `valid=false` → `--.- °C` / `-- %`，禁止用天气温湿度代替。接入后填 `temperature_c`、`humidity_percent`、`valid=true`。
@@ -104,7 +104,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 - 追问（VAD 可用时自动启用）：播放结束静音后开 6 s 本地 VAD 窗口；确认开口带 ≤120 ms 前滚，复用同一通道 `listen start/stop`；窗口内取数最多等 4 s（网络锁）。沉默退回待唤醒。
 - 端点：本地 VAD 约 660 ms 静默结束录音，录音上限 15 s，随后发 `listen stop`；服务端收尾另行保留。
 - 播放：正常结束等 I²S DMA 尾帧（`AUDIO_PLAYBACK_TAIL_MS`）再静音；打断/断线/出错立即停。
-- AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考），参考信号是 `play_response()` 实际写入 I²S 的 PCM（`s_reference`，按写入顺序，不加延迟）。WakeNet 在 AFE 之外，检测 AEC 输出；播放期间保持 `ARMED`，命中后置 `VOICE_BIT_INTERRUPT`，由 `run_turn()` 静音、丢音频、发 `abort`(wake_word_detected)、同通道重新 `listen start`。AFE 失败则回退为播放期不检测。
+- AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考），参考信号是 `play_response()` 实际写入 I²S 的 PCM（`playback_ref_stream`，按写入顺序，不加延迟）。WakeNet 在 AFE 之外，检测 AEC 输出；播放期间保持 `ARMED`，命中后置 `VOICE_BIT_INTERRUPT`，由 `run_turn()` 静音、丢音频、发 `abort`(wake_word_detected)、同通道重新 `listen start`。AFE 失败则回退为播放期不检测。
 - 两任务只通过 `voice_internal.h` 的事件位 + 两个流缓冲通信；新增位同步更新该头与主机 harness。
 - 预算（两端要一起改）：设备首音频 90 s、播放断流 30 s；Rust 正常首音频 65 s、含失败提示 75 s、整回合 180 s（不含 ASR）。
 - WS stop 失败：保留 chat/MCP/Opus，释放网络锁后由语音任务重试清理，禁止开新会话；成功后 `deinit` 消费句柄。

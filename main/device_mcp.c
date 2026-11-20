@@ -13,14 +13,14 @@
 #include "freertos/FreeRTOS.h"
 #include "net.h"
 
-typedef struct {
+struct device_snapshot {
     weather_t weather;
     sensor_reading_t sensor;
     forecast_stamp_t stamp;
-} device_snapshot_t;
+};
 
-static device_snapshot_t s_snapshot;
-static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static struct device_snapshot published_snapshot;
+static portMUX_TYPE snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 
 forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying,
                                     bool forecast_updated)
@@ -28,27 +28,27 @@ forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_readi
     time_t now = time(NULL);
     bool clock_known = net_time_is_synced() && now >= NET_MIN_SYNCED_EPOCH;
     int64_t uptime = esp_timer_get_time();
-    portENTER_CRITICAL(&s_lock);
+    portENTER_CRITICAL(&snapshot_lock);
     if (forecast_updated && weather && weather->ok) {
-        s_snapshot.weather = *weather;
+        published_snapshot.weather = *weather;
 
-        s_snapshot.stamp.fetched_at = clock_known ? now : 0;
-        s_snapshot.stamp.fetched_uptime_us = uptime;
+        published_snapshot.stamp.fetched_at = clock_known ? now : 0;
+        published_snapshot.stamp.fetched_uptime_us = uptime;
     }
-    s_snapshot.sensor = sensor ? *sensor : (sensor_reading_t){0};
-    s_snapshot.stamp.retrying = retrying;
-    forecast_stamp_t stamp = s_snapshot.stamp;
-    portEXIT_CRITICAL(&s_lock);
+    published_snapshot.sensor = sensor ? *sensor : (sensor_reading_t){0};
+    published_snapshot.stamp.retrying = retrying;
+    forecast_stamp_t stamp = published_snapshot.stamp;
+    portEXIT_CRITICAL(&snapshot_lock);
     return stamp;
 }
 
-static device_snapshot_t snapshot(void)
+static struct device_snapshot snapshot(void)
 {
-    device_snapshot_t copy;
+    struct device_snapshot copy;
     // Never allocate JSON or wait for network/audio while holding this lock.
-    portENTER_CRITICAL(&s_lock);
-    copy = s_snapshot;
-    portEXIT_CRITICAL(&s_lock);
+    portENTER_CRITICAL(&snapshot_lock);
+    copy = published_snapshot;
+    portEXIT_CRITICAL(&snapshot_lock);
     return copy;
 }
 
@@ -67,7 +67,7 @@ static esp_err_t send_json(esp_mcp_tool_result_t *result, cJSON *json, bool comp
 static esp_err_t get_time(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
     (void)properties;
-    device_snapshot_t copy = snapshot();
+    struct device_snapshot copy = snapshot();
     time_t now = time(NULL);
     int offset = copy.weather.utc_offset;
     bool timezone_known = copy.weather.ok && offset >= -14 * 3600 && offset <= 14 * 3600 && offset % 60 == 0;
@@ -160,7 +160,7 @@ static cJSON *hour_json(const weather_hour_t *hour)
 static esp_err_t get_forecast(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
     (void)properties;
-    device_snapshot_t copy = snapshot();
+    struct device_snapshot copy = snapshot();
     int64_t uptime = esp_timer_get_time();
     double age = (double)(uptime - copy.stamp.fetched_uptime_us) / 1000000.0;
     if (age < 0) {

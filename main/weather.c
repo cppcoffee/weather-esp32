@@ -11,7 +11,7 @@
 #include "net.h"
 #include "weather_json.h"
 
-static const char *TAG = "weather";
+static const char *log_tag = "weather";
 
 // ip-api.com: free, no key, plain HTTP. Returns lat/lon/city of the exit IP.
 #define GEO_URL "http://ip-api.com/json/?fields=status,city,lat,lon"
@@ -205,11 +205,11 @@ bool weather_update(weather_t *w)
         return false;
     }
     if (!parse_geo(buf, (size_t)len, &lat, &lon, w->city, sizeof(w->city))) {
-        ESP_LOGE(TAG, "geo parse failed");
+        ESP_LOGE(log_tag, "geo parse failed");
         return false;
     }
 
-    ESP_LOGI(TAG, "ip located: %s %.4f,%.4f", w->city, lat, lon);
+    ESP_LOGI(log_tag, "ip located: %s %.4f,%.4f", w->city, lat, lon);
 
     char lat_s[16], lon_s[16];
     snprintf(lat_s, sizeof(lat_s), "%.4f", lat);
@@ -221,11 +221,11 @@ bool weather_update(weather_t *w)
         return false;
     }
     if (!parse_forecast(buf, (size_t)len, w)) {
-        ESP_LOGE(TAG, "weather parse failed: invalid timezone, daily or hourly data");
+        ESP_LOGE(log_tag, "weather parse failed: invalid timezone, daily or hourly data");
         return false;
     }
     w->ok = true;
-    ESP_LOGI(TAG, "%s %.1f/%.1fC, %d days, %d hours, tz %+d", w->days[0].date, w->days[0].tmax, w->days[0].tmin,
+    ESP_LOGI(log_tag, "%s %.1f/%.1fC, %d days, %d hours, tz %+d", w->days[0].date, w->days[0].tmax, w->days[0].tmin,
              WEATHER_DAYS, WEATHER_HOURS, w->utc_offset);
     return true;
 }

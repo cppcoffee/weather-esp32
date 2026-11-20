@@ -11,19 +11,19 @@
 #include "esp_wifi.h"
 #include "lwip/ip4_addr.h"
 
-static const char *TAG = "net";
-static char s_ap_ssid[24];
+static const char *log_tag = "net";
+static char portal_ssid[24];
 
 const char *net_ap_ssid(void)
 {
     // 后缀取 MAC 后三字节：手上几块板子同时上电时热点名字不会撞。
     // 开放热点（无密码）：手机连上会提示「不安全」，但免去输密码。
-    if (!s_ap_ssid[0]) {
+    if (!portal_ssid[0]) {
         uint8_t mac[6] = {0};
         esp_efuse_mac_get_default(mac);
-        snprintf(s_ap_ssid, sizeof(s_ap_ssid), "weather-%02X%02X%02X", mac[3], mac[4], mac[5]);
+        snprintf(portal_ssid, sizeof(portal_ssid), "weather-%02X%02X%02X", mac[3], mac[4], mac[5]);
     }
-    return s_ap_ssid;
+    return portal_ssid;
 }
 
 void net_portal(void)
@@ -58,10 +58,10 @@ void net_portal(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     wifi_config_t no_sta = {0};
     if (esp_wifi_set_config(WIFI_IF_STA, &no_sta) != ESP_OK) {
-        ESP_LOGW(TAG, "could not clear STA config");
+        ESP_LOGW(log_tag, "could not clear STA config");
     }
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "AP %s up, open http://%s", name, NET_AP_URL);
+    ESP_LOGI(log_tag, "AP %s up, open http://%s", name, NET_AP_URL);
 
     portal_dns_start();
     ESP_ERROR_CHECK(portal_web_start());
@@ -69,5 +69,5 @@ void net_portal(void)
     portal_web_stop();
     portal_dns_stop();
     esp_wifi_stop();
-    ESP_LOGI(TAG, "portal closed, switching to station");
+    ESP_LOGI(log_tag, "portal closed, switching to station");
 }

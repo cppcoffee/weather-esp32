@@ -4,8 +4,8 @@
 
 #include "freertos/FreeRTOS.h"
 
-static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static voice_feedback_t s_feedback;
+static portMUX_TYPE feedback_lock = portMUX_INITIALIZER_UNLOCKED;
+static voice_feedback_t current_feedback;
 
 bool voice_feedback_publish(voice_state_t state, const char *activation_code)
 {
@@ -30,18 +30,20 @@ bool voice_feedback_publish(voice_state_t state, const char *activation_code)
     } else if (activation_code != NULL) {
         return false;
     }
-    portENTER_CRITICAL(&s_lock);
-    if (s_feedback.state != VOICE_STATE_ACTIVATION || (state != VOICE_STATE_CONNECTING && state != VOICE_STATE_ERROR)) {
-        s_feedback = next;
+    portENTER_CRITICAL(&feedback_lock);
+    if (current_feedback.state != VOICE_STATE_ACTIVATION
+        || (state != VOICE_STATE_CONNECTING && state != VOICE_STATE_ERROR))
+    {
+        current_feedback = next;
     }
-    portEXIT_CRITICAL(&s_lock);
+    portEXIT_CRITICAL(&feedback_lock);
     return true;
 }
 
 voice_feedback_t voice_feedback_get(void)
 {
-    portENTER_CRITICAL(&s_lock);
-    voice_feedback_t copy = s_feedback;
-    portEXIT_CRITICAL(&s_lock);
+    portENTER_CRITICAL(&feedback_lock);
+    voice_feedback_t copy = current_feedback;
+    portEXIT_CRITICAL(&feedback_lock);
     return copy;
 }
