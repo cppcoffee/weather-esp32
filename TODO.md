@@ -75,7 +75,6 @@ python3 tools/test_voice_session.py --sanitize
 python3 tools/test_device_mcp.py --sanitize
 python3 tools/test_audio_volume.py
 python3 tools/test_voice_settings.py
-python3 tools/test_portal.py
 python3 tools/preview_ui.py --sanitize
 # 按 AGENTS.md 的环境说明执行 idf.py build；真机验收另行记录。
 ```

@@ -19,7 +19,6 @@ env IDF_PATH=$HOME/.espressif/v6.0.2/esp-idf \
 ```bash
 python3 tools/test_app.py                  # 应用/解析/按键/UI（--only weather|ui|app）
 python3 tools/test_clock.py --sanitize     # 时钟、阻塞取数、跨午夜、显示互斥
-python3 tools/test_portal.py               # 配网页模板、转义、分块发送
 python3 tools/test_device_mcp.py           # 设备工具、音量、快照、并发
 python3 tools/test_audio_volume.py         # 音量恢复/NVS 故障回滚
 python3 tools/test_voice_feedback.py --sanitize  # 激活码、状态快照、状态绘图
@@ -116,9 +115,9 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 ## 配网页
 
 - 热点 `weather-XXXXXX`（开放），`192.168.1.1`，扫描或手填 SSID；凭据明文 HTTP 存 NVS，不先验证连接。不写编译期凭据、不提交真实密码。
-- 模板替换**不转义、不递归**；SSID 先 `html_escape()`。新增 token 同步替换表 + `test_portal.py`。
+- 模板替换**不转义、不递归**；SSID 先 `html_escape()`。新增 token 时同步更新替换表。
 - 表单字段：`ssid`/`ssid2`（手填优先）/`pass`/`voice_url`（必填）。服务设置与 WiFi 凭据同一 `wifi` NVS 事务；长按重配网只清 WiFi 部分。旧版 NVS 中的追问开关值不影响运行行为。
-- `send_page()` 分块发送并内联 CSS/JS；结果页自包含（保存后热点即关闭）。改页面后跑 `test_portal.py` + ESP-IDF 构建。
+- `send_page()` 分块发送并内联 CSS/JS；结果页自包含（保存后热点即关闭）。改页面后运行 ESP-IDF 构建。
 
 ## 屏幕驱动与刷新
 
@@ -171,7 +170,7 @@ swift tools/genicons.swift .cache/weather-icons/weathericons-regular-webfont.ttf
 | --- | --- |
 | 驱动、布局、字模、图标 | `test_app.py` + `preview_ui.py`（图标另核对预览与 `third_party/` 说明） |
 | 时钟任务、显示互斥、重试/配网页绘图 | `test_clock.py --sanitize` |
-| 配网页、模板、嵌入资源 | `test_portal.py` + ESP-IDF 构建 |
+| 配网页、模板、嵌入资源 | ESP-IDF 构建 |
 | 天气解析/数据契约 | `test_app.py --only weather`（含 `--only app`） |
 | 设备工具、音量、快照 | `test_device_mcp.py` + `test_audio_volume.py` |
 | `voice.c`/`voice_capture.c` 状态与时序 | `test_voice_lifecycle.py` + `test_voice_session.py --sanitize` |
@@ -183,6 +182,6 @@ swift tools/genicons.swift .cache/weather-icons/weathericons-regular-webfont.ttf
 ## 覆盖边界（测试通过 ≠ 真机可用）
 
 - 只有真机能验：真实 WiFi/HTTP(S)/TLS/DNS/NVS 时序、屏幕黑度/残影/刷新时序、WakeNet 与 VAD 识别率、AEC 实际抑制量、端到端打断延迟、音质与首句延迟。
-- `test_app.py` 的 `main.c` 语音与发布调用是 stub；`test_voice_lifecycle.py` 抽取真实状态函数（不覆盖整个 `voice.c` 或 SDK 停止时序）；`test_voice_session.py` 编译真实会话/播放/追问函数，stub RTOS/Opus/VAD/I²S；`test_portal.py` 不执行 JS、不验真实 HTTP。
+- `test_app.py` 的 `main.c` 语音与发布调用是 stub；`test_voice_lifecycle.py` 抽取真实状态函数（不覆盖整个 `voice.c` 或 SDK 停止时序）；`test_voice_session.py` 编译真实会话/播放/追问函数，stub RTOS/Opus/VAD/I²S。
 - `--baseline` 只在数据契约、布局、字模一致时有意义；`.cache/` 历史快照不是运行依赖。
 - 不要把 `ABLATION.md` 的旧体积/像素/残影数字当成当前保证。

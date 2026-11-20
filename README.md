@@ -92,7 +92,6 @@ idf.py -p 实际串口 monitor    # 需在真实终端运行
 ```bash
 python3 tools/test_app.py                 # 应用/解析/UI
 python3 tools/test_clock.py --sanitize    # 时钟与显示互斥
-python3 tools/test_portal.py              # 配网页模板与发送
 python3 tools/test_device_mcp.py          # 设备工具与音量
 python3 tools/test_voice_lifecycle.py     # 会话清理、断网恢复、重配网
 python3 tools/test_voice_session.py --sanitize  # 录音、播放、追问、打断
