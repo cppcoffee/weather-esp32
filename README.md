@@ -1,6 +1,6 @@
 # weather-esp32
 
-ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气面板，纯 ESP-IDF/C。支持 5 天预报、未来 10 小时逐时页、SNTP 时钟、本地温湿度气压传感器、网页配网，以及基于 `espressif/esp_xiaozhi`（WakeNet 本地唤醒）的 AI 语音问答。自建服务端见 [`xiaozhi-server-rs`](../xiaozhi-server-rs) 与 [`LOCAL_XIAOZHI.md`](LOCAL_XIAOZHI.md)。
+ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气面板，纯 ESP-IDF/C。支持 5 天预报、未来 10 小时逐时页、SNTP 时钟、本地温湿度气压传感器、网页配网，以及基于 `espressif/esp_xiaozhi`（WakeNet 本地唤醒）的 AI 语音问答。自建服务端见 [`xiaozhi-server-rs`](https://github.com/cppcoffee/xiaozhi-server-rs)。
 
 ## 硬件接线
 
