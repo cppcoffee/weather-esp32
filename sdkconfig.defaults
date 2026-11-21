@@ -20,3 +20,5 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
 CONFIG_SR_WN_WN9_XIAOLUXIAOLU_TTS2=y
 # 没有内置 OTA 服务：信息地址由配网页逐台填写，空值让 get_info() 直接报错
 CONFIG_XIAOZHI_OTA_URL=""
+# 系统时间由 SNTP 统一同步，禁止 OTA 接口用含时区偏移的 server_time 覆盖 UTC 时钟
+CONFIG_XIAOZHI_SYNC_SYSTEM_TIME_FROM_SERVER=n
