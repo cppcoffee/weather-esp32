@@ -23,7 +23,7 @@
 #define REFRESH_S          (30 * 60)
 #define RETRY_MIN_S        5
 #define RETRY_MAX_S        60
-#define SENSOR_POLL_US     (60LL * 1000000LL)
+#define SENSOR_POLL_US     (10LL * 60 * 1000000)
 
 enum app_view {
     VIEW_DAILY,
@@ -114,6 +114,9 @@ static void draw_page(const struct app_state *app)
         ui_draw_retry(app->retry_attempt, app->retry_delay);
     }
     ui_draw_status(app->status, app->status_attempt);
+    const char *page =
+        app->have_weather ? (app->view == VIEW_HOURLY ? "hourly" : "daily") : (app->retrying ? "retry" : "placeholder");
+    device_mcp_publish_display_page(page);
 }
 
 // Show the current action before a blocking step, so the footer says what the device is
@@ -205,6 +208,7 @@ static void show_portal(void)
 {
     xSemaphoreTake(display_lock, portMAX_DELAY);
     ui_draw_portal_hint();
+    device_mcp_publish_display_page("portal");
     epd_refresh();
     xSemaphoreGive(display_lock);
 }
@@ -227,6 +231,7 @@ static bool button_service(struct app_state *app)
         app->status = UI_STATUS_CONNECTING;
         app->status_attempt = 0;
         ui_draw_resetting();
+        device_mcp_publish_display_page("resetting");
         epd_refresh();
         xSemaphoreGive(display_lock);
         net_forget_creds();
@@ -307,6 +312,7 @@ static void run_connect_phase(struct app_state *app)
     app->status = UI_STATUS_RETRY;
     app->status_attempt = app->connect_attempt;
     ui_draw_retry(app->connect_attempt, delay_s);
+    device_mcp_publish_display_page("retry");
     ui_draw_status(app->status, app->status_attempt);
     epd_refresh();
     xSemaphoreGive(display_lock);
@@ -335,7 +341,8 @@ static void run_weather_phase(struct app_state *app)
     }
     set_status(app, UI_STATUS_FETCHING, 0, true);
     set_network_busy(app, true);
-    bool updated = weather_update(&app->w);
+    forecast_stamp_t fetched;
+    bool updated = weather_update(&app->w, &fetched);
     set_network_busy(app, false);
     if (app->deferred_hold) {
         voice_weather_end();
@@ -370,11 +377,7 @@ static void run_weather_phase(struct app_state *app)
         ESP_LOGW(log_tag, "update failed, retry #%u in %us", app->retry_attempt, app->retry_delay);
     }
 
-    sensor_reading_t sensor_snapshot;
-    xSemaphoreTake(display_lock, portMAX_DELAY);
-    sensor_snapshot = app->sensor;
-    xSemaphoreGive(display_lock);
-    app->stamp = device_mcp_publish(current_weather(app), &sensor_snapshot, app->retrying, updated);
+    app->stamp = device_mcp_publish_forecast(current_weather(app), updated ? &fetched : NULL, app->retrying);
     voice_weather_end();
     start_voice();
     voice_net_ready();
@@ -422,6 +425,7 @@ void app_main(void)
     if (sensor_init() != ESP_OK) {
         ESP_LOGW(log_tag, "local sensor unavailable");
     }
+    device_mcp_set_sensor_model(sensor_name());
     esp_err_t audio_err = audio_init();
     if (audio_err == ESP_FAIL) {
         vTaskDelay(pdMS_TO_TICKS(150));

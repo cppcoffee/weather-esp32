@@ -39,6 +39,12 @@ typedef int esp_err_t;
 #include <stdint.h>
 int64_t esp_timer_get_time(void);
 """,
+    "esp_system.h": r"""
+#pragma once
+#include <stdint.h>
+uint32_t esp_get_free_heap_size(void);
+uint32_t esp_get_free_internal_heap_size(void);
+""",
     "freertos/FreeRTOS.h": r"""
 #pragma once
 #include <pthread.h>
@@ -113,6 +119,33 @@ int64_t esp_timer_get_time(void)
 {
     CHECK(lock_depth == 0);
     return atomic_load(&uptime);
+}
+
+#if TEST_CURRENT_MCP
+#define SENSOR_PRESSURE(value) .pressure_hpa = (value),
+void net_get_status(net_status_t *out)
+{
+    CHECK(lock_depth == 0);
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->connected = true;
+    snprintf(out->ssid, sizeof(out->ssid), "TestWiFi");
+    out->rssi = -52;
+}
+#else
+#define SENSOR_PRESSURE(value)
+#endif
+
+uint32_t esp_get_free_heap_size(void)
+{
+    CHECK(lock_depth == 0);
+    return 120000;
+}
+
+uint32_t esp_get_free_internal_heap_size(void)
+{
+    CHECK(lock_depth == 0);
+    return 80000;
 }
 
 static void *json_malloc(size_t size)
@@ -371,11 +404,16 @@ static void volume(esp_mcp_t *mcp)
 {
     CHECK(mcp->tools[4]->property && mcp->tools[4]->property->min == 0 && mcp->tools[4]->property->max == 100);
     char *text = invoke(mcp, 3);
-    CHECK(strstr(text, "60"));
+    CHECK(strstr(text, "\"audio_speaker\":{\"volume\":60}") && strstr(text, "\"read_at\":null")
+          && strstr(text, "\"display_page\":\"placeholder\"") && strstr(text, "\"sensor_model\":\"unknown\"")
+          && strstr(text, "\"wifi\":{\"connected\":true,\"ssid\":\"TestWiFi\",\"rssi\":-52}")
+          && strstr(text, "\"memory\":{\"free_heap_bytes\":120000,\"free_internal_bytes\":80000}"));
     free(text);
+    synced = true;
     esp_mcp_tool_result_t result = {0};
     esp_mcp_property_list_t args = {.volume = 28};
     CHECK(callback(mcp, 4)(&args, &result) == ESP_OK && current_volume == 28 && result.calls == 1);
+    CHECK(!strcmp(result.text, "{\"volume\":28,\"saved\":true,\"applied_at\":\"2025-01-01T00:00:00+00:00\"}"));
     free(result.text);
     result = (esp_mcp_tool_result_t){0};
     args.volume = 101;
@@ -388,7 +426,22 @@ static void volume(esp_mcp_t *mcp)
     free(text);
     puts("PASS MCP speaker status, set, range and failure");
 }
+
 #endif
+
+static void publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying, bool updated)
+{
+#if TEST_CURRENT_MCP
+    forecast_stamp_t fetched = {
+        .fetched_at = net_synchronized_time(),
+        .fetched_uptime_us = esp_timer_get_time(),
+    };
+    device_mcp_publish_forecast(weather, updated ? &fetched : NULL, retrying);
+    device_mcp_publish_sensor(sensor);
+#else
+    device_mcp_publish(weather, sensor, retrying, updated);
+#endif
+}
 
 static void descriptions(esp_mcp_t *mcp)
 {
@@ -408,16 +461,16 @@ static void behavior(esp_mcp_t *mcp)
     weather_t w = fixture(0);
     weather_t partial = fixture(1);
     partial.ok = false;
-    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f, .pressure_hpa = 1013.25f};
+    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f, SENSOR_PRESSURE(1013.25f)};
     emit(mcp, "initial_time", 0);
     emit(mcp, "initial_forecast", 1);
     emit(mcp, "initial_sensor", 2);
     synced = true;
     emit(mcp, "synced_no_timezone", 0);
-    device_mcp_publish(&partial, &sensor, true, true);
+    publish(&partial, &sensor, true, true);
     emit(mcp, "first_failure", 1);
     synced = false;
-    device_mcp_publish(&w, &sensor, false, true);
+    publish(&w, &sensor, false, true);
     emit(mcp, "unknown_fetch", 1);
     emit(mcp, "unsynced_timezone", 0);
     synced = true;
@@ -427,11 +480,11 @@ static void behavior(esp_mcp_t *mcp)
     emit(mcp, "east8", 0);
     wall = EPOCH + 8;
     emit(mcp, "east8_next_second", 0);
-    device_mcp_publish(&w, &sensor, false, false);
+    publish(&w, &sensor, false, false);
     emit(mcp, "republish_does_not_date_old_cache", 1);
     wall = EPOCH;
     uptime = 20000000;
-    device_mcp_publish(&w, &sensor, false, true);
+    publish(&w, &sensor, false, true);
     emit(mcp, "success", 1);
     emit(mcp, "real_sensor", 2);
     /* Caller-owned inputs must be copied, not retained by pointer. */
@@ -445,32 +498,32 @@ static void behavior(esp_mcp_t *mcp)
     wall = EPOCH - 864000;
     uptime = 23750000;
     emit(mcp, "wall_backward", 1);
-    device_mcp_publish(&partial, NULL, true, true);
+    publish(&partial, NULL, true, true);
     emit(mcp, "failed_partial", 1);
     emit(mcp, "null_sensor", 2);
     w = fixture(1);
-    device_mcp_publish(&w, NULL, false, false);
+    publish(&w, NULL, false, false);
     emit(mcp, "not_an_update", 1);
     uptime = 1819999999;
     emit(mcp, "before_stale", 1);
     uptime = 1820000000;
     emit(mcp, "at_stale", 1);
     wall = EPOCH + 1800;
-    device_mcp_publish(&w, NULL, false, true);
+    publish(&w, NULL, false, true);
     emit(mcp, "recovered", 1);
     emit(mcp, "negative_half_hour", 0);
     w.utc_offset = 19800;
-    device_mcp_publish(&w, NULL, false, true);
+    publish(&w, NULL, false, true);
     emit(mcp, "positive_half_hour", 0);
     int offsets[] = {0, 50400, -50400, 50460, -50460, 1};
     const char *labels[] = {"utc", "plus14", "minus14", "offset_too_high", "offset_too_low", "offset_seconds"};
     for (int i = 0; i < 6; i++) {
         w.utc_offset = offsets[i];
-        device_mcp_publish(&w, NULL, false, true);
+        publish(&w, NULL, false, true);
         emit(mcp, labels[i], 0);
     }
     w.utc_offset = 28800;
-    device_mcp_publish(&w, NULL, false, true);
+    publish(&w, NULL, false, true);
     wall = 1704067199;
     emit(mcp, "reset_clock", 0);
     wall = 1704067200;
@@ -485,13 +538,13 @@ static void behavior(esp_mcp_t *mcp)
         {.valid = true, .temperature_c = 25, .humidity_percent = -INFINITY},
         {.valid = true, .temperature_c = 25, .humidity_percent = -0.25f},
         {.valid = true, .temperature_c = 25, .humidity_percent = 100.25f},
-        {.valid = true, .temperature_c = -12.5f, .humidity_percent = 0, .pressure_hpa = 299.5f},
-        {.valid = true, .temperature_c = 35.25f, .humidity_percent = 100, .pressure_hpa = 1012.5f},
+        {.valid = true, .temperature_c = -12.5f, .humidity_percent = 0, SENSOR_PRESSURE(299.5f)},
+        {.valid = true, .temperature_c = 35.25f, .humidity_percent = 100, SENSOR_PRESSURE(1012.5f)},
     };
     for (int i = 0; i < 11; i++) {
         char label[32];
         snprintf(label, sizeof(label), "sensor_%d", i);
-        device_mcp_publish_sensor(&samples[i]);
+        publish(NULL, &samples[i], false, false);
         emit(mcp, label, 2);
     }
 }
@@ -534,16 +587,16 @@ static void allocation_tests(esp_mcp_t *mcp)
     allocation_sweep(mcp, 1, "unavailable forecast");
     allocation_sweep(mcp, 2, "unavailable sensor");
     weather_t w = fixture(0);
-    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f, .pressure_hpa = 1013.25f};
-    device_mcp_publish(&w, &sensor, false, true);
+    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f, SENSOR_PRESSURE(1013.25f)};
+    publish(&w, &sensor, false, true);
     allocation_sweep(mcp, 1, "unknown fetch time");
     synced = true;
-    device_mcp_publish(&w, &sensor, false, true);
+    publish(&w, &sensor, false, true);
     allocation_sweep(mcp, 0, "synchronized time");
     allocation_sweep(mcp, 1, "complete 5-day/21-hour forecast");
     allocation_sweep(mcp, 2, "valid sensor");
     sensor.temperature_c = NAN;
-    device_mcp_publish(NULL, &sensor, true, false);
+    publish(NULL, &sensor, true, false);
     allocation_sweep(mcp, 2, "invalid sensor");
     allocation_sweep(mcp, 1, "retrying forecast");
 }
@@ -571,6 +624,41 @@ static cJSON *invoke_json(esp_mcp_t *mcp, int index)
     return json;
 }
 
+#if TEST_CURRENT_MCP
+static void sample_times(esp_mcp_t *mcp)
+{
+    sensor_reading_t sample = {.valid = true, .temperature_c = 23, .humidity_percent = 56};
+    device_mcp_publish_sensor(&sample);
+    synced = true;
+    wall = EPOCH + 9;
+    uptime = 14500000;
+    weather_t w = fixture(0);
+    // A forecast received before SNTP must keep its acquisition stamp when published later.
+    forecast_stamp_t fetched = {.fetched_uptime_us = 12000000};
+    device_mcp_publish_forecast(&w, &fetched, false);
+    cJSON *json = invoke_json(mcp, 2);
+    CHECK(cJSON_IsNull(field(json, "sampled_at")));
+    number(json, "sample_age_seconds", 4.5);
+    cJSON_Delete(json);
+    json = invoke_json(mcp, 1);
+    CHECK(cJSON_IsNull(field(json, "fetched_at")));
+    number(json, "age", 2.5);
+    cJSON_Delete(json);
+
+    device_mcp_publish_sensor(&sample);
+    wall = EPOCH + 1000;
+    uptime = 15750000;
+    device_mcp_publish_forecast(&w, NULL, true);
+    json = invoke_json(mcp, 2);
+    cJSON *at = field(json, "sampled_at");
+    CHECK(cJSON_IsString(at) && !strcmp(at->valuestring, "2025-01-01T08:00:09+08:00"));
+    number(json, "sample_age_seconds", 1.25);
+    number(json, "temperature_c", 23);
+    cJSON_Delete(json);
+    puts("PASS acquisition timestamps survive SNTP sync, clock jumps and forecast publication");
+}
+#endif
+
 static _Atomic bool start_threads, stop_writer;
 static _Atomic long publications;
 
@@ -585,7 +673,7 @@ static void *writer(void *unused)
     while (!atomic_load(&start_threads)) sched_yield();
     int v = 0;
     while (!atomic_load(&stop_writer)) {
-        device_mcp_publish(&variants[v], &sensors[v], v != 0, true);
+        publish(&variants[v], &sensors[v], v != 0, true);
         atomic_fetch_add(&publications, 1);
         v = !v;
         sched_yield();
@@ -648,7 +736,7 @@ static void concurrent(esp_mcp_t *mcp)
     synced = true;
     weather_t w = fixture(0);
     sensor_reading_t sensor = {.valid = true, .temperature_c = 10.25f, .humidity_percent = 20.5f};
-    device_mcp_publish(&w, &sensor, false, true);
+    publish(&w, &sensor, false, true);
     pthread_t producer, consumers[2];
     CHECK(pthread_create(&producer, NULL, writer, NULL) == 0);
     for (int i = 0; i < 2; i++) CHECK(pthread_create(&consumers[i], NULL, reader, mcp) == 0);
@@ -676,6 +764,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[1], "concurrent") == 0) concurrent(&engine);
 #if TEST_CURRENT_MCP
         else if (strcmp(argv[1], "volume") == 0) volume(&engine);
+        else if (strcmp(argv[1], "sample_times") == 0) sample_times(&engine);
 #endif
         else CHECK(!"unknown scenario");
         CHECK(esp_mcp_destroy(&engine) == ESP_OK && live_tools == 0);
@@ -843,21 +932,31 @@ def validate_behavior(output, *, legacy=False):
 
     def forecast(label, variant=0, *, age: float = 0, fetched_at: "int | None" = epoch, retrying=False):
         known = fetched_at is not None
+        next_refresh = None if retrying else max(0.0, 1800.0 - age)
         expect(label, {
             "available": True, "source": "Open-Meteo_cached_forecast", "retrying": retrying,
             **expected_forecast(variant, legacy=legacy), "fetched_at_known": known, "fetched_at": fetched_at,
             "age": age, "stale": retrying or not known or age >= 1800,
+            **({} if legacy else {
+                "refresh_interval_seconds": 1800,
+                "next_refresh_in_seconds": next_refresh,
+            }),
             **(LEGACY_FORECAST_METADATA if legacy else {}),
         })
 
-    def sensor(label, temperature=None, humidity=None, pressure=None, reason=None):
+    def sensor(label, temperature=None, humidity=None, pressure=None, reason=None, sampled_at=None, extra=None):
         expected = {
             "available": reason is None, "source": "local_sensor",
+            **({} if legacy else {"sensor_model": "unknown"}),
             "temperature_c": temperature, "humidity_percent": humidity,
             **({} if legacy else {"pressure_hpa": pressure}),
         }
         if reason:
             expected["reason"] = reason
+        elif not legacy:
+            expected.update(sampled_at=sampled_at, sample_age_seconds=0)
+        if extra and not legacy:
+            expected.update(extra)
         expect(label, expected)
 
     unavailable_time("initial_time", False)
@@ -877,7 +976,7 @@ def validate_behavior(output, *, legacy=False):
     for label in ("success", "copied_forecast"):
         forecast(label)
     for label in ("real_sensor", "copied_sensor"):
-        sensor(label, 23.75, 61.5, 1013.25)
+        sensor(label, 23.75, 61.5, 1013.25, sampled_at="2025-01-01T08:00:00+08:00")
     forecast("wall_forward", age=2.5)
     forecast("wall_backward", age=3.75)
     forecast("failed_partial", age=3.75, retrying=True)
@@ -896,8 +995,10 @@ def validate_behavior(output, *, legacy=False):
     clock("minimum_clock", 1704067200, 28800)
     for i in range(9):
         sensor(f"sensor_{i}", reason="sensor_unavailable" if i == 0 else "invalid_sensor_reading")
-    sensor("sensor_9", -12.5, 0, None)
-    sensor("sensor_10", 35.25, 100, 1012.5)
+    sensor("sensor_9", -12.5, 0, None, sampled_at="2024-01-01T08:00:00+08:00")
+    sensor("sensor_10", 35.25, 100, 1012.5, sampled_at="2024-01-01T08:00:00+08:00", extra={
+        "pressure_delta_hpa": -0.75, "pressure_trend": "steady", "pressure_trend_window_minutes": 30,
+    })
     require(checked == records.keys(), f"unvalidated records: {records.keys() - checked}")
     require(len(checked) == 44, "behavior scenario must retain all 44 results")
     print(f"PASS behavior: {len(checked)} results; time, sensor, full forecast and cache lifecycle")
@@ -919,6 +1020,13 @@ def compare_behavior(before, after):
                 else:
                     require(key not in old, f"{label}: unavailable baseline has metadata {key}")
         comparable = dict(new)
+        if old.get("source") == "local_sensor":
+            for key in ("sensor_model", "sampled_at", "sample_age_seconds", "pressure_hpa",
+                        "pressure_delta_hpa", "pressure_trend", "pressure_trend_window_minutes"):
+                comparable.pop(key, None)
+        if old.get("source") == "Open-Meteo_cached_forecast":
+            comparable.pop("refresh_interval_seconds", None)
+            comparable.pop("next_refresh_in_seconds", None)
         if "hours" in comparable:
             comparable["hours"] = [{key: val for key, val in hour.items() if key != "date"}
                                    for hour in comparable["hours"]]
@@ -983,7 +1091,7 @@ def main():
             ], work, env)
             scenarios = ["registration", "behavior", "descriptions", "allocation", "concurrent"]
             if label != "baseline":
-                scenarios.append("volume")
+                scenarios.extend(("volume", "sample_times"))
             for scenario in scenarios:
                 output = run([executable, scenario], work, env)
                 if artifacts:

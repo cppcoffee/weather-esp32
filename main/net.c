@@ -216,3 +216,20 @@ void net_set_wifi_low_latency(bool enable)
         ESP_LOGW(log_tag, "wifi ps(%s) failed: %s", enable ? "none" : "min_modem", esp_err_to_name(err));
     }
 }
+
+void net_get_status(net_status_t *out)
+{
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!sta_events || !(xEventGroupGetBits(sta_events) & GOT_IP)) {
+        return;
+    }
+    wifi_ap_record_t ap = {0};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        out->connected = true;
+        snprintf(out->ssid, sizeof(out->ssid), "%.*s", (int)sizeof(ap.ssid), (const char *)ap.ssid);
+        out->rssi = ap.rssi;
+    }
+}

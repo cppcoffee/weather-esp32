@@ -4,7 +4,7 @@ ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气面板，纯 ESP-IDF/C。
 
 ## 硬件接线
 
-| 屏幕 (SSD1680) | GPIO | 音频 (ES8311 + NS415B) | GPIO | 传感器 (`I2C_NUM_1`) | GPIO |
+| 屏幕 (SSD1680) | GPIO | 音频 (ES8311 + NS415B) | GPIO | AHT20+BMP280 | GPIO |
 |---|---|---|---|---|---|
 | SCK | 38 | 功放 EN | 15 | SDA | 5 |
 | SDA (MOSI) | 39 | I²S DOUT | 16 | SCL | 6 |
@@ -16,7 +16,7 @@ ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气面板，纯 ESP-IDF/C。
 
 - 修改引脚只改 `main/epd.h`、`main/audio.h`、`main/sensor.h` 顶部的 `#define`。
 - GPIO33–37 被 Octal PSRAM 占用，GPIO43/44 留给外接 UART 日志，GPIO19/20 为 USB-JTAG；所有外设需与 ESP32 共地。
-- 传感器自动识别 BME280、BME680/688、AHT20/SHT3x/SHT4x + BMP280/BMP388/390，每 60 秒采样并局部刷新底栏；未接入或读数异常时显示 `--.-°C` / `--.-%` / `---.-kPa`。
+- 传感器使用 AHT20+BMP280（`SDA=GPIO5`、`SCL=GPIO6`、`VCC=3V3`、`GND` 共地，驱动同时兼容 BME280、BME680/688、AHT20/SHT3x/SHT4x + BMP280/BMP388/390）。开机采集一次温湿度和气压，之后每 10 分钟采集一次。屏幕和 MCP 共用最新读数，底栏数值变化时局部刷新。未接入或读数异常时显示 `--.-°C` / `--.-%` / `---.-kPa`。
 
 ## 编译与烧录
 

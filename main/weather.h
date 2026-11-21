@@ -24,7 +24,21 @@ typedef struct {
     float tmax, tmin;
     int code;
     float precip_probability; // 0..100%, highest interval probability that day, not current rain conditions
+    char sunrise[6];          // HH:MM local time, empty if unavailable
+    char sunset[6];           // HH:MM local time, empty if unavailable
+    float uv_index_max;
+    bool uv_valid;
 } weather_day_t;
+
+typedef struct {
+    bool valid;
+    float temperature_c;
+    float apparent_temperature_c;
+    float relative_humidity;
+    float wind_speed_kmh;
+    int wind_direction_deg;
+    int code;
+} weather_current_t;
 
 typedef struct {
     int date; // local YYYYMMDD, retained from the API for midnight/DST transitions
@@ -38,9 +52,12 @@ typedef struct {
     char city[24];
     weather_day_t days[WEATHER_DAYS];
     weather_hour_t hours[WEATHER_HOURS];
+    weather_current_t current;
     int utc_offset; // seconds east of UTC, from the weather API or coordinates
     bool tz_known;
     bool ok;
 } weather_t;
 
-bool weather_update(weather_t *w); // exit-IP geolocation + five-day forecast + 21-hour data; resets w even on failure
+// Exit-IP geolocation + five-day forecast + 21-hour data. Resets w even on failure;
+// writes fetched only on success when the caller requests acquisition metadata.
+bool weather_update(weather_t *w, forecast_stamp_t *fetched);

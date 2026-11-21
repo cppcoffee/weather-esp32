@@ -26,7 +26,7 @@ typedef enum {
 void ui_draw_weather(const weather_t *weather, const sensor_reading_t *sensor);
 // Hourly strip for the current local hour and the next 9, one column per hour.
 void ui_draw_hourly(const weather_t *weather, const sensor_reading_t *sensor);
-// Set metadata from device_mcp_publish before drawing the page. NULL means no forecast.
+// Set metadata from device_mcp_publish_forecast before drawing the page. NULL means no forecast.
 void ui_set_forecast_stamp(const forecast_stamp_t *stamp);
 // Redraw only the footer status corner; attempt is used by UI_STATUS_RETRY.
 void ui_draw_status(ui_status_t status, unsigned attempt);

@@ -57,7 +57,7 @@ static struct epd_test_spi panel;
 static unsigned page_switches, refreshed_switches, full_updates;
 static bool dc_level = true;
 static bool allow_forecast_pixels, allow_hourly_pixels, allow_page_switch, allow_status_pixels, allow_sensor_pixels;
-static unsigned forecast_pixels, sensor_publications;
+static unsigned forecast_pixels, sensor_reads, sensor_publications;
 static sensor_reading_t mock_sensor;
 static bool ready, blocked, stopping, allow_weather_return, erased, reprovisioned;
 enum { FRAME_BYTES = PANEL_W / 8 * PANEL_H };
@@ -217,11 +217,14 @@ esp_err_t audio_init(void) { return ESP_OK; }
 esp_err_t sensor_init(void) { return ESP_OK; }
 bool sensor_read(sensor_reading_t *out) {
     pthread_mutex_lock(&gate);
+    sensor_reads++;
     *out = mock_sensor;
     pthread_mutex_unlock(&gate);
     return out->valid;
 }
 const char *sensor_name(void) { return "mock"; }
+void device_mcp_set_sensor_model(const char *model) { (void)model; }
+void device_mcp_publish_display_page(const char *page) { (void)page; }
 void device_mcp_publish_sensor(const sensor_reading_t *sensor) {
     assert(sensor != NULL);
     pthread_mutex_lock(&gate);
@@ -235,7 +238,7 @@ void voice_net_ready(void) {}
 void voice_net_pause(void) {}
 bool voice_weather_begin(void) { return true; }
 void voice_weather_end(void) {}
-forecast_stamp_t device_mcp_publish(const weather_t *w, const sensor_reading_t *sensor, bool retrying, bool updated) {
+forecast_stamp_t device_mcp_publish_forecast(const weather_t *w, const forecast_stamp_t *fetched, bool retrying) {
     return (forecast_stamp_t){0};
 }
 void net_init(void) {}
@@ -250,7 +253,7 @@ void net_portal(void) {
 const char *net_ap_ssid(void) { return "weather-DEMO"; }
 void net_apply_tz(int offset) {}
 bool net_time_is_synced(void) { return atomic_load(&synced); }
-bool weather_update(weather_t *weather) {
+bool weather_update(weather_t *weather, forecast_stamp_t *fetched) {
     assert(!display_held); /* A network wait must not prevent the clock from drawing. */
     pthread_mutex_lock(&gate);
     blocked = true; pthread_cond_broadcast(&changed);
@@ -328,6 +331,7 @@ int main(void) {
     assert(!pthread_create(&app_thread, NULL, app_start, NULL));
     pthread_mutex_lock(&gate);
     while (!ready || !blocked || notify_done != pending_notifies) pthread_cond_wait(&changed, &gate);
+    assert(sensor_reads == 1 && sensor_publications == 1);
     pthread_mutex_unlock(&gate);
     unsigned voice_bytes = 0;
     sample_button(0, 8); sample_button(1, 3);
@@ -473,21 +477,26 @@ int main(void) {
     }
     publish_status(VOICE_STATE_WAIT_NETWORK, NULL, true);
 
-    /* Periodic sensor poll changes only x < 200, y >= 110 and publishes to MCP. */
-    unsigned before_pub;
+    /* Sensor polling is due at 10 minutes of monotonic time, regardless of wall time. */
     pthread_mutex_lock(&gate);
     mock_sensor = (sensor_reading_t){.temperature_c = 23.5f, .humidity_percent = 58.0f, .pressure_hpa = 1013.2f, .valid = true};
-    before_pub = sensor_publications;
+    unsigned before_poll = sensor_reads;
+    assert(sensor_publications == before_poll);
     pthread_mutex_unlock(&gate);
+    atomic_fetch_add(&uptime, 599LL * 1000000);
+    advance(0, false);
+    assert(sensor_reads == before_poll && sensor_publications == before_poll);
+
+    /* A changed reading refreshes only x < 200, y >= 110 and publishes to MCP. */
     allow_sensor_pixels = true;
-    atomic_fetch_add(&uptime, 60LL * 1000000LL);
+    atomic_fetch_add(&uptime, 1000000);
     advance(0, true);
     allow_sensor_pixels = false;
-    assert(sensor_publications == before_pub + 1);
-    /* Identical sensor reading on next 60 s poll must not trigger a redundant refresh. */
-    atomic_fetch_add(&uptime, 60LL * 1000000LL);
+    assert(sensor_reads == before_poll + 1 && sensor_publications == before_poll + 1);
+    /* An identical reading at the next poll is published without refreshing the screen. */
+    atomic_fetch_add(&uptime, 600LL * 1000000);
     advance(0, false);
-    assert(sensor_publications == before_pub + 2);
+    assert(sensor_reads == before_poll + 2 && sensor_publications == before_poll + 2);
 
     assert(!erased && !reprovisioned); /* WiFi credentials stay intact during HTTP I/O. */
     pthread_mutex_lock(&gate);
@@ -502,6 +511,7 @@ int main(void) {
     assert(panel.updates == frames && full_updates == 2);
     assert(memcmp(panel.old, panel.bw, FRAME_BYTES) == 0);
     puts("PASS clock: blocked HTTP taps and hold, local time, retry, setup/resume, forecast expiry, hourly rollover, regional window and full waveform only on page switches 8 and 16");
+    puts("PASS sensor cadence: one boot sample, 10-minute polls, MCP publication and changed-region refresh");
     printf("0x24 image bytes: clock %u, voice status %u, full frame %u\n",
            clock_bytes, voice_bytes, FRAME_BYTES);
 }

@@ -6,14 +6,18 @@
 // Protocol dispatch and schemas are owned by the managed mcp-c-sdk.
 typedef struct esp_mcp_s esp_mcp_t;
 
-// Publish the same successful forecast and local sensor values used by the UI.
-// Only forecast_updated && weather->ok replaces the cached forecast/fetch time;
-// failures retain it and update retrying. Safe to call before voice_init or after it fails.
-forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying,
-                                    bool forecast_updated);
+// Publish the same successful forecast used by the UI. A failed fetch passes NULL
+// for fetched so it retains the previous data and updates retrying.
+forecast_stamp_t device_mcp_publish_forecast(const weather_t *weather, const forecast_stamp_t *fetched, bool retrying);
 
-// Publish a fresh local sensor reading without touching the cached forecast snapshot.
+// Call when sampling completes to publish the values and acquisition time together.
 void device_mcp_publish_sensor(const sensor_reading_t *sensor);
+
+// Record the detected local sensor chip summary (e.g. "AHT20+BMP280").
+void device_mcp_set_sensor_model(const char *model);
+
+// Publish the current e-paper screen mode (e.g. "daily", "hourly", "portal").
+void device_mcp_publish_display_page(const char *page);
 
 // Register the device data and audio controls. The engine owns tools after success;
 // the caller must destroy the engine if registration fails partway through.

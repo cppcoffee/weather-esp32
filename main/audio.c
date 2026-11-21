@@ -301,8 +301,8 @@ esp_err_t audio_init(void)
     }
     audio_device.ready = true;
     audio_device.muted = true;
-    ESP_LOGI(log_tag, "ES8311 audio ready: %d Hz, %d-bit stereo, PA GPIO %d", AUDIO_SAMPLE_RATE_HZ,
-             AUDIO_BITS_PER_SAMPLE, AUDIO_PA_EN_GPIO);
+    ESP_LOGI(log_tag, "ES8311 audio ready: %d Hz, %d-bit stereo, PA GPIO %d, speaker volume %d%%", AUDIO_SAMPLE_RATE_HZ,
+             AUDIO_BITS_PER_SAMPLE, AUDIO_PA_EN_GPIO, audio_device.volume);
     return ESP_OK;
 }
 

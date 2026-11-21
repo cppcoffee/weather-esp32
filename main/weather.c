@@ -8,6 +8,7 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "net.h"
 #include "weather_json.h"
 
@@ -19,7 +20,9 @@ static const char *log_tag = "weather";
 // forecast_hours=21 starts at the current local hour, so the hourly strip covers now .. +20 h.
 #define WX_URL                                                                                                         \
     "https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"                                                  \
-    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"                          \
+    "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m" \
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,sunrise,"    \
+    "sunset"                                                                                                           \
     "&hourly=weather_code,temperature_2m,precipitation_probability"                                                    \
     "&temperature_unit=celsius&timezone=auto&forecast_days=5&forecast_hours=21"
 
@@ -87,6 +90,24 @@ static bool json_hour_time(const cJSON *item, char date[11], int *hour, long *st
     return true;
 }
 
+static void copy_hhmm(const cJSON *item, char out[6])
+{
+    out[0] = '\0';
+    const char *value = NULL;
+    if (!json_string_with_length(item, 16, &value) || value[10] != 'T' || value[13] != ':' || value[11] < '0'
+        || value[11] > '2' || value[12] < '0' || value[12] > '9' || value[14] < '0' || value[14] > '5'
+        || value[15] < '0' || value[15] > '9')
+    {
+        return;
+    }
+    int hh = (value[11] - '0') * 10 + (value[12] - '0');
+    if (hh > 23) {
+        return;
+    }
+    memcpy(out, value + 11, 5);
+    out[5] = '\0';
+}
+
 static bool json_days(const cJSON *daily, weather_day_t days[WEATHER_DAYS])
 {
     cJSON *dates;
@@ -102,6 +123,13 @@ static bool json_days(const cJSON *daily, weather_day_t days[WEATHER_DAYS])
     {
         return false;
     }
+    cJSON *uv_maxima = NULL;
+    cJSON *sunrises = NULL;
+    cJSON *sunsets = NULL;
+    (void)json_object_array(daily, "uv_index_max", WEATHER_DAYS, &uv_maxima);
+    (void)json_object_array(daily, "sunrise", WEATHER_DAYS, &sunrises);
+    (void)json_object_array(daily, "sunset", WEATHER_DAYS, &sunsets);
+
     int previous = 0;
     for (int i = 0; i < WEATHER_DAYS; i++) {
         int ordinal, code;
@@ -119,6 +147,18 @@ static bool json_days(const cJSON *daily, weather_day_t days[WEATHER_DAYS])
         days[i].tmin = (float)tmin;
         days[i].code = code;
         days[i].precip_probability = (float)precip_probability;
+
+        double uv = 0;
+        if (uv_maxima && json_num(cJSON_GetArrayItem(uv_maxima, i), &uv) && uv >= 0 && uv <= 30) {
+            days[i].uv_index_max = (float)uv;
+            days[i].uv_valid = true;
+        }
+        if (sunrises) {
+            copy_hhmm(cJSON_GetArrayItem(sunrises, i), days[i].sunrise);
+        }
+        if (sunsets) {
+            copy_hhmm(cJSON_GetArrayItem(sunsets, i), days[i].sunset);
+        }
         previous = ordinal;
     }
     return true;
@@ -195,6 +235,35 @@ static int utc_offset_from_coords(double lat, double lon)
     return zone * 3600;
 }
 
+static void json_current(const cJSON *current, weather_current_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!cJSON_IsObject(current)) {
+        return;
+    }
+    double temp = 0, apparent = 0, humidity = 0, wind_speed = 0;
+    int code = 0, wind_dir = 0;
+    if (!json_num(cJSON_GetObjectItemCaseSensitive(current, "temperature_2m"), &temp) || fabs(temp) > FLT_MAX
+        || !json_num(cJSON_GetObjectItemCaseSensitive(current, "apparent_temperature"), &apparent)
+        || fabs(apparent) > FLT_MAX
+        || !json_num(cJSON_GetObjectItemCaseSensitive(current, "relative_humidity_2m"), &humidity) || humidity < 0
+        || humidity > 100 || !json_int(cJSON_GetObjectItemCaseSensitive(current, "weather_code"), &code) || code < 0
+        || code > 99 || !json_num(cJSON_GetObjectItemCaseSensitive(current, "wind_speed_10m"), &wind_speed)
+        || wind_speed < 0 || wind_speed > 500
+        || !json_int(cJSON_GetObjectItemCaseSensitive(current, "wind_direction_10m"), &wind_dir) || wind_dir < 0
+        || wind_dir > 360)
+    {
+        return;
+    }
+    out->temperature_c = (float)temp;
+    out->apparent_temperature_c = (float)apparent;
+    out->relative_humidity = (float)humidity;
+    out->wind_speed_kmh = (float)wind_speed;
+    out->wind_direction_deg = wind_dir;
+    out->code = code;
+    out->valid = true;
+}
+
 static bool parse_forecast(const char *buf, size_t length, weather_t *weather)
 {
     cJSON *root = json_parse(buf, length);
@@ -205,15 +274,17 @@ static bool parse_forecast(const char *buf, size_t length, weather_t *weather)
     bool ok = json_int(cJSON_GetObjectItemCaseSensitive(root, "utc_offset_seconds"), &weather->utc_offset)
               && json_days(cJSON_GetObjectItemCaseSensitive(root, "daily"), weather->days)
               && json_hours(cJSON_GetObjectItemCaseSensitive(root, "hourly"), weather->days[0].date, weather->hours);
+    if (ok) {
+        json_current(cJSON_GetObjectItemCaseSensitive(root, "current"), &weather->current);
+    }
     cJSON_Delete(root);
     return ok;
 }
 
-bool weather_update(weather_t *w)
+bool weather_update(weather_t *w, forecast_stamp_t *fetched)
 {
     static char buf[8192];
     double lat, lon;
-    char url[320];
 
     memset(w, 0, sizeof(*w));
 
@@ -235,6 +306,7 @@ bool weather_update(weather_t *w)
     ESP_LOGI(log_tag, "ip located: %s %.4f,%.4f (coord tz %+d)", w->city, lat, lon, coord_offset);
 
     char lat_s[16], lon_s[16];
+    char url[sizeof(WX_URL) + sizeof(lat_s) + sizeof(lon_s)];
     snprintf(lat_s, sizeof(lat_s), "%.4f", lat);
     snprintf(lon_s, sizeof(lon_s), "%.4f", lon);
     snprintf(url, sizeof(url), WX_URL, lat_s, lon_s);
@@ -256,6 +328,12 @@ bool weather_update(weather_t *w)
 #endif
     w->tz_known = true;
     w->ok = true;
+    if (fetched) {
+        *fetched = (forecast_stamp_t){
+            .fetched_at = net_synchronized_time(),
+            .fetched_uptime_us = esp_timer_get_time(),
+        };
+    }
     ESP_LOGI(log_tag, "%s %.1f/%.1fC, %d days, %d hours, tz %+d", w->days[0].date, w->days[0].tmax, w->days[0].tmin,
              WEATHER_DAYS, WEATHER_HOURS, w->utc_offset);
     return true;

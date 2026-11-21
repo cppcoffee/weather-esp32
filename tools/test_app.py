@@ -98,7 +98,8 @@ PRESSES = {
 GEO_URL = "http://ip-api.com/json/?fields=status,city,lat,lon"
 WEATHER_URL = (
     "https://api.open-meteo.com/v1/forecast?latitude=30.5728&longitude=104.0668"
-    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+    "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m"
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,sunrise,sunset"
     "&hourly=weather_code,temperature_2m,precipitation_probability"
     "&temperature_unit=celsius"
     "&timezone=auto&forecast_days=5&forecast_hours=21"
@@ -315,6 +316,8 @@ esp_err_t sensor_init(void) { return ESP_OK; }
 bool sensor_read(sensor_reading_t *out) { if (out) *out = (sensor_reading_t){0}; return false; }
 const char *sensor_name(void) { return "none"; }
 void device_mcp_publish_sensor(const sensor_reading_t *sensor) { assert(sensor && !sensor->valid); }
+void device_mcp_set_sensor_model(const char *model) { (void)model; }
+void device_mcp_publish_display_page(const char *page) { (void)page; }
 /* The dedicated clock regression runs the real clock task with pthread-backed RTOS stubs. */
 static bool display_locked;
 void *xSemaphoreCreateMutex(void) { return (void *)1; }
@@ -681,10 +684,16 @@ void net_forget_creds(void) {
     credentials_erased = true;
     puts("forget");
 }
+#ifdef BASELINE_APP
 forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying, bool updated) {
+#else
+forecast_stamp_t device_mcp_publish_forecast(const weather_t *weather, const forecast_stamp_t *fetched, bool retrying) {
+    bool updated = fetched != NULL;
+    if (updated) assert(fetched->fetched_at >= NET_MIN_SYNCED_EPOCH);
+#endif
     static weather_t previous;
     static bool published;
-    assert(weather_reserved && sensor && !sensor->valid);
+    assert(weather_reserved);
     assert(updated == (pattern[cycle] == 'S'));
     assert(retrying == !updated);
     if (updated) {
@@ -716,7 +725,8 @@ int net_http_get(const char *url, char *buf, size_t cap) {
     }
     assert(strcmp(url,
         "https://api.open-meteo.com/v1/forecast?latitude=30.5728&longitude=104.0668"
-        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,sunrise,sunset"
         "&hourly=weather_code,temperature_2m,precipitation_probability"
         "&temperature_unit=celsius"
         "&timezone=auto&forecast_days=5&forecast_hours=21") == 0);
@@ -762,6 +772,8 @@ WEATHER_HARNESS = r'''
 #include "net.h"
 #include "fixtures.h"
 
+bool net_time_is_synced(void) { return true; }
+
 static const char *response;
 static unsigned requests;
 
@@ -774,7 +786,8 @@ int net_http_get(const char *url, char *buf, size_t cap) {
         assert(requests == 2);
         assert(strcmp(url,
             "https://api.open-meteo.com/v1/forecast?latitude=30.5728&longitude=104.0668"
-            "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+            "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m"
+            "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,sunrise,sunset"
             "&hourly=weather_code,temperature_2m,precipitation_probability"
             "&temperature_unit=celsius"
             "&timezone=auto&forecast_days=5&forecast_hours=21") == 0);
@@ -790,7 +803,7 @@ int main(int argc, char **argv) {
     response = argv[1];
     /* Failures must clear a previously successful weather result. */
     weather_t w = sample_weather(7);
-    bool result = weather_update(&w);
+    bool result = weather_update(&w, NULL);
     assert(requests == 2);
     printf("{\"result\":%d,\"ok\":%d,\"utc_offset\":%d,\"days\":[",
         result, w.ok, w.utc_offset);
