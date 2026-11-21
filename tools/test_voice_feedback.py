@@ -30,7 +30,11 @@ HARNESS = r'''
 enum { FRAME_BYTES = PANEL_W / 8 * PANEL_H };
 static unsigned char frame[FRAME_BYTES];
 int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *transaction) {
-    if (transaction->length == FRAME_BYTES * 8) memcpy(frame, transaction->tx_buffer, sizeof(frame));
+    static struct epd_test_spi panel;
+    if (epd_test_transfer(&panel, ui_dc, transaction)) {
+        assert(panel.update == 0x0F);
+        memcpy(frame, panel.bw, sizeof(frame));
+    }
     return 0;
 }
 static void *publish_many(void *arg) {
@@ -182,7 +186,7 @@ def main():
         sources = ["voice_feedback.c", "epd.c", "fonts_aa.c", "font_clock.c", "font_icons.c"]
         subprocess.run([
             compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-function",
-            "-pthread", *flags, "-I", str(work / "stubs"), "-I", str(project / "main"),
+            "-pthread", *flags, "-I", str(work / "stubs"), "-I", str(project / "main"), "-I", str(project / "tools"),
             str(work / "ui_wrapper.c"), *(str(project / "main" / name) for name in sources),
             str(work / "feedback.c"), "-lm", "-o", str(work / "feedback"),
         ], check=True, timeout=60)

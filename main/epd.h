@@ -32,11 +32,7 @@ void epd_hline(int x, int y, int w, int color);
 void epd_fill_rect(int x, int y, int w, int h, int color);
 void epd_text(int x, int y_baseline, const aafont *f, const char *s); // y = baseline
 int epd_text_w(const aafont *f, const char *s);
+// Update the changed region with the partial waveform.
 void epd_refresh(void);
-// Partial waveform now, without advancing or triggering the periodic full-refresh cadence.
-void epd_refresh_partial(void);
-// Page-switch refresh: switches 1..7 use the partial waveform; switch 8 uses a full refresh
-// (also consuming any due maintenance refresh) and restarts the switch count.
+// Only page switches advance the cadence. Every eighth switch uses the full waveform.
 void epd_refresh_page_switch(void);
-// Full waveform now, without consuming the periodic partial-refresh cadence.
-void epd_refresh_full(void);

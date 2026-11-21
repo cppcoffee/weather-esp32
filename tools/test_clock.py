@@ -26,6 +26,7 @@ HARNESS = r'''
 #include <time.h>
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "epd_spi_test.h"
 #include "device_mcp.h"
 #include "button.h"
 #include "freertos/FreeRTOS.h"
@@ -52,8 +53,9 @@ static atomic_bool synced;
 static atomic_llong wall_time = 1735689540LL; /* 2024-12-31 23:59:00 UTC */
 static atomic_llong uptime;
 static unsigned generation, completed, frames, pending_notifies, notify_done;
-static unsigned full_refreshes, partial_refreshes;
-static int dc_level = 1, last_cmd;
+static struct epd_test_spi panel;
+static unsigned page_switches, refreshed_switches, full_updates;
+static bool dc_level = true;
 static bool allow_forecast_pixels, allow_hourly_pixels, allow_page_switch, allow_status_pixels, allow_sensor_pixels;
 static unsigned forecast_pixels, sensor_publications;
 static sensor_reading_t mock_sensor;
@@ -111,6 +113,7 @@ int xQueueReceive(void *q, void *item, unsigned timeout) {
     bool ready = queued_count != 0;
     if (ready) {
         *(button_event_t *)item = queued[0];
+        if (queued[0] == BUTTON_TAP) page_switches++;
         memmove(queued, queued + 1, --queued_count * sizeof(*queued));
     }
     pthread_mutex_unlock(&gate);
@@ -182,23 +185,32 @@ int gpio_set_level(int pin, int level) {
 }
 int gpio_get_level(int pin) { return pin == 4 ? atomic_load(&pin_level) : 0; } /* Idle button, idle EPD BUSY. */
 int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *transaction) {
-    if (transaction->length == 8) {
-        const unsigned char *p = transaction->tx_buffer;
-        if (!dc_level) {
-            last_cmd = p[0];
-        } else if (last_cmd == 0x22) {
-            pthread_mutex_lock(&gate);
-            if (p[0] == 0xC7) full_refreshes++;
-            else if (p[0] == 0x0F) partial_refreshes++;
-            pthread_mutex_unlock(&gate);
-        }
-    }
-    if (transaction->length == FRAME_BYTES * 8) {
+    pthread_mutex_lock(&gate);
+    if (epd_test_transfer(&panel, dc_level, transaction)) {
         assert(display_held);
-        pthread_mutex_lock(&gate);
-        memcpy(frame, transaction->tx_buffer, sizeof(frame)); frames++;
-        pthread_mutex_unlock(&gate);
+        bool full = refreshed_switches != page_switches && page_switches % 8 == 0;
+        assert(panel.update == (full ? 0xC7 : 0x0F));
+        if (full) full_updates++;
+        if (frames && !full) {
+            unsigned x_start = TEST_ROW_BYTES, x_end = 0, y_start = PANEL_H, y_end = 0;
+            for (unsigned y = 0; y < PANEL_H; y++) for (unsigned x = 0; x < TEST_ROW_BYTES; x++) {
+                size_t offset = y * TEST_ROW_BYTES + x;
+                assert(panel.old[offset] == frame[offset]);
+                if (panel.bw[offset] != frame[offset]) {
+                    if (x < x_start) x_start = x;
+                    if (x > x_end) x_end = x;
+                    if (y < y_start) y_start = y;
+                    y_end = y;
+                }
+            }
+            assert(panel.x_start == x_start && panel.x_end == x_end);
+            assert(panel.y_start == y_start && panel.y_end == y_end);
+        }
+        refreshed_switches = page_switches;
+        memcpy(frame, panel.bw, sizeof(frame));
+        frames++;
     }
+    pthread_mutex_unlock(&gate);
     return 0;
 }
 esp_err_t audio_init(void) { return ESP_OK; }
@@ -283,15 +295,14 @@ static void publish_status(voice_state_t state, const char *code, bool expect_re
     unsigned char before[FRAME_BYTES];
     pthread_mutex_lock(&gate);
     memcpy(before, frame, sizeof(before));
-    unsigned previous_frames = frames, previous_full = full_refreshes, previous_partial = partial_refreshes;
+    unsigned previous_frames = frames;
     unsigned target = pending_notifies + 1;
     pthread_mutex_unlock(&gate);
     assert(voice_feedback_publish(state, code));
     pthread_mutex_lock(&gate);
     while (notify_done < target) pthread_cond_wait(&changed, &gate);
     assert(frames == previous_frames + (expect_refresh ? 1 : 0));
-    assert(full_refreshes == previous_full); /* Voice status updates must never trigger a full flash. */
-    assert(partial_refreshes == previous_partial + (expect_refresh ? 1 : 0));
+    assert(panel.updates == frames);
     unsigned pixels = 0;
     for (int x = 0; x < 296; x++) for (int y = 0; y < 128; y++) {
         int px = 127 - y, index = x * 16 + (px >> 3), mask = 0x80 >> (px & 7);
@@ -318,12 +329,26 @@ int main(void) {
     pthread_mutex_lock(&gate);
     while (!ready || !blocked || notify_done != pending_notifies) pthread_cond_wait(&changed, &gate);
     pthread_mutex_unlock(&gate);
+    unsigned voice_bytes = 0;
     sample_button(0, 8); sample_button(1, 3);
     assert(queued_count == 1 && queued[0] == BUTTON_TAP);
     allow_page_switch = true;
     advance(0, true); /* The visible page switches while the HTTP stub stays blocked. */
     assert(queued_count == 0);
     allow_page_switch = false;
+    for (unsigned i = 1; i < 16; i++) {
+        if (i == 7 || i == 15) {
+            publish_status(VOICE_STATE_LISTENING, NULL, true);
+            voice_bytes = panel.image_bytes;
+            assert(voice_bytes < FRAME_BYTES);
+            publish_status(VOICE_STATE_WAIT_NETWORK, NULL, true);
+        }
+        sample_button(0, 8); sample_button(1, 3);
+        allow_page_switch = true;
+        advance(0, true);
+        allow_page_switch = false;
+    }
+    assert(page_switches == 16 && full_updates == 2);
     sample_button(0, 8); sample_button(1, 3);
     assert(queued_count == 1 && queued[0] == BUTTON_TAP);
     sample_button(0, BUTTON_LONG_PRESS_MS / BUTTON_POLL_MS + 10);
@@ -345,6 +370,8 @@ int main(void) {
     assert(!memcmp(updated, frame, sizeof(frame))); /* 23:59 UTC is 07:59 local. */
     xSemaphoreGive(&display);
     advance(1, true); /* Local time rolls to 08:00 while HTTP is blocked. */
+    unsigned clock_bytes = panel.image_bytes;
+    assert(clock_bytes < FRAME_BYTES);
     xSemaphoreTake(&display, 0);
     memcpy(updated, frame, sizeof(updated));
     ui_draw_hourly(&weather, &sensor); ui_draw_status(UI_STATUS_FETCHING, 0); epd_refresh();
@@ -364,7 +391,7 @@ int main(void) {
     xSemaphoreGive(&display);
     advance(60, true);
     xSemaphoreTake(&display, 0);
-    ui_draw_portal_hint(); epd_refresh_full();
+    ui_draw_portal_hint(); epd_refresh();
     xSemaphoreGive(&display);
     advance(60, false); /* A timer must never overwrite the setup instructions. */
     xSemaphoreTake(&display, 0);
@@ -435,7 +462,7 @@ int main(void) {
     advance(3600, true);
     assert_hour_column(updated, 64, 8);
 
-    /* Ten rapid voice status changes wake clock_task immediately and stay strictly partial. */
+    /* Rapid voice status changes wake clock_task immediately and share the refresh cadence. */
     const voice_state_t rapid[] = {
         VOICE_STATE_CONNECTING, VOICE_STATE_READY, VOICE_STATE_LISTENING, VOICE_STATE_WAITING,
         VOICE_STATE_SPEAKING, VOICE_STATE_FOLLOWUP, VOICE_STATE_LISTENING, VOICE_STATE_WAITING,
@@ -446,20 +473,17 @@ int main(void) {
     }
     publish_status(VOICE_STATE_WAIT_NETWORK, NULL, true);
 
-    /* Periodic sensor poll updates only x < 200, y >= 110 via partial refresh and publishes to MCP. */
-    unsigned before_pub, before_full, before_partial;
+    /* Periodic sensor poll changes only x < 200, y >= 110 and publishes to MCP. */
+    unsigned before_pub;
     pthread_mutex_lock(&gate);
     mock_sensor = (sensor_reading_t){.temperature_c = 23.5f, .humidity_percent = 58.0f, .pressure_hpa = 1013.2f, .valid = true};
     before_pub = sensor_publications;
-    before_full = full_refreshes;
-    before_partial = partial_refreshes;
     pthread_mutex_unlock(&gate);
     allow_sensor_pixels = true;
     atomic_fetch_add(&uptime, 60LL * 1000000LL);
     advance(0, true);
     allow_sensor_pixels = false;
     assert(sensor_publications == before_pub + 1);
-    assert(full_refreshes == before_full && partial_refreshes == before_partial + 1);
     /* Identical sensor reading on next 60 s poll must not trigger a redundant refresh. */
     atomic_fetch_add(&uptime, 60LL * 1000000LL);
     advance(0, false);
@@ -475,7 +499,11 @@ int main(void) {
     stopping = true; pthread_cond_broadcast(&changed);
     pthread_mutex_unlock(&gate);
     assert(!pthread_join(clock_thread, NULL)); assert(!pthread_join(button_thread, NULL));
-    puts("PASS clock: blocked HTTP taps and hold, local time and missing zone, midnight, clock corrections, retry, setup/resume, forecast expiry, hourly rollover and immediate partial voice status updates");
+    assert(panel.updates == frames && full_updates == 2);
+    assert(memcmp(panel.old, panel.bw, FRAME_BYTES) == 0);
+    puts("PASS clock: blocked HTTP taps and hold, local time, retry, setup/resume, forecast expiry, hourly rollover, regional window and full waveform only on page switches 8 and 16");
+    printf("0x24 image bytes: clock %u, voice status %u, full frame %u\n",
+           clock_bytes, voice_bytes, FRAME_BYTES);
 }
 '''
 
@@ -509,7 +537,8 @@ def main():
         subprocess.run([
             compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",
             "-Wno-unused-parameter", "-pthread", *flags, "-I", str(work / "stubs"),
-            "-I", str(project / "main"), *(str(project / "main" / name) for name in sources),
+            "-I", str(project / "main"), "-I", str(project / "tools"),
+            *(str(project / "main" / name) for name in sources),
             str(work / "clock.c"), "-lm", "-o", str(work / "clock"),
         ], check=True, timeout=60)
         subprocess.run([str(work / "clock")], check=True, timeout=15)

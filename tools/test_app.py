@@ -3,7 +3,7 @@
 
 Does NOT test real net.c, net_portal.c, portal_web.c, portal_dns.c (WiFi, provisioning, synchronization/events)
 or hardware timing. Only net calls and ESP-IDF hardware/RTOS I/O are stubbed;
-time is fixed, and every full 4736-byte SPI framebuffer is captured, not hashed.
+time is fixed, and the full image is reconstructed from the SPI RAM writes.
 Retry headings and retained bodies are checked with the real renderer and fonts;
 the 5 s boot wait and stepped connect/retry sleeps are traced without waiting, and
 hardware delays are ignored. Separate harnesses check the real weather.c parser and
@@ -68,21 +68,21 @@ FRAME_BYTES = 16 * VISIBLE_W
 # S: success, G: geolocation HTTP failure, W: weather HTTP failure, P: parse failure.
 # Each character is one update and one refresh, including every failed retry.
 # Values are (update outcomes, provisioning attempts, total SPI frames,
-# transient connect failures before the first success). Every case also sends one
-# blank-white frame before the boot wait to clear the previous session's image.
+# transient connect failures before the first success). Every case also sends
+# the placeholder frame before the boot wait.
 CASES = {
     "steady": ("SSSS", 0, 5, 0),
     "initial_failure": ("GSSS", 0, 5, 0),
     "refresh_failure": ("SGGS", 0, 5, 0),
     "weather_failure": ("SWWS", 0, 5, 0),
-    "provisioning_retry": ("SSSS", 2, 7, 0),
+    "provisioning_retry": ("SSSS", 2, 6, 0),
     "all_failure": ("GGGG", 0, 5, 0),
     "initial_weather_failure": ("WSSS", 0, 5, 0),
     "parse_failure": ("SPPS", 0, 5, 0),
     "initial_parse_failure": ("PPSS", 0, 5, 0),
     "retry_reset": ("GGSG", 0, 5, 0),
     "retry_counter_width": ("G" * 10 + "SG", 0, 13, 0),
-    "provisioning_initial_failure": ("GSSS", 2, 7, 0),
+    "provisioning_initial_failure": ("GSSS", 2, 6, 0),
     "connect_backoff": ("SSSS", 0, 11, 6),
     "button_toggle": ("SS", 0, 5, 0),
     "button_switch_full": ("SS", 0, 11, 0),
@@ -91,7 +91,7 @@ CASES = {
 # Presses are "cycle:milliseconds-after-the-update-frame"; each adds one redraw frame.
 PRESSES = {
     "button_toggle": "0:5000,0:15000",
-    # Switches 1..7 are partial; the 8th must use the full waveform.
+    # Switch eight times after several weather and status frames.
     "button_switch_full": "0:1000,0:2000,0:3000,0:4000,0:5000,0:6000,0:7000,0:8000",
     "button_retry": "0:2000",
 }
@@ -305,6 +305,7 @@ HARNESS = r'''
 #include "freertos/task.h"
 #include "voice_feedback.h"
 #include "fixtures.h"
+#include "epd_spi_test.h"
 
 typedef int esp_err_t;
 #define ESP_OK 0
@@ -336,10 +337,12 @@ void xTaskDelayUntil(unsigned *last, unsigned ms) { abort(); }
 void *xQueueCreate(unsigned cap, size_t size) { assert(cap == 8 && size == sizeof(button_event_t)); return (void *)2; }
 int xQueueSend(void *queue, const void *item, unsigned timeout) { abort(); }
 int xQueueReset(void *queue) { assert(queue == (void *)2); return 1; }
+static unsigned page_switches;
 int xQueueReceive(void *queue, void *item, unsigned timeout) {
     assert(queue == (void *)2 && timeout == 0);
     button_event_t event = button_poll(BUTTON_POLL_MS);
     *(button_event_t *)item = event;
+    if (event == BUTTON_TAP) page_switches++;
     return event != BUTTON_NONE;
 }
 /* voice.c needs the real esp_xiaozhi/opus stack, so the app harness links stubs. */
@@ -387,9 +390,10 @@ static unsigned long expected_wait_ms(void) {
     return (unsigned long)expected_retry_seconds(retries) * 1000UL;
 }
 int gpio_config(const gpio_config_t *cfg) { (void)cfg; return 0; }
-static int dc_level = 1, last_cmd;
-static unsigned switch_count;
-static bool expect_switch_refresh, expect_status_partial;
+static bool dc_level = true;
+static struct epd_test_spi panel;
+static unsigned refreshed_switches;
+static unsigned char *rendered;
 int gpio_set_level(int pin, int level) {
     if (pin == EPD_DC) dc_level = level;
     return 0;
@@ -440,9 +444,6 @@ void vTaskDelay(unsigned ms) {
     if (button_pressed_level) {
         if (wait_elapsed - press_started >= BTN_PRESS_MS) {
             button_pressed_level = false;
-            /* Page switches 1..7 are partial; the 8th is a full refresh. */
-            switch_count++;
-            expect_switch_refresh = true;
         }
     } else if (press_next < press_count && press_cycle[press_next] == cycle &&
                wait_elapsed >= press_at[press_next]) {
@@ -587,8 +588,7 @@ static void check_app_frame(unsigned char *fb) {
     }
 }
 
-/* The status corner is x >= 200, y >= 110; a refresh that changes nothing else is a status
-   refresh, so it is traced separately and must not repaint the page. */
+/* Trace changes confined to the status corner separately from page redraws. */
 static bool status_only_frame(const unsigned char *fb) {
     if (!have_last_frame || memcmp(fb, last_frame, FRAME_BYTES) == 0) return false;
     for (int x = 0; x < 296; x++) {
@@ -602,62 +602,55 @@ static bool status_only_frame(const unsigned char *fb) {
 }
 
 int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *t) {
-    if (t->length == 8) {
-        const unsigned char *p = t->tx_buffer;
-        if (!dc_level) {
-            last_cmd = p[0];
-        } else if (last_cmd == 0x22 && expect_status_partial) {
-            expect_status_partial = false;
-            if (p[0] != 0x0F) {
-                fprintf(stderr, "status-only refresh used update sequence 0x%02X; expected 0x0F (partial)\n", p[0]);
-                exit(2);
-            }
-        } else if (last_cmd == 0x22 && expect_switch_refresh) {
-            expect_switch_refresh = false;
-            unsigned expected = switch_count % 8 == 0 ? 0xC7 : 0xC0;
-            if (p[0] != expected) {
-                fprintf(stderr, "page switch %u used update sequence 0x%02X; expected 0x%02X "
-                    "(switches 1..7 partial, 8th full)\n", switch_count, p[0], expected);
-                exit(2);
-            }
+    if (dc_level && panel.command == 0x24 && panel.updates == 0 && t->length == FRAME_BYTES * 8) {
+        rendered = (unsigned char *)t->tx_buffer;
+    }
+    if (!epd_test_transfer(&panel, dc_level, t)) return 0;
+#ifndef BASELINE_APP
+    bool full = refreshed_switches != page_switches && page_switches % 8 == 0;
+    assert(panel.update == (full ? 0xC7 : 0x0F));
+    if (panel.updates == 1) {
+        for (size_t i = 0; i < FRAME_BYTES; i++) {
+            assert((panel.bw[i] ^ panel.old[i]) == 0xFF);
         }
     }
-    if (t->length == FRAME_BYTES * 8) {
-        /* epd_refresh submits its own mutable framebuffer, not a read-only copy. */
-        unsigned char *p = (unsigned char *)t->tx_buffer;
-        bool status = status_only_frame(p);
-        if (status) {
-            puts("status");
-            expect_status_partial = true;
-            memcpy(last_frame, p, FRAME_BYTES);
-            return 0;
-        }
-        if (reset_test && button_pressed_level) {
-            assert(reset_frames < 2);
-            unsigned char saved[FRAME_BYTES];
-            memcpy(saved, p, FRAME_BYTES);
-            if (reset_frames == 0) {
-                const char *notice = "WiFi 重置中";
-                epd_clear(EPD_WHITE);
-                epd_text(148 - epd_text_w(&font_mid, notice) / 2, 70, &font_mid, notice);
-            } else {
-                ui_draw_portal_hint();
-            }
-            assert(memcmp(saved, p, FRAME_BYTES) == 0);
-            memcpy(p, saved, FRAME_BYTES);
-            puts(reset_frames++ == 0 ? "reset_notice_frame" : "portal_hint_frame");
-        } else if (updating) {
-            check_app_frame(p);
-        } else if (!boot_checked) {
-            boot_checked = true;
-            check_boot_frame(p);
-        }
-        memcpy(last_frame, p, FRAME_BYTES);
-        have_last_frame = true;
-        printf("frame:");
-        for (int i = 0; i < FRAME_BYTES; i++) printf("%02x", p[i]);
-        puts("");
+#endif
+    refreshed_switches = page_switches;
+    /* The first 0x24 write sends the whole mutable framebuffer. Reference rendering
+       below uses that buffer and restores it before the SPI callback returns. */
+    assert(rendered && memcmp(rendered, panel.bw, FRAME_BYTES) == 0);
+#ifdef BASELINE_APP
+    /* Older drivers can redraw the same portal hint on a second provisioning attempt. */
+    if (!updating && have_last_frame && !memcmp(last_frame, panel.bw, FRAME_BYTES)) return 0;
+#endif
+    if (status_only_frame(panel.bw)) {
+        puts("status");
+        memcpy(last_frame, panel.bw, FRAME_BYTES);
+        return 0;
     }
+    if (reset_test && button_pressed_level) {
+        assert(reset_frames < 2);
+        if (reset_frames == 0) {
+            const char *notice = "WiFi 重置中";
+            epd_clear(EPD_WHITE);
+            epd_text(148 - epd_text_w(&font_mid, notice) / 2, 70, &font_mid, notice);
+        } else {
+            ui_draw_portal_hint();
+        }
+        assert(memcmp(rendered, panel.bw, FRAME_BYTES) == 0);
+        memcpy(rendered, panel.bw, FRAME_BYTES);
+        puts(reset_frames++ == 0 ? "reset_notice_frame" : "portal_hint_frame");
+    } else if (updating) {
+        check_app_frame(rendered);
+    } else if (!boot_checked) {
+        boot_checked = true;
+        check_boot_frame(rendered);
+    }
+    memcpy(last_frame, panel.bw, FRAME_BYTES);
+    have_last_frame = true;
+    printf("frame:");
+    for (int i = 0; i < FRAME_BYTES; i++) printf("%02x", panel.bw[i]);
+    puts("");
     return 0;
 }
 
@@ -758,6 +751,7 @@ int main(int argc, char **argv) {
         app_main();
         return 1; /* The application must run until the final simulated sleep. */
     }
+    assert(page_switches == refreshed_switches);
     return 0;
 }
 '''
@@ -845,9 +839,11 @@ UI_HARNESS = r'''
 #include "ui.h"
 #include "font_icons.h"
 #include "fixtures.h"
+#include "epd_spi_test.h"
 
+static bool ui_dc = true;
 int gpio_config(const gpio_config_t *cfg) { (void)cfg; return 0; }
-int gpio_set_level(int pin, int level) { (void)pin; (void)level; return 0; }
+int gpio_set_level(int pin, int level) { if (pin == EPD_DC) ui_dc = level; return 0; }
 int gpio_get_level(int pin) { (void)pin; return 0; }
 void vTaskDelay(unsigned ms) { assert(ms < 1000); }
 time_t time(time_t *out) {
@@ -908,10 +904,10 @@ void traced_text(int x, int y, const aafont *font, const char *text) {
     epd_text(x, y, font, text);
 }
 int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *t) {
-    if (t->length == PANEL_W / 8 * PANEL_H * 8) {
-        const unsigned char *p = t->tx_buffer;
+    static struct epd_test_spi panel;
+    if (epd_test_transfer(&panel, ui_dc, t)) {
         printf("frame:");
-        for (int i = 0; i < PANEL_W / 8 * PANEL_H; i++) printf("%02x", p[i]);
+        for (int i = 0; i < TEST_FRAME_BYTES; i++) printf("%02x", panel.bw[i]);
         puts("");
     }
     return 0;
@@ -1517,7 +1513,8 @@ def compile_app(compiler, source, cjson_dir, cjson_source, work, label):
     run([
         compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",
         "-Wno-unused-parameter", "-Wno-unused-variable",
-        "-I", work / "stubs", "-I", source, "-I", cjson_dir,
+        "-I", work / "stubs", "-I", source, "-I", cjson_dir, "-I", Path(__file__).parent,
+        *(["-DBASELINE_APP"] if label == "baseline" else []),
         *(source / name for name in sources), cjson_source, work / "harness.c",
         "-lm", "-o", executable,
     ], work, 60)
@@ -1541,7 +1538,7 @@ def compile_ui(compiler, source, work):
     run([
         compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",
         "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-unused-function",
-        "-I", work / "stubs", "-I", source,
+        "-I", work / "stubs", "-I", source, "-I", Path(__file__).parent,
         work / "ui_wrapper.c", source / "epd.c", source / "fonts_aa.c", source / "font_clock.c", source / "font_icons.c",
         work / "ui_harness.c", "-lm", "-o", executable,
     ], work, 60)
@@ -2303,7 +2300,8 @@ def validate(trace, case, label, success_frames=None):
     # Every update refreshes once, then sleeps 30 minutes on success or the current
     # retry interval on failure. Provisioning is only used without stored credentials.
     expected = ["cycle:0", "net_init", "frame", "boot_wait:5000"]
-    expected += ["connect", "frame", "portal"] * portals
+    if portals:
+        expected += ["connect", "frame", "portal"] + ["connect", "portal"] * (portals - 1)
     for failure in range(connect_failures):
         if failure:
             expected.append("status")  # footer status: connecting
@@ -2316,7 +2314,7 @@ def validate(trace, case, label, success_frames=None):
         expected.append("status")  # footer status: connecting
     expected.append("connect")
     # Which cycle drew each captured frame; boot/portal/press frames are not update frames.
-    frame_cycles = [None] * (1 + portals + connect_failures)
+    frame_cycles = [None] * (1 + bool(portals) + connect_failures)
     have_weather = False
     retries = 0
     for cycle, outcome in enumerate(pattern):

@@ -71,30 +71,13 @@ Header 中的字符串均为 C UTF-8 十六进制转义，不含字面 PUA 字�
 - 原实现对内存行做 `maxY-row` 反转，导致图标倒置。实际位图内存行已是图像自上而下顺序，改为 `minY+row`。不能仅凭“字体路径坐标 Y 向上”推断内存行方向。
 - 两套各 11 个 glyph，均检查非空且栅格化结果互不相同。合计位图 1,603 B；另有 22 个 `aaglyph` 和 22 个 `uint16_t` 码点。在 `sizeof(aaglyph)=8` 时，位图与这两类表合计 1,823 B，不含两个 `aafont` 描述符及链接对齐开销。C 源文件为 10,564 B，不能当作固件占用。
 
-## 重生成命令
+## 验证现有字模
 
-在项目根目录运行。需要 macOS 的 Swift、CoreGraphics、CoreText、CryptoKit、ImageIO；不需要 Pillow 或其他第三方包。首次下载需要网络，后续生成本身离线。
-
-目录通过编辑器代理的 `create_directory` 工具创建为 `.cache/weather-icons/`；手动运行时先保证该目录存在。TTF、CSS、预览及验证产物只放已被 `.gitignore` 排除的 `.cache/weather-icons/`。
+固件使用已入库的 `main/font_icons.c`。原生成脚本见 Git 历史中的 `c17dc44:tools/genicons.swift`。在仓库根目录运行回归和预览检查字模映射及显示方向。
 
 ```sh
-curl -fL --max-time 60 https://raw.githubusercontent.com/erikflowers/weather-icons/bb80982bf1f43f2d57f9dd753e7413bf88beb9ed/font/weathericons-regular-webfont.ttf -o .cache/weather-icons/weathericons-regular-webfont.ttf
-curl -fL --max-time 60 https://raw.githubusercontent.com/erikflowers/weather-icons/bb80982bf1f43f2d57f9dd753e7413bf88beb9ed/css/weather-icons.css -o .cache/weather-icons/weather-icons.css
-shasum -a 256 .cache/weather-icons/weathericons-regular-webfont.ttf .cache/weather-icons/weather-icons.css
-
-swift tools/genicons.swift .cache/weather-icons/weathericons-regular-webfont.ttf main/font_icons.c .cache/weather-icons/preview.png
-shasum -a 256 main/font_icons.c
-open .cache/weather-icons/preview.png
-```
-
-最后一个 PNG 参数可省略，保留原生成器的 `输入.ttf 输出.c` 调用方式。预览直接解码与 C 相同的打包字节及 glyph offset，不另用字体渲染一套图标。上排 daily，下排 hourly，列顺序见上表；灰色 cell 边框只用于检查，不写入字模，像素以最近邻方式放大 4 倍。
-
-可不覆盖源文件地验证重生成一致性：
-
-```sh
-swift tools/genicons.swift .cache/weather-icons/weathericons-regular-webfont.ttf .cache/weather-icons/regenerated.c
-cmp main/font_icons.c .cache/weather-icons/regenerated.c
-cc -std=c11 -Wall -Wextra -Werror -Imain -c main/font_icons.c -o .cache/weather-icons/font_icons.o
+python3 tools/test_app.py --only ui
+python3 tools/preview_ui.py
 ```
 
 ## 已做的字模验证

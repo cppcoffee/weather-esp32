@@ -1,6 +1,6 @@
-# 在本地 PC 运行小智智控台和语音服务
+# 在本地 PC 运行智控台和语音服务
 
-本指南使用社区项目 [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server)，与本仓库的 `espressif/esp_xiaozhi` 客户端通过小智协议连接。它是可自建的服务端，不是把 xiaozhi.me 的官方后台复制到本机。
+本指南使用社区项目 [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server)，与本仓库的 `espressif/esp_xiaozhi` 客户端通过协议连接。它是可自建的服务端，不是把 xiaozhi.me 的官方后台复制到本机。
 
 ## 运行哪些服务
 
@@ -137,7 +137,7 @@ docker compose -f docker-compose_all.yml -f docker-compose.local.yml logs --tail
 
 ## 6. 让本项目固件连接 PC
 
-不需要重新编译来切换服务地址。烧录当前固件后，设备进入 `SETUP-WIFI` 页面，在“小智语音”里填写服务信息地址（必填，固件没有内置默认值）：
+不需要重新编译来切换服务地址。烧录当前固件后，设备进入 `SETUP-WIFI` 页面，在“语音”里填写服务信息地址（必填，固件没有内置默认值）：
 
 - Python 全模块服务的信息地址：`http://PC局域网IP:8002/xiaozhi/ota/`
 - 仅运行 Python 语音 Server 的信息地址：`http://PC局域网IP:8003/xiaozhi/ota/`

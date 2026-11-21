@@ -117,7 +117,7 @@ static void draw_page(const struct app_state *app)
 }
 
 // Show the current action before a blocking step, so the footer says what the device is
-// waiting for instead of looking stuck. Corner-only updates always use partial refresh.
+// waiting for instead of looking stuck.
 static void set_status(struct app_state *app, ui_status_t status, unsigned attempt, bool show_now)
 {
     xSemaphoreTake(display_lock, portMAX_DELAY);
@@ -125,16 +125,16 @@ static void set_status(struct app_state *app, ui_status_t status, unsigned attem
     app->status_attempt = attempt;
     if (show_now) {
         ui_draw_status(status, attempt);
-        epd_refresh_partial();
+        epd_refresh();
     }
     xSemaphoreGive(display_lock);
 }
 
-// Page switches have their own refresh count.
 static void switch_page(struct app_state *app)
 {
     app->view = app->view == VIEW_DAILY ? VIEW_HOURLY : VIEW_DAILY;
     draw_page(app);
+    epd_refresh_page_switch();
 }
 
 static void present(const struct app_state *app)
@@ -194,12 +194,8 @@ static void clock_task(void *arg)
                 switched = true;
             }
         }
-        if (switched) {
-            epd_refresh_page_switch();
-        } else if (clock_changed) {
+        if (!switched && (clock_changed || voice_changed || status_changed || sensor_changed)) {
             epd_refresh();
-        } else if (voice_changed || status_changed || sensor_changed) {
-            epd_refresh_partial();
         }
         xSemaphoreGive(display_lock);
     }
@@ -209,7 +205,7 @@ static void show_portal(void)
 {
     xSemaphoreTake(display_lock, portMAX_DELAY);
     ui_draw_portal_hint();
-    epd_refresh_full();
+    epd_refresh();
     xSemaphoreGive(display_lock);
 }
 
@@ -244,7 +240,6 @@ static bool button_service(struct app_state *app)
     case BUTTON_TAP:
         xSemaphoreTake(display_lock, portMAX_DELAY);
         switch_page(app);
-        epd_refresh_page_switch();
         xSemaphoreGive(display_lock);
         return false;
 
@@ -450,12 +445,10 @@ void app_main(void)
     (void)sensor_read(&app.sensor);
     device_mcp_publish_sensor(&app.sensor);
 
-    // The glass keeps the last session's image, and the first forecast is seconds to minutes
-    // away, so paint the placeholder page now. One full refresh scrubs the old image and leaves
-    // something readable; it does not force a full waveform for the later routine page updates.
+    // Paint a placeholder while the device starts networking and fetches the first forecast.
     xSemaphoreTake(display_lock, portMAX_DELAY);
     draw_page(&app);
-    epd_refresh_full();
+    epd_refresh();
     xSemaphoreGive(display_lock);
     ESP_ERROR_CHECK(xTaskCreate(clock_task, "clock", 4096, &app, 1, &clock_task_handle) == pdPASS ? ESP_OK
                                                                                                   : ESP_ERR_NO_MEM);

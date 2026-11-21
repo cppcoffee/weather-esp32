@@ -15,8 +15,9 @@ static const char *log_tag = "epd";
 #define ROW_BYTES (PANEL_W / 8)
 #define FB_SIZE   (ROW_BYTES * PANEL_H) // 4736 bytes, 1 = white, 0 = black
 
-#define LUT_BYTES           153
-#define FULL_WAVEFORM_BYTES (LUT_BYTES + 6)
+#define LUT_BYTES              153
+#define FULL_WAVEFORM_BYTES    (LUT_BYTES + 6)
+#define PAGE_SWITCH_FULL_EVERY 8
 
 // Waveshare 2.9" V2 (SSD1680) waveform table. Designated initializers keep the
 // controller's byte offsets visible; omitted entries are intentionally zero.
@@ -35,7 +36,17 @@ static const uint8_t ws_partial[LUT_BYTES] = {
 };
 
 static uint8_t framebuffer[FB_SIZE];
+static uint8_t displayed[FB_SIZE];
 static spi_device_handle_t panel_spi;
+static unsigned page_switches;
+static bool displayed_valid;
+
+struct ram_window {
+    unsigned x_start, x_end; // byte addresses in a controller row
+    unsigned y_start, y_end;
+};
+
+static const struct ram_window full_window = {0, ROW_BYTES - 1, 0, PANEL_H - 1};
 
 static void tx(const uint8_t *buf, size_t n)
 {
@@ -67,21 +78,22 @@ static void cmd1(uint8_t c, uint8_t d)
 
 // SSD1680: BUSY high while busy, low when idle.
 // Use at least 10 ms (1 tick at CONFIG_FREERTOS_HZ=100) so polling sleeps instead of spinning.
-static void wait_idle(const char *what, uint32_t timeout_ms)
+static bool wait_idle(const char *what, uint32_t timeout_ms)
 {
     vTaskDelay(pdMS_TO_TICKS(10)); // BUSY needs a moment to assert
     if (gpio_get_level(EPD_BUSY) == 0) {
-        return;
+        return true;
     }
     int64_t t0 = esp_timer_get_time();
     while (gpio_get_level(EPD_BUSY) == 1) {
         if (esp_timer_get_time() - t0 > (int64_t)timeout_ms * 1000) {
             ESP_LOGE(log_tag, "%s: BUSY stuck high after %u ms", what, timeout_ms);
-            return;
+            return false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     ESP_LOGI(log_tag, "%s: busy %lld ms", what, (esp_timer_get_time() - t0) / 1000);
+    return true;
 }
 
 static void panel_reset(void)
@@ -95,16 +107,29 @@ static void panel_reset(void)
     wait_idle("reset", 2000);
 }
 
-static void window_full(void)
+static void set_window(const struct ram_window *window)
 {
     cmd(0x44); // RAM X start/end (in bytes)
-    data((const uint8_t[]){0x00, (PANEL_W - 1) / 8}, 2);
+    data((const uint8_t[]){window->x_start, window->x_end}, 2);
     cmd(0x45); // RAM Y start/end
-    data((const uint8_t[]){0x00, 0x00, (PANEL_H - 1) & 0xFF, (PANEL_H - 1) >> 8}, 4);
-    cmd(0x4E);
-    data((const uint8_t[]){0x00}, 1);
+    data((const uint8_t[]){window->y_start & 0xFF, window->y_start >> 8, window->y_end & 0xFF, window->y_end >> 8}, 4);
+    cmd1(0x4E, window->x_start);
     cmd(0x4F);
-    data((const uint8_t[]){0x00, 0x00}, 2);
+    data((const uint8_t[]){window->y_start & 0xFF, window->y_start >> 8}, 2);
+}
+
+static void write_frame(uint8_t ram, const struct ram_window *window)
+{
+    set_window(window);
+    cmd(ram);
+    size_t width = window->x_end - window->x_start + 1;
+    if (width == ROW_BYTES) {
+        data(framebuffer + window->y_start * ROW_BYTES, (window->y_end - window->y_start + 1) * width);
+        return;
+    }
+    for (unsigned y = window->y_start; y <= window->y_end; y++) {
+        data(framebuffer + y * ROW_BYTES + window->x_start, width);
+    }
 }
 
 static void full_lut(void)
@@ -133,30 +158,39 @@ static void panel_config(bool soft_reset)
     cmd1(0x11, 0x03); // data entry: x+ y+
     cmd(0x21);        // display update control: normal, no inversion
     data((const uint8_t[]){0x00, 0x80}, 2);
-    window_full();
     wait_idle("config", 2000);
 }
 
-static void refresh_full(void)
+static bool refresh_full(void)
 {
     panel_config(true);
     cmd1(0x3C, 0x05); // border waveform
     full_lut();
-    cmd(0x24); // black/white RAM
-    data(framebuffer, FB_SIZE);
-    // Keep RED/old RAM (0x26) synchronized with 0x24 across full refreshes so the next
-    // ping-pong partial refresh (0x22=0x0F) only toggles pixels that actually changed.
-    cmd(0x26);
-    data(framebuffer, FB_SIZE / 2);
-    data(framebuffer + FB_SIZE / 2, FB_SIZE - FB_SIZE / 2);
+    write_frame(0x24, &full_window);
+    write_frame(0x26, &full_window);
     cmd1(0x22, 0xC7); // full update sequence
     cmd(0x20);
-    wait_idle("full refresh", 15000);
+    return wait_idle("full refresh", 15000);
 }
 
-// Vendor partial sequence: hardware reset, partial LUT, 0xC0 prepare, write image,
-// then 0x0F display. Only changed pixels toggle, so the panel does not flash.
-static void refresh_partial(void)
+// At boot the glass can retain an image independently of RAM. Seed the previous
+// image with the inverse of the target so the partial LUT drives every pixel
+// toward its intended color.
+static void seed_partial_reference(void)
+{
+    uint8_t rows[ROW_BYTES * 8];
+    set_window(&full_window);
+    cmd(0x26);
+    for (size_t offset = 0; offset < FB_SIZE; offset += sizeof(rows)) {
+        size_t count = FB_SIZE - offset < sizeof(rows) ? FB_SIZE - offset : sizeof(rows);
+        for (size_t i = 0; i < count; i++) {
+            rows[i] = (uint8_t)~framebuffer[offset + i];
+        }
+        data(rows, count);
+    }
+}
+
+static bool refresh_partial(const struct ram_window *window)
 {
     panel_config(false);
     cmd1(0x3C, 0x80);
@@ -164,16 +198,24 @@ static void refresh_partial(void)
     data(ws_partial, LUT_BYTES);
     wait_idle("partial lut", 2000);
     cmd(0x37);
-    data((const uint8_t[]){0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00}, 10);
+    // Disable RAM ping-pong. Both banks must keep the last image outside this window.
+    data((const uint8_t[10]){0}, 10);
     cmd1(0x22, 0xC0);
     cmd(0x20);
-    wait_idle("partial prepare", 15000);
-    window_full();
-    cmd(0x24);
-    data(framebuffer, FB_SIZE);
+    if (!wait_idle("partial prepare", 15000)) {
+        return false;
+    }
+    if (!displayed_valid) {
+        seed_partial_reference();
+    }
+    write_frame(0x24, window);
     cmd1(0x22, 0x0F);
     cmd(0x20);
-    wait_idle("partial refresh", 15000);
+    if (!wait_idle("partial refresh", 15000)) {
+        return false;
+    }
+    write_frame(0x26, window);
+    return true;
 }
 
 void epd_init(void)
@@ -212,6 +254,8 @@ void epd_init(void)
     panel_config(true);
     cmd1(0x3C, 0x05); // border waveform
     full_lut();
+    page_switches = 0;
+    displayed_valid = false;
 }
 
 void epd_clear(int color)
@@ -314,62 +358,48 @@ int epd_text_w(const aafont *f, const char *s)
     return w;
 }
 
-// Routine updates use the partial waveform. Periodic full refreshes bound accumulated residue;
-// the boot placeholder is already a full refresh, so the first ordinary update starts partial.
-#define FULL_REFRESH_EVERY 5
-// Page switches have their own cadence: 1..7 stay partial, the 8th is full. Any full refresh
-// clears the accumulated switch count because it also clears the residue that count bounds.
-#define PAGE_SWITCH_FULL_EVERY 8
-
-static struct {
-    unsigned ordinary_count;
-    unsigned page_switches;
-    bool maintenance_full_pending;
-} refresh_state = {.ordinary_count = 1};
-
-// consume_ordinary merges a due ordinary maintenance slot into this full refresh, so the next
-// epd_refresh() does not immediately flash the panel again.
-static void full_refresh_done(bool consume_ordinary)
-{
-    refresh_full();
-    refresh_state.maintenance_full_pending = false;
-    refresh_state.page_switches = 0;
-    if (consume_ordinary) {
-        refresh_state.ordinary_count++;
-    }
-}
-
 void epd_refresh(void)
 {
-    if (refresh_state.maintenance_full_pending || refresh_state.ordinary_count % FULL_REFRESH_EVERY == 0) {
-        full_refresh_done(true);
-    } else {
-        refresh_partial();
-        refresh_state.ordinary_count++;
+    struct ram_window window = full_window;
+    if (displayed_valid) {
+        window = (struct ram_window){.x_start = ROW_BYTES, .y_start = PANEL_H};
+        for (unsigned y = 0; y < PANEL_H; y++) {
+            for (unsigned x = 0; x < ROW_BYTES; x++) {
+                size_t offset = y * ROW_BYTES + x;
+                if (framebuffer[offset] == displayed[offset]) {
+                    continue;
+                }
+                if (x < window.x_start) {
+                    window.x_start = x;
+                }
+                if (x > window.x_end) {
+                    window.x_end = x;
+                }
+                if (y < window.y_start) {
+                    window.y_start = y;
+                }
+                window.y_end = y;
+            }
+        }
+        if (window.y_start == PANEL_H) {
+            return;
+        }
     }
-}
-
-void epd_refresh_partial(void)
-{
-    refresh_partial();
+    displayed_valid = refresh_partial(&window);
+    if (displayed_valid) {
+        memcpy(displayed, framebuffer, FB_SIZE);
+    }
 }
 
 void epd_refresh_page_switch(void)
 {
-    if (++refresh_state.page_switches >= PAGE_SWITCH_FULL_EVERY) {
-        bool due = refresh_state.maintenance_full_pending || refresh_state.ordinary_count % FULL_REFRESH_EVERY == 0;
-        full_refresh_done(due);
+    if (++page_switches < PAGE_SWITCH_FULL_EVERY) {
+        epd_refresh();
         return;
     }
-    refresh_partial();
-    if (refresh_state.ordinary_count % FULL_REFRESH_EVERY == 0) {
-        refresh_state.maintenance_full_pending = true;
+    page_switches = 0;
+    displayed_valid = refresh_full();
+    if (displayed_valid) {
+        memcpy(displayed, framebuffer, FB_SIZE);
     }
-}
-
-// Used for the boot blank page and provisioning page. It does not consume the periodic
-// refresh slot; the counter starts at one so the first ordinary update after boot is partial.
-void epd_refresh_full(void)
-{
-    full_refresh_done(false);
 }
