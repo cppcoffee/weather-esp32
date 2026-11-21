@@ -1,77 +1,59 @@
 # weather-esp32
 
-ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气面板，纯 ESP-IDF/C。支持 5 天预报、未来 10 小时逐时页、SNTP 时钟、本地温湿度气压传感器、网页配网，以及基于 `espressif/esp_xiaozhi`（WakeNet 本地唤醒）的 AI 语音问答。自建服务端见 [`xiaozhi-server-rs`](https://github.com/cppcoffee/xiaozhi-server-rs)。
+ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气与 AI 语音面板（ESP-IDF / C）。支持 5 天与未来 10 小时天气预报、SNTP 时钟、本地温湿度气压监测、网页配网，以及本地唤醒（WakeNet）语音问答。
 
-## 硬件接线
+配套自建语音服务端见 [`xiaozhi-server-rs`](https://github.com/cppcoffee/xiaozhi-server-rs)。
 
-| 屏幕 (SSD1680) | GPIO | 音频 (ES8311 + NS415B) | GPIO | AHT20+BMP280 | GPIO |
-|---|---|---|---|---|---|
-| SCK | 38 | 功放 EN | 15 | SDA | 5 |
-| SDA (MOSI) | 39 | I²S DOUT | 16 | SCL | 6 |
-| RST | 40 | I²S WS | 17 | VCC | 3V3 |
-| DC | 41 | I²S DIN (Mic) | 18 | | |
-| CS1 | 42 | I²S BCLK | 9 | | |
-| BUSY | 21 | I²S MCLK | 10 | | |
-| VCC | 3V3 | I²C SCL / SDA | 11 / 12 | | |
+## 硬件与接线
 
-- 修改引脚只改 `main/epd.h`、`main/audio.h`、`main/sensor.h` 顶部的 `#define`。
-- GPIO33–37 被 Octal PSRAM 占用，GPIO43/44 留给外接 UART 日志，GPIO19/20 为 USB-JTAG；所有外设需与 ESP32 共地。
-- 传感器使用 AHT20+BMP280（`SDA=GPIO5`、`SCL=GPIO6`、`VCC=3V3`、`GND` 共地，驱动同时兼容 BME280、BME680/688、AHT20/SHT3x/SHT4x + BMP280/BMP388/390）。开机采集一次温湿度和气压，之后每 10 分钟采集一次。屏幕和 MCP 共用最新读数，底栏数值变化时局部刷新。未接入或读数异常时显示 `--.-°C` / `--.-%` / `---.-kPa`。
+需要 **ESP32-S3（16 MB Flash + Octal PSRAM）**，所有外设与开发板共地：
 
-## 编译与烧录
+| 模块 | 接线（GPIO） |
+|---|---|
+| 墨水屏（SSD1680） | `SCK=38` `SDA(MOSI)=39` `RST=40` `DC=41` `CS1=42` `BUSY=21` `VCC=3V3` |
+| 音频（ES8311 + NS415B） | `PA_EN=15` `DOUT=16` `WS=17` `DIN=18` `BCLK=9` `MCLK=10` `SCL=11` `SDA=12` |
+| 传感器（AHT20+BMP280，可选） | `SDA=5` `SCL=6` `VCC=3V3`（兼容 BME280/680、AHT20/SHT3x/SHT4x + BMP280/388/390） |
+| 按键 | `GPIO4` 接微动开关到 `GND`（内部上拉） |
 
-本机使用 ESP-IDF v6.0.2：
+- 避开预留引脚：`GPIO33–37`（Octal PSRAM）、`GPIO19/20`（USB-JTAG）、`GPIO43/44`（外接 UART 日志）。
+- 如需调整引脚，修改 `main/epd.h`、`main/audio.h`、`main/sensor.h`、`main/button.h` 顶部 `#define`。
+
+## 编译与部署
+
+环境要求：**ESP-IDF v6.0.2**。使用语音功能前，请先按 `xiaozhi-server-rs` 文档在局域网部署服务端并获取 OTA 地址。
 
 ```bash
 . ~/.espressif/tools/activate_idf_v6.0.2.sh
 idf.py build
-idf.py -p <串口> flash       # 自动写入 app、分区表、bootloader 与 WakeNet 模型分区
-idf.py -p <串口> monitor     # 需在真实终端运行；或接 USB-TTL 到 GPIO43/44 看稳定日志
+idf.py -p <串口> flash      # 一并写入 app、分区表、bootloader 与 WakeNet 模型分区
+idf.py -p <串口> monitor    # 需交互式终端；也可接 USB-TTL 到 GPIO43/44 查看日志
 ```
 
-> 首次烧录必须包含 `model` 分区（`build/srmodels/srmodels.bin`）；若语音异常可 `erase-flash` 后重刷。
+- 首次烧录会自动写入 `model` 分区（`build/srmodels/srmodels.bin`）；若语音模型异常，先执行 `idf.py -p <串口> erase-flash` 再重刷。
+- 修改 `sdkconfig.defaults` 后，需删除已有 `sdkconfig` 再重新编译才会生效。
 
-## 配网与使用
+## 配网与设置
 
-1. **首次配网**：上电连接开放热点 `weather-XXXXXX`，浏览器打开 `192.168.1.1`。选择/输入 WiFi 并填写 **服务信息地址（OTA）**（必填，无默认值，例如 `http://PC局域网IP:8000/xiaozhi/ota/`，不可填 `localhost`）。
-2. **按键**：短按切换「5 天预报 / 未来 10 小时」；**长按 5 秒**清除 WiFi 凭据并重进配网（保留服务设置）。
-3. **语音问答**：
-   - 待机时说 **“小鹿小鹿”** 开始对话。屏幕先显示「语音连接」，会话就绪后显示「正在聆听」。设备会在本地暂存唤醒后的语音，连接成功后才上传。录满至少 2.4 s 后静默约 900 ms 结束，最长 15 s。
-   - **免唤醒追问默认开启**：播完后约 6 秒内可直接继续说话；播放中说“小鹿小鹿”可打断（需 AEC 正常）。
-   - 追问窗口结束，或说 **“退下 / 退下吧 / 再见 / 拜拜”**，设备释放语音连接并回到本地唤醒。待机时 Wi‑Fi 保持关联并使用 `MAX_MODEM`，语音建连和对话用低延迟档位。
-   - 配套 Rust 服务端按连接保存对话上下文。追问窗口内可以接着聊，窗口结束后的下一次唤醒会开启新对话。
-   - 路由器掉线时仍可本地识别唤醒词。识别后会提前触发已排定的重连，并等待 Wi‑Fi 最多 10 秒。超时后屏幕显示「无网络」，可以再说一次唤醒词。
-4. **屏幕状态**：顶部显示重试提示或激活码；右下角局刷语音/联网状态；每切页 8 次全刷一次，其余为局刷。
+1. **首次配网**：上电后连接开放热点 `weather-XXXXXX`（无密码），浏览器打开 `http://192.168.1.1`。
+2. **表单设置**：
+   - **Wi-Fi**：从扫描列表选择或手动输入 SSID 与密码。
+   - **服务信息地址（OTA）**：必填（无默认值），填写局域网服务端地址，如 `http://192.168.1.2:8000/xiaozhi/ota/`（不可填 `localhost`）。
+3. **重新配网**：长按按键 **5 秒** 清除 Wi-Fi 凭据并重进配网（上次保存的语音服务地址会保留）。
+4. **调节音量**：默认 `80`（范围 `0–100`），可在语音对话中让助手调整，自动写入 NVS 持久保存。
 
-## 天气、刷新与 MCP 工具
+## 日常使用
 
-- **天气与时钟**：通过 `ip-api.com` 定位并请求 Open-Meteo（5 天日预报 + 21 小时逐时），每 30 分钟刷新；失败时保留旧快照并按 5→10→20→40→60 s 阶梯重试。连网后后台 SNTP 校时并应用天气返回的 UTC 时区。
-- **Wi‑Fi 重连**：连接成功后保存 AP 信道作为启动时的扫描提示。掉线后先快重连两次，再按 5→10→20→40→60 s 等待后重试。
-- **出门提示**：仅看当日数据，雷雨/冰雹显示 `雷雨注意安全`，否则四舍五入降水概率 ≥51% 显示 `今日带伞`、低概率显示 `降水概率低`。
-- **MCP 工具**：`self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading`、`self.get_device_status`、`self.audio_speaker.set_volume`（0–100，写 NVS 持久化，默认 80）。
+- **按键**：短按切换「5 天预报 / 未来 10 小时」；长按 5 秒重新配网。
+- **语音问答**：说 **“小鹿小鹿”** 唤醒；播完后约 6 秒内可直接追问，播放中再说唤醒词可打断；说“退下 / 再见 / 拜拜”或静默超时后结束会话并回到待机。
+- **自动更新**：联网后按 IP 定位拉取天气（每 30 分钟）并 SNTP 校时；本地传感器每 10 分钟采样一次（未接入时显示 `--`）。语音助手支持查询时间、天气、本地温湿度气压、设备状态及调音量。
 
-## 常见日志
+## 常见排查
 
-| 日志 | 含义 |
+| 日志 / 现象 | 排查方式 |
 |---|---|
-| `voice unavailable` / `WakeNet requires PSRAM` | 语音未启动（查 ES8311、Octal PSRAM 或 `model` 分区） |
-| `service info URL not configured` | 配网页未填写 OTA 地址 |
-| `server config unavailable` | OTA 接口不可达或未下发 WebSocket 配置（约 30 s 后重试） |
-| `chat ready` | 唤醒后建立的 WebSocket 已连通，即将开始录音上传 |
-| `wake word detected` / `user:` / `bot:` | 唤醒命中、语音识别文本与模型回复 |
+| `voice unavailable` / `WakeNet requires PSRAM` | 检查 ES8311 接线、Octal PSRAM 配置，或 `erase-flash` 后重刷 `model` 分区 |
+| `service info URL not configured` | 重进配网页填写服务信息地址（OTA） |
+| `server config unavailable` | 检查局域网服务端是否可达、OTA 接口是否返回 WebSocket 配置 |
+| 屏幕显示激活码 | 按服务端提示输入激活码完成绑定 |
 
-## 开发与回归
-
-内部契约与代码规范见 [`AGENTS.md`](AGENTS.md)。
-
-```bash
-python3 tools/test_app.py                       # 应用/解析/UI
-python3 tools/test_clock.py --sanitize          # 时钟与显示互斥
-python3 tools/test_device_mcp.py                # MCP 工具与音量
-python3 tools/test_sensor.py                    # I2C 温湿度气压传感器驱动
-python3 tools/test_voice_lifecycle.py           # 会话清理与重配网
-python3 tools/test_voice_session.py --sanitize  # 录音、播放、追问、打断
-python3 tools/preview_ui.py                     # 布局预览 PNG
-```
-
-主机回归首次运行前需先执行 `idf.py build` 或 `reconfigure` 以下载 `cjson` 组件；真实 WiFi/TLS、I²S 时序、WakeNet/AEC 效果需真机验证。
+开发规范与主机回归测试见 [`AGENTS.md`](AGENTS.md)。
