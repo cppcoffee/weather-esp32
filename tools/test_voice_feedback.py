@@ -133,6 +133,12 @@ int main(void) {
         assert(!ui_update_status(priority[i], i + 1));
     }
     memcpy(before, frame, sizeof(before));
+    assert(apply(VOICE_STATE_OFFLINE, NULL)); epd_refresh(); isolated(before, false);
+    memcpy(expected, frame, sizeof(expected));
+    (void)ui_update_status(UI_STATUS_CONNECTING, 0); epd_refresh();
+    assert(!memcmp(expected, frame, sizeof(expected))); /* A wake timeout takes precedence over weather retry. */
+    assert(apply(VOICE_STATE_READY, NULL)); epd_refresh();
+    memcpy(before, frame, sizeof(before));
     assert(ui_update_status(UI_STATUS_UPDATED, 0)); epd_refresh(); isolated(before, false);
     assert(apply(VOICE_STATE_WAIT_NETWORK, NULL)); epd_refresh();
     memcpy(before, frame, sizeof(before));

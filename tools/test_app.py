@@ -354,11 +354,11 @@ voice_feedback_t voice_feedback_get(void) {
     return (voice_feedback_t){.state = VOICE_STATE_WAIT_NETWORK};
 }
 static bool weather_reserved;
-static unsigned weather_attempts;
-void voice_net_ready(void) { assert(!weather_reserved && weather_attempts > 0); }
+void voice_net_ready(void) { assert(!weather_reserved); }
+void voice_enable_wake(void) { assert(!weather_reserved); }
 void voice_net_pause(void) {}
 bool voice_weather_begin(void) { assert(!weather_reserved); weather_reserved = true; return true; }
-void voice_weather_end(void) { assert(weather_reserved); weather_reserved = false; weather_attempts++; }
+void voice_weather_end(void) { assert(weather_reserved); weather_reserved = false; }
 static jmp_buf done;
 static const char *pattern;
 static unsigned cycle;

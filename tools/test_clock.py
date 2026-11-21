@@ -235,6 +235,7 @@ esp_err_t voice_init(void) {
     return voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL) ? ESP_OK : ESP_FAIL;
 }
 void voice_net_ready(void) {}
+void voice_enable_wake(void) {}
 void voice_net_pause(void) {}
 bool voice_weather_begin(void) { return true; }
 void voice_weather_end(void) {}

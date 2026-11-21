@@ -6,6 +6,8 @@
 void net_init(void);                                      // NVS + netif + wifi 事件
 bool net_try_stored(int timeout_ms);                      // 用 NVS 里的凭据连 WiFi
 bool net_has_stored(void);                                // NVS 里是否已有 WiFi 凭据
+bool net_has_ip(void);                                    // STA 已取得 IP
+void net_request_reconnect(void);                         // 有语音请求时提前执行下一次重连
 void net_forget_creds(void);                              // 清掉 NVS 里的 WiFi 凭据（长按重置）
 void net_portal(void);                                    // SoftAP + 配网页，保存凭据后返回
 const char *net_ap_ssid(void);                            // 热点名 "weather-XXXXXX"，后缀是 MAC

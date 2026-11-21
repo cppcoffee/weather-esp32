@@ -335,6 +335,9 @@ static esp_err_t save_post(httpd_req_t *req)
         err = nvs_set_str(h, "pass", pass);
     }
     if (err == ESP_OK) {
+        err = nvs_set_u8(h, "channel", 0);
+    }
+    if (err == ESP_OK) {
         err = voice_settings_store(h, &settings);
     }
     if (err == ESP_OK) {

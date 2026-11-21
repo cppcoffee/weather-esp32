@@ -271,6 +271,9 @@ static bool wait_serviced(unsigned ms, struct app_state *app)
 
 static void run_connect_phase(struct app_state *app)
 {
+    if (net_has_stored()) {
+        voice_enable_wake();
+    }
     if (!app->boot_wait_done) {
         app->boot_wait_done = true;
         if (wait_serviced(BOOT_WAIT_MS, app)) {
@@ -436,8 +439,7 @@ void app_main(void)
     }
     button_init();
     ESP_ERROR_CHECK(xTaskCreate(button_task, "button", 2048, NULL, 2, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-    // Voice stays idle until the network is up; it runs in its own task so a microphone
-    // read or a chat turn never stalls the weather loop.
+    // Local wake detection runs in its own task so microphone reads never stall weather.
     if (voice_init() != ESP_OK) {
         ESP_LOGW(log_tag, "voice unavailable");
     }

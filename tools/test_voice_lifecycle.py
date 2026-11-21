@@ -28,8 +28,10 @@ import tempfile
 
 BOUNDARIES = (
     ("static bool network_ready(void)", "static void on_audio(const uint8_t *data, int len, void *ctx)"),
-    ("static void close_session(void)", "static esp_err_t open_session(void)"),
+    ("static void close_session(void)", "static esp_err_t prepare_service(void)"),
+    ("static void finish_wake(void)", "static void voice_task(void *arg)"),
     ("static void voice_task(void *arg)", "esp_err_t voice_init(void)"),
+    ("void voice_enable_wake(void)", "void voice_net_ready(void)"),
     ("void voice_net_ready(void)", "void voice_net_set_connected(bool connected)"),
     ("void voice_net_set_connected(bool connected)", "void voice_net_pause(void)"),
     ("void voice_net_pause(void)", "bool voice_weather_begin(void)"),
@@ -79,9 +81,11 @@ PRELUDE = r'''
 #include "voice_feedback.h"
 #include "voice_internal.h"
 
+static voice_state_t feedback;
 bool voice_feedback_publish(voice_state_t state, const char *code) {
-    (void)state; (void)code; return true;
+    (void)code; feedback = state; return true;
 }
+voice_feedback_t voice_feedback_get(void) { return (voice_feedback_t){.state = feedback}; }
 
 static const char *context = "setup";
 #define CHECK(x) do { if (!(x)) { \
@@ -94,22 +98,57 @@ typedef uint32_t esp_xiaozhi_chat_handle_t;
 typedef struct { unsigned generation; } esp_mcp_t, OpusEncoder, OpusDecoder;
 #define ESP_OK 0
 #define ESP_FAIL (-1)
+#define ESP_ERR_INVALID_STATE 2
 #define pdTRUE 1
 #define pdFALSE 0
+#define BIT0 1u
 #define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 
-enum { WIFI_EVENT, IP_EVENT };
+enum { WIFI_EVENT, IP_EVENT, NET_EVENTS };
+enum { RECONNECT_DUE, RECONNECT_REQUEST };
 enum { WIFI_EVENT_STA_START, WIFI_EVENT_STA_DISCONNECTED, WIFI_EVENT_STA_STOP, IP_EVENT_STA_GOT_IP };
-typedef int esp_event_base_t;
-#define GOT_IP 1u
+enum { WIFI_MODE_STA, WIFI_MODE_APSTA };
+enum { WIFI_PS_NONE, WIFI_PS_MAX_MODEM };
+typedef int esp_event_base_t, wifi_mode_t;
 static EventBits_t wifi_events;
 static EventBits_t *sta_events = &wifi_events;
 static EventBits_t events;
-static unsigned wifi_connects;
-static void esp_wifi_connect(void) { wifi_connects++; }
+static unsigned wifi_connects, reconnect_requests, quick_retries, backoff_s;
+static bool sta_active, low_latency;
+static int64_t reconnect_at_us, timer_at_us, now_us = 100;
+static void *reconnect_timer = &timer_at_us;
+static wifi_mode_t wifi_mode = WIFI_MODE_STA;
+static esp_err_t esp_wifi_connect(void) { wifi_connects++; return ESP_OK; }
+static esp_err_t esp_wifi_get_mode(wifi_mode_t *mode) { *mode = wifi_mode; return ESP_OK; }
+static esp_err_t esp_wifi_set_ps(int mode) {
+    CHECK(wifi_mode == WIFI_MODE_STA && (mode == WIFI_PS_NONE || mode == WIFI_PS_MAX_MODEM));
+    low_latency = mode == WIFI_PS_NONE;
+    return ESP_OK;
+}
+static int64_t esp_timer_get_time(void) { return now_us; }
+static esp_err_t esp_timer_stop(void *timer) {
+    CHECK(timer == reconnect_timer);
+    timer_at_us = 0;
+    return ESP_OK;
+}
+static esp_err_t esp_timer_start_once(void *timer, int64_t delay_us) {
+    CHECK(timer == reconnect_timer && delay_us > 0);
+    if (timer_at_us) return ESP_ERR_INVALID_STATE;
+    timer_at_us = now_us + delay_us;
+    return ESP_OK;
+}
+static int queued_net_event = -1;
+static esp_err_t esp_event_post(esp_event_base_t base, int id, void *data, size_t size, TickType_t wait) {
+    CHECK(base == NET_EVENTS && !data && !size && !wait && queued_net_event == -1);
+    queued_net_event = id;
+    if (id == RECONNECT_REQUEST) reconnect_requests++;
+    return ESP_OK;
+}
+static void save_channel(void) {}
+static TickType_t xTaskGetTickCount(void) { return (TickType_t)(now_us / 1000); }
 static void start_time_sync(void);
 static atomic_bool time_synced;
 static bool sntp_initialized;
@@ -147,7 +186,8 @@ static esp_xiaozhi_chat_handle_t live_chat;
 static esp_mcp_t *live_mcp;
 static OpusEncoder *live_encoder;
 static OpusDecoder *live_decoder;
-static bool locked, stopped, wake_on_wait, muted = true;
+static bool locked, stopped, muted = true;
+static int prepares;
 static int opens, stops, deinits, mcp_destroys, encoder_destroys, decoder_destroys;
 static int turns, takes, gives, waits, delays, failures_left;
 static bool deinit_error;
@@ -168,100 +208,91 @@ static esp_err_t esp_xiaozhi_chat_deinit(esp_xiaozhi_chat_handle_t chat);
 static esp_err_t esp_mcp_destroy(esp_mcp_t *mcp);
 static void opus_encoder_destroy(OpusEncoder *encoder);
 static void opus_decoder_destroy(OpusDecoder *decoder);
+static esp_err_t prepare_service(void);
 static esp_err_t open_session(void);
 static esp_err_t run_turn(void);
 '''
 
 HARNESS = r'''
 #line 1 "lifecycle_harness.c"
-enum action { NET, GOODBYE, PAUSE, WAKE, IDLE, DROP, FAST_RECONNECT, IP };
-static bool drop_in_turn;
+enum action { ENABLE_OFFLINE, ENABLE_ONLINE, PROBE, PAUSE, WAKE, IP, TIMEOUT };
+enum turn_event { NONE, GOODBYE, REPROVISION, LINK_FLAP };
+static enum turn_event during_turn;
 static void wifi_event(esp_event_base_t base, int32_t event)
 {
     on_event(NULL, base, event, NULL);
 }
-
+static void process_net_event(void)
+{
+    int id = queued_net_event;
+    CHECK(id != -1);
+    queued_net_event = -1;
+    wifi_event(NET_EVENTS, id);
+}
 static void disconnect(void)
 {
     wifi_event(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED);
     CHECK(!wifi_events && !network_ready());
 }
+
 struct step {
-    const char *label;
     enum action action;
-    int opens, stops, disposed, turns;
-    bool pending;
-    EventBits_t bits;
+    int expected_turns;
+    int expected_prepares;
+    EventBits_t required, forbidden;
 };
 static struct step script[20];
-static int script_count, current = -1;
+static int script_count, current;
 
-static void add(const char *label, enum action action, int nopen, int nstop,
-                int disposed, int nturn, bool pending, EventBits_t bits)
+static void add(enum action action, int expected_turns, int expected_prepares,
+                EventBits_t required, EventBits_t forbidden)
 {
     CHECK(script_count < (int)(sizeof(script) / sizeof(script[0])));
-    script[script_count++] = (struct step){label, action, nopen, nstop, disposed, nturn, pending, bits};
+    script[script_count++] = (struct step){action, expected_turns, expected_prepares, required, forbidden};
 }
 
-static void expect_state(const struct step *step)
+static enum action outer_boundary(void)
 {
-    CHECK(!locked && takes == gives && !wake_on_wait);
-    CHECK(opens == step->opens && stops == step->stops && turns == step->turns);
-    CHECK(deinits == step->disposed && mcp_destroys == step->disposed);
-    CHECK(encoder_destroys == step->disposed && decoder_destroys == step->disposed);
-    CHECK(session.cleanup_pending == step->pending && events == step->bits);
-    CHECK(muted);
-    bool live = step->opens != step->disposed;
-    CHECK((session.chat != 0) == live && session.chat == live_chat);
-    CHECK((session.mcp != NULL) == live && session.mcp == live_mcp);
-    CHECK((session.encoder != NULL) == live && session.encoder == live_encoder);
-    CHECK((session.decoder != NULL) == live && session.decoder == live_decoder);
-    if (live) {
-        CHECK(!stopped);
-        CHECK(session.chat == (unsigned)opens && session.mcp->generation == session.chat);
-        CHECK(session.encoder->generation == session.chat && session.decoder->generation == session.chat);
-    }
-}
-
-static void outer_boundary(void)
-{
-    CHECK(!locked && takes == gives);
-    if (current >= 0) expect_state(&script[current]);
-    if (++current == script_count) longjmp(finished, 1);
-    context = script[current].label;
-    switch (script[current].action) {
-    case NET:
+    CHECK(!locked && takes == gives && !low_latency);
+    if (current == script_count) longjmp(finished, 1);
+    const struct step *step = &script[current++];
+    CHECK((events & step->required) == step->required && !(events & step->forbidden));
+    CHECK(turns == step->expected_turns && opens == step->expected_turns && prepares == step->expected_prepares);
+    CHECK(deinits == opens && mcp_destroys == opens && encoder_destroys == opens && decoder_destroys == opens);
+    CHECK(!session.cleanup_pending && !session.chat && !session.mcp && !session.encoder && !session.decoder);
+    CHECK(!live_chat && !live_mcp && !live_encoder && !live_decoder && muted);
+    switch (step->action) {
+    case ENABLE_OFFLINE:
+        wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
+        voice_enable_wake();
+        break;
+    case ENABLE_ONLINE:
+        wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
         wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+        voice_enable_wake();
+        break;
+    case PROBE:
         voice_net_ready();
         break;
-    case DROP:
-        disconnect();
-        break;
-    case FAST_RECONNECT:
-        disconnect();
-        wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
-        CHECK(wifi_events == GOT_IP && !network_ready());
-        break;
     case IP:
+        if (queued_net_event != -1) process_net_event();
         wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
-        break;
-    case GOODBYE:
-        /* Inject callback fact, not a copy of on_server_goodbye or capture_task. */
-        xEventGroupSetBits(voice_events, VOICE_BIT_HANGUP | VOICE_BIT_RECEIVING);
         break;
     case PAUSE:
         voice_net_pause();
-        CHECK(!(events & (VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_RECEIVING
-                          | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE)));
-        CHECK(events & VOICE_BIT_RESET);
+        wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
         break;
     case WAKE:
-        CHECK((events & VOICE_BIT_ARMED) && !session.cleanup_pending);
-        wake_on_wait = true;
+        CHECK(events & VOICE_BIT_ARMED);
+        xEventGroupClearBits(voice_events, VOICE_BIT_ARMED);
+        xEventGroupSetBits(voice_events, VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE);
         break;
-    case IDLE:
+    case TIMEOUT:
+        CHECK(queued_net_event == RECONNECT_REQUEST);
+        process_net_event();
         break;
     }
+    return step->action;
 }
 
 static EventBits_t xEventGroupGetBits(EventBits_t *group)
@@ -289,29 +320,20 @@ static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask,
 {
     CHECK(group == &events && clear == pdFALSE && all == pdFALSE && !locked);
     CHECK(++waits <= 100); /* Hard bound even if source starts polling unexpectedly. */
-    if (timeout == portMAX_DELAY) {
-        EventBits_t needed = (events & VOICE_BIT_ENABLED) ? VOICE_BIT_NET : VOICE_BIT_ENABLED;
-        CHECK(mask == (needed | VOICE_BIT_RESET));
-        outer_boundary();
-        CHECK(events & mask); /* Never pretend an infinite wait returned without an event. */
+    CHECK(!(events & mask));
+    enum action action = outer_boundary();
+    if (action == TIMEOUT) {
+        CHECK(timeout == VOICE_NETWORK_WAIT_MS && !(events & mask));
+        now_us += (int64_t)timeout * 1000;
     } else {
-        CHECK(mask == (VOICE_BIT_TRIGGER | VOICE_BIT_RESET)
-              || mask == (VOICE_BIT_TRIGGER | VOICE_BIT_RESET | VOICE_BIT_HANGUP));
-        CHECK(timeout == pdMS_TO_TICKS(VOICE_POLL_MS));
-        if (wake_on_wait) {
-            /* Emulate only the capture task's event handoff, not WakeNet detection. */
-            CHECK(events & VOICE_BIT_ARMED);
-            xEventGroupClearBits(voice_events, VOICE_BIT_ARMED);
-            xEventGroupSetBits(voice_events, VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE);
-            wake_on_wait = false;
-        }
+        CHECK(events & mask);
     }
     return events;
 }
 
 static int xSemaphoreTake(void *lock, TickType_t timeout)
 {
-    CHECK(lock == network_lock && !locked && timeout == pdMS_TO_TICKS(VOICE_POLL_MS));
+    CHECK(lock == network_lock && !locked && timeout == portMAX_DELAY);
     locked = true;
     takes++;
     return pdTRUE;
@@ -344,9 +366,16 @@ static esp_err_t audio_set_mute(bool mute)
     return ESP_OK;
 }
 
+static esp_err_t prepare_service(void)
+{
+    CHECK(locked && network_ready());
+    prepares++;
+    return ESP_OK;
+}
+
 static esp_err_t open_session(void)
 {
-    CHECK(locked && network_ready() && !session.cleanup_pending);
+    CHECK(locked && low_latency && network_ready() && !session.cleanup_pending);
     CHECK(!session.chat && !session.mcp && !session.encoder && !session.decoder && !live_chat);
     CHECK(!live_mcp && !live_encoder && !live_decoder);
     session.mcp = live_mcp = calloc(1, sizeof(*session.mcp));
@@ -361,15 +390,27 @@ static esp_err_t open_session(void)
 
 static esp_err_t run_turn(void)
 {
-    CHECK(locked && network_ready() && !session.cleanup_pending);
+    CHECK(locked && low_latency && network_ready() && !session.cleanup_pending);
     CHECK(session.chat && session.chat == live_chat && !stopped && session.mcp == live_mcp);
     CHECK(session.encoder && session.decoder && (events & VOICE_BIT_CAPTURE));
+    xEventGroupClearBits(voice_events, VOICE_BIT_TRIGGER);
     turns++;
-    if (drop_in_turn) {
-        drop_in_turn = false;
+    enum turn_event event = during_turn;
+    during_turn = NONE;
+    if (event == LINK_FLAP) {
         disconnect();
         wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
-        CHECK(!network_ready() && (events & VOICE_BIT_RESET));
+        CHECK(!network_ready() && (events & VOICE_BIT_LINK_LOST));
+        return ESP_FAIL;
+    }
+    if (event == REPROVISION) {
+        voice_net_pause();
+        wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
+        CHECK(events & VOICE_BIT_RESET);
+        return ESP_FAIL;
+    }
+    if (event == GOODBYE) {
+        xEventGroupSetBits(voice_events, VOICE_BIT_HANGUP);
         return ESP_FAIL;
     }
     xEventGroupSetBits(voice_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED);
@@ -429,75 +470,92 @@ static void opus_decoder_destroy(OpusDecoder *decoder)
     decoder_destroys++;
 }
 
-static void make_script(const char *route, int failures)
+static void make_script(const char *route)
 {
-    EventBits_t online = VOICE_BIT_ENABLED | VOICE_BIT_NET;
-    EventBits_t net_armed = online | VOICE_BIT_ARMED;
-    EventBits_t error = failures ? VOICE_BIT_ERROR : 0;
-    bool wake = strcmp(route, "wake") == 0;
-    bool reset_live = strcmp(route, "reset-live") == 0;
-    add("NET: first session and ARMED", NET, 1, 0, 0, 0, false, net_armed);
-    bool fast = strcmp(route, "fast-reconnect") == 0;
-    bool active = strcmp(route, "during-turn") == 0;
-    if (fast || active || strcmp(route, "disconnect") == 0) {
-        if (active) {
-            drop_in_turn = true;
-            add("turn: lose WiFi and regain IP before returning", WAKE, 1, 0, 0, 1, false, online | VOICE_BIT_RESET);
+    EventBits_t local = VOICE_BIT_ENABLED | VOICE_BIT_ARMED;
+    EventBits_t online = local | VOICE_BIT_NET;
+    EventBits_t pending = VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE;
+    bool offline = !strcmp(route, "offline-wake") || !strcmp(route, "offline-expiry");
+    add(offline ? ENABLE_OFFLINE : ENABLE_ONLINE, 0, 0, 0, local | VOICE_BIT_NET);
+    if (offline) {
+        add(WAKE, 0, 0, local, VOICE_BIT_NET);
+        if (!strcmp(route, "offline-expiry")) {
+            add(TIMEOUT, 0, 0, pending, local ^ VOICE_BIT_ENABLED);
+            add(IP, 0, 0, local, pending | VOICE_BIT_NET);
+            add(PROBE, 0, 0, online, pending | VOICE_BIT_CHECK_INFO);
+            add(WAKE, 0, 1, online, pending);
+        } else {
+            add(IP, 0, 0, pending, VOICE_BIT_NET | VOICE_BIT_ARMED);
         }
-        EventBits_t surviving = active || fast ? online : VOICE_BIT_ENABLED;
-        EventBits_t pending_bits = surviving | VOICE_BIT_RESET | VOICE_BIT_ERROR;
-        add("outage: dispose old session on voice task", active ? IDLE : fast ? FAST_RECONNECT : DROP,
-            1, 1, !failures, active, failures != 0,
-            failures ? pending_bits | (active ? 0 : VOICE_BIT_ARMED) : surviving);
-        for (int attempt = 1; attempt <= failures; attempt++) {
-            add("outage: retry failed SDK stop", IDLE, 1, 1 + attempt, attempt == failures, active,
-                attempt < failures, pending_bits | (active ? 0 : VOICE_BIT_ARMED));
-        }
-        if (failures) {
-            add("outage: complete reset after successful stop", IDLE, 1, failures + 1, 1, active, false, surviving);
-        }
-        add("IP restored: rebuild and arm once", active || fast ? IDLE : IP,
-            2, failures + 1, 1, active, false, net_armed);
-        add("wake: first turn after network recovery", WAKE, 2, failures + 1, 1, active + 1, false, net_armed);
-        add("final RESET", PAUSE, 2, failures + 2, 2, active + 1, false, 0);
-        return;
-    }
-    if (!reset_live) {
-        add("goodbye: close or retain resources", GOODBYE, 1, 1, !failures, 0,
-            failures != 0, net_armed | error);
     } else {
-        add("pause live session: RESET close or retain", PAUSE, 1, 1, !failures, 0,
-            failures != 0, failures ? VOICE_BIT_RESET | error : 0);
+        if (!strcmp(route, "reprovision")) during_turn = REPROVISION;
+        if (!strcmp(route, "link-flap")) during_turn = LINK_FLAP;
+        if (!strcmp(route, "goodbye")) during_turn = GOODBYE;
+        add(PROBE, 0, 0, online, pending | VOICE_BIT_CHECK_INFO);
+        add(WAKE, 0, 1, online, pending);
     }
-    if (wake) {
-        for (int attempt = 1; attempt <= failures; attempt++) {
-            add("pending cleanup: retain until successful stop", IDLE, 1, 1 + attempt,
-                attempt == failures, 0, attempt < failures, net_armed | error);
-        }
-        add("suspended: no eager reopen without wake", IDLE, 1, failures + 1, 1, 0, false, net_armed | error);
-        add("wake: leave suspended without reopening yet", WAKE, 1, failures + 1, 1, 0, false,
-            online | VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE | error);
-        add("wake reconnect: new session and turn", IDLE, 2, failures + 1, 1, 1, false, net_armed);
-    } else {
-        if (!reset_live) {
-            /* Pause while goodbye cleanup is still pending, not only after success. */
-            add("goodbye then net_pause: RESET preempts wake", PAUSE, 1, failures ? 2 : 1,
-                failures < 2, 0, failures == 2, failures ? VOICE_BIT_RESET | error : 0);
-        }
-        int already_retried = reset_live ? 0 : 1;
-        for (int attempt = already_retried + 1; attempt <= failures; attempt++) {
-            add("offline pending cleanup: retry with RESET retained", IDLE, 1, 1 + attempt,
-                attempt == failures, 0, attempt < failures, VOICE_BIT_RESET | error);
-        }
-        if (failures) {
-            add("RESET after cleanup: clear suspension and reset flags", IDLE, 1, failures + 1,
-                1, 0, false, 0);
-        }
-        add("NET after RESET: rebuild and ARMED without a wake", NET, 2, failures + 1, 1, 0, false, net_armed);
+
+    int configured = 1;
+    if (!strcmp(route, "reprovision")) {
+        add(ENABLE_ONLINE, 1, 1, 0, online | pending | VOICE_BIT_RESET);
+        add(PROBE, 1, 1, online, pending | VOICE_BIT_CHECK_INFO);
+        configured = 2;
     }
-    int nturn = wake ? 1 : 0;
-    add("final RESET: consume second session", PAUSE, 2, failures + 2, 2, nturn, false, 0);
-    add("repeat RESET: no retry of consumed chat", PAUSE, 2, failures + 2, 2, nturn, false, 0);
+    add(WAKE, 1, configured, online, pending | VOICE_BIT_LINK_LOST);
+    add(PAUSE, 2, configured, online, pending);
+    add(PAUSE, 2, configured, 0, online | pending | VOICE_BIT_RESET);
+}
+
+static void test_reconnect(void)
+{
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
+    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    CHECK(wifi_events == GOT_IP && events == VOICE_BIT_NET && !network_ready());
+    CHECK(sntp_inits == 1 && !sntp_starts && !net_time_is_synced());
+    disconnect();
+    CHECK(wifi_connects == 2 && (events & VOICE_BIT_LINK_LOST));
+    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    CHECK(sntp_inits == 2 && sntp_callback && !sntp_starts && !net_time_is_synced());
+    sntp_callback(NULL);
+    sntp_callback(&(struct timeval){.tv_sec = 100});
+    CHECK(!net_time_is_synced());
+    sntp_callback(&(struct timeval){.tv_sec = NET_MIN_SYNCED_EPOCH});
+    CHECK(net_time_is_synced());
+    disconnect();
+    disconnect();
+    CHECK(wifi_connects == 4 && !timer_at_us);
+    for (unsigned i = 0; i < 6; i++) {
+        static const int seconds[] = {5, 10, 20, 40, 60, 60};
+        unsigned before = wifi_connects;
+        disconnect();
+        CHECK(wifi_connects == before && timer_at_us - now_us == seconds[i] * 1000000LL);
+        now_us = timer_at_us;
+        timer_at_us = 0;
+        reconnect_due(NULL);
+        process_net_event();
+        CHECK(wifi_connects == before + 1 && !timer_at_us);
+    }
+    disconnect();
+    unsigned before = wifi_connects;
+    net_request_reconnect();
+    process_net_event();
+    CHECK(wifi_connects == before + 1 && !timer_at_us);
+    disconnect();
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
+    CHECK(!timer_at_us && !sta_active && !wifi_events);
+    wifi_mode = WIFI_MODE_APSTA;
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
+    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    wifi_event(NET_EVENTS, RECONNECT_DUE);
+    CHECK(wifi_connects == before + 1 && !wifi_events && !sntp_starts);
+    wifi_mode = WIFI_MODE_STA;
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
+    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
+    CHECK(sntp_starts == 1 && net_time_is_synced());
+    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
+    CHECK(!timer_at_us && !wifi_events && !sta_active);
+    events = 0;
+    reconnect_requests = 0;
 }
 
 int main(int argc, char **argv)
@@ -507,40 +565,27 @@ int main(int argc, char **argv)
     CHECK(failures >= 0 && failures <= 2);
     failures_left = failures;
     deinit_error = atoi(argv[3]) != 0;
+    context = "network backoff and SNTP";
+    test_reconnect();
+    context = argv[1];
     voice_events = NULL;
     voice_net_pause();
     voice_net_ready();
     voice_net_set_connected(true);
-    CHECK(events == 0); /* No-op when voice_init never created events. */
+    CHECK(events == 0);
     voice_events = &events;
-    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_START);
-    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
-    CHECK(wifi_events == GOT_IP && events == VOICE_BIT_NET && !network_ready());
-    CHECK(sntp_inits == 1 && !sntp_starts && !net_time_is_synced()); /* Initial allocation failed. */
-    disconnect();
-    CHECK(wifi_connects == 2 && events == 0);
-    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
-    CHECK(sntp_inits == 2 && sntp_callback && !sntp_starts && !net_time_is_synced());
-    sntp_callback(NULL);
-    sntp_callback(&(struct timeval){.tv_sec = 100});
-    CHECK(!net_time_is_synced());
-    sntp_callback(&(struct timeval){.tv_sec = NET_MIN_SYNCED_EPOCH});
-    CHECK(net_time_is_synced());
-    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
-    CHECK(wifi_connects == 2 && wifi_events == 0 && events == 0);
-    wifi_event(IP_EVENT, IP_EVENT_STA_GOT_IP);
-    CHECK(sntp_inits == 2 && sntp_starts == 1 && net_time_is_synced());
-    wifi_event(WIFI_EVENT, WIFI_EVENT_STA_STOP);
-    make_script(argv[1], failures);
+    make_script(argv[1]);
     if (setjmp(finished) == 0) voice_task(NULL);
     CHECK(current == script_count && !locked && takes == gives && failures_left == 0);
-    CHECK(deinits == 2 && !session.chat && !live_chat && !session.cleanup_pending);
-    CHECK(!session.mcp && !session.encoder && !session.decoder && events == 0);
-    CHECK(delays == failures);
-    printf("PASS %-11s stop_failures=%d deinit_error=%d (%d iterations, %d balanced lock pairs)\n",
-           argv[1], failures, deinit_error, script_count, takes);
+    CHECK(deinits == 2 && opens == 2 && stops == 2 + failures && !session.chat && !live_chat);
+    CHECK(!session.cleanup_pending && !session.mcp && !session.encoder && !session.decoder && events == 0);
+    CHECK(delays == (failures > 0 ? failures - 1 : 0));
+    CHECK(reconnect_requests == (!strncmp(argv[1], "offline-", 8) ? 1u : 0u));
+    printf("PASS %-14s stop_failures=%d deinit_error=%d (%d balanced lock pairs)\n",
+           argv[1], failures, deinit_error, takes);
     return 0;
 }
+
 '''
 
 
@@ -567,7 +612,19 @@ def main():
     source = Path(__file__).resolve().parents[1] / "main" / "voice.c"
     functions, ranges = extract(source.read_text(encoding="utf-8"), source, BOUNDARIES)
     net = source.with_name("net.c")
-    handler, net_ranges = extract(net.read_text(encoding="utf-8"), net, (
+    net_source = net.read_text(encoding="utf-8")
+    constants = re.findall(r"^#define (?:GOT_IP|QUICK_RETRIES|BACKOFF_MIN_S|BACKOFF_MAX_S) .+$",
+                           net_source, re.MULTILINE)
+    require(len(constants) == 4, "missing production reconnect constants")
+    handler, net_ranges = extract(net_source, net, (
+        ("static bool sta_mode(void)", "static void cancel_reconnect(void)"),
+        ("static void cancel_reconnect(void)", "static void reset_reconnect(void)"),
+        ("static void reset_reconnect(void)", "static void schedule_reconnect(void)"),
+        ("static void schedule_reconnect(void)", "static void connect_sta(void)"),
+        ("static void connect_sta(void)", "static void reconnect_due(void *arg)"),
+        ("static void reconnect_due(void *arg)", "void net_request_reconnect(void)"),
+        ("void net_request_reconnect(void)", "static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)"),
+        ("void net_set_wifi_low_latency(bool enable)", "void net_get_status(net_status_t *out)"),
         ("static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)", "void net_init(void)"),
         ("static void on_time_sync(struct timeval *tv)", "bool net_time_is_synced(void)"),
         ("bool net_time_is_synced(void)", "static void start_time_sync(void)"),
@@ -583,19 +640,19 @@ def main():
     with tempfile.TemporaryDirectory(prefix="weather-test-voice-lifecycle-") as directory:
         work = Path(directory)
         harness = work / "lifecycle.c"
-        harness.write_text(PRELUDE + "\n" + functions + "\n" + handler + "\n" + HARNESS, encoding="utf-8")
+        harness.write_text("\n".join((PRELUDE, *constants, functions, handler, HARNESS)), encoding="utf-8")
         executable = work / "lifecycle.out"
         flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"] if args.sanitize else []
         run([
             compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", *flags,
             "-I", source.parent, harness, "-o", executable,
         ], work, env, 60)
-        for route in ("wake", "reprovision", "reset-live", "disconnect", "fast-reconnect", "during-turn"):
+        for route in ("wake", "reprovision", "goodbye", "link-flap", "offline-wake", "offline-expiry"):
             for failures in range(3):
                 for deinit_error in range(2):
                     print(run([executable, route, failures, deinit_error], work, env, 5), end="", flush=True)
     print(f"PASS 36 lifecycle scenarios{' (ASan/UBSan)' if args.sanitize else ''}")
-    print("PASS STA SNTP start, initialization retry, reconnect and validated sync callback")
+    print("PASS Wi-Fi fast retries, scan backoff, wake-triggered reconnect, portal isolation and SNTP")
     print("Scope: does not validate the real SDK stop timing, audio, WakeNet, or all of voice.c.")
 
 

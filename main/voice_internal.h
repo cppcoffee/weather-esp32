@@ -24,7 +24,8 @@
 #define VOICE_RESPONSE_TIMEOUT_MS    30000
 #define VOICE_FIRST_AUDIO_TIMEOUT_MS 90000
 #define VOICE_RETRY_MS               30000
-// Bound on the first WebSocket connect; a wake during this window waits instead of failing.
+// How long a local wake waits for Wi-Fi before returning to standby.
+#define VOICE_NETWORK_WAIT_MS    10000
 #define VOICE_CONNECT_TIMEOUT_MS 8000
 #define VOICE_POLL_MS            100
 #define VOICE_CAPTURE_POLL_MS    20
@@ -55,9 +56,13 @@
 #define VOICE_BIT_LOCAL_EOS   (1 << 15)
 #define VOICE_BIT_WS_READY    (1 << 16)
 #define VOICE_BIT_ABORT_DRAIN (1 << 17)
+#define VOICE_BIT_LINK_LOST   (1 << 18)
+#define VOICE_BIT_CHECK_INFO  (1 << 19)
 #define VOICE_TURN_BITS       (VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_ERROR | VOICE_BIT_WS_LOST)
-#define VOICE_END_BITS        (VOICE_BIT_RESET | VOICE_BIT_HANGUP | VOICE_BIT_ERROR | VOICE_BIT_WS_LOST)
+#define VOICE_END_BITS (VOICE_BIT_RESET | VOICE_BIT_LINK_LOST | VOICE_BIT_HANGUP | VOICE_BIT_ERROR | VOICE_BIT_WS_LOST)
 
-// Both tasks use the same rule: voice is enabled, STA has IP, and teardown is complete.
+// Network audio requires IP. Local wake detection can also run offline.
+#define VOICE_LOCAL_READY(bits) (((bits) & (VOICE_BIT_ENABLED | VOICE_BIT_RESET)) == VOICE_BIT_ENABLED)
 #define VOICE_NETWORK_READY(bits)                                                                                      \
-    (((bits) & (VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_RESET)) == (VOICE_BIT_ENABLED | VOICE_BIT_NET))
+    (((bits) & (VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_RESET | VOICE_BIT_LINK_LOST))                            \
+     == (VOICE_BIT_ENABLED | VOICE_BIT_NET))

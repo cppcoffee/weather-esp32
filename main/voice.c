@@ -201,10 +201,8 @@ static void close_session(void)
     audio_set_mute(true);
 }
 
-static esp_err_t open_session(void)
+static esp_err_t prepare_service(void)
 {
-    voice_feedback_publish(VOICE_STATE_CONNECTING, NULL);
-    esp_xiaozhi_chat_config_t config = ESP_XIAOZHI_CHAT_DEFAULT_CONFIG();
     esp_xiaozhi_chat_info_t info = {0};
     voice_settings_t settings = {0};
     esp_err_t err = voice_settings_load(&settings);
@@ -235,20 +233,25 @@ static esp_err_t open_session(void)
         esp_xiaozhi_chat_free_info(&info);
         return ESP_ERR_INVALID_STATE;
     }
-    if (err == ESP_OK) {
-        // 只走 WebSocket，地址一律用信息接口下发的那条
-        config.has_mqtt_config = false;
-        config.has_websocket_config = info.has_websocket_config;
-    }
+    bool has_websocket_config = info.has_websocket_config;
     esp_xiaozhi_chat_free_info(&info);
-    if (err != ESP_OK || !config.has_websocket_config) {
+    if (err != ESP_OK || !has_websocket_config) {
         voice_feedback_publish(VOICE_STATE_ERROR, NULL);
         ESP_LOGW(log_tag, "server config unavailable from %s: %s; retry after network recovery", settings.info_url,
                  esp_err_to_name(err));
         return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
     }
 
-    err = esp_mcp_create(&session.mcp);
+    return ESP_OK;
+}
+
+static esp_err_t open_session(void)
+{
+    esp_xiaozhi_chat_config_t config = ESP_XIAOZHI_CHAT_DEFAULT_CONFIG();
+    config.has_mqtt_config = false;
+    config.has_websocket_config = true; // prepare_service saves the server's parameters in NVS.
+    xEventGroupClearBits(voice_events, VOICE_BIT_WS_READY | VOICE_TURN_BITS | VOICE_BIT_HANGUP);
+    esp_err_t err = esp_mcp_create(&session.mcp);
     if (err != ESP_OK) {
         goto failed;
     }
@@ -270,11 +273,13 @@ static esp_err_t open_session(void)
         goto failed;
     }
     // `chat ready` must mean the socket is up, otherwise the first wake word is dropped.
-    if (!(xEventGroupWaitBits(voice_events, VOICE_BIT_WS_READY, pdFALSE, pdFALSE,
-                              pdMS_TO_TICKS(VOICE_CONNECT_TIMEOUT_MS))
-          & VOICE_BIT_WS_READY))
-    {
-        ESP_LOGW(log_tag, "websocket not connected after %d ms", VOICE_CONNECT_TIMEOUT_MS);
+    EventBits_t bits = xEventGroupWaitBits(voice_events, VOICE_BIT_WS_READY | VOICE_END_BITS, pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(VOICE_CONNECT_TIMEOUT_MS));
+    if (!VOICE_NETWORK_READY(bits) || (bits & VOICE_END_BITS)) {
+        err = ESP_FAIL;
+        goto failed;
+    }
+    if (!(bits & VOICE_BIT_WS_READY)) {
         err = ESP_ERR_TIMEOUT;
         goto failed;
     }
@@ -322,7 +327,10 @@ static esp_err_t stream_microphone(void)
 {
     TickType_t started = xTaskGetTickCount();
     size_t filled = 0;
-    while (xTaskGetTickCount() - started < pdMS_TO_TICKS(VOICE_TURN_TIMEOUT_MS)) {
+    unsigned frames = 0;
+    while (frames < VOICE_TURN_TIMEOUT_MS / VOICE_FRAME_MS
+           && xTaskGetTickCount() - started < pdMS_TO_TICKS(VOICE_TURN_TIMEOUT_MS))
+    {
         EventBits_t bits = xEventGroupGetBits(voice_events);
         if (!turn_can_continue()) {
             return ESP_FAIL;
@@ -358,6 +366,7 @@ static esp_err_t stream_microphone(void)
         if (err != ESP_OK) {
             return err;
         }
+        frames++;
     }
     // End the upload at 15 s, then allow time for the server to answer.
     return ESP_OK;
@@ -474,7 +483,6 @@ static esp_err_t run_turn(void)
     bool interrupted = false;
     esp_err_t err = ESP_OK;
 
-    net_set_wifi_low_latency(true);
     while (turn_can_continue()) {
         xQueueReset(rx_audio_queue);
         xEventGroupClearBits(voice_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_INTERRUPT
@@ -509,6 +517,7 @@ static esp_err_t run_turn(void)
         if (err != ESP_OK) {
             break;
         }
+        xEventGroupClearBits(voice_events, VOICE_BIT_TRIGGER);
         ESP_LOGI(log_tag, "listening");
         voice_feedback_publish(VOICE_STATE_LISTENING, NULL);
         err = stream_microphone();
@@ -540,7 +549,6 @@ static esp_err_t run_turn(void)
             break;
         }
     }
-    net_set_wifi_low_latency(false);
     EventBits_t bits = xEventGroupClearBits(
         voice_events, VOICE_BIT_RECEIVING | VOICE_BIT_ARMED | VOICE_BIT_INTERRUPT | VOICE_BIT_CAPTURE
                           | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS | VOICE_BIT_ABORT_DRAIN);
@@ -553,112 +561,135 @@ static esp_err_t run_turn(void)
     return (bits & (VOICE_BIT_WS_LOST | VOICE_BIT_ERROR)) ? ESP_FAIL : err;
 }
 
+static void finish_wake(void)
+{
+    EventBits_t bits =
+        xEventGroupClearBits(voice_events, VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE | VOICE_BIT_LOCAL_EOS
+                                               | VOICE_BIT_HANGUP | VOICE_BIT_WS_READY | VOICE_TURN_BITS);
+    if (VOICE_LOCAL_READY(bits)) {
+        xEventGroupSetBits(voice_events, VOICE_BIT_ARMED);
+    }
+}
+
 static void voice_task(void *arg)
 {
     (void)arg;
-    bool suspended = false; // 用户说过"退下"：不建会话，只跑本地唤醒
+    const EventBits_t work = VOICE_BIT_TRIGGER | VOICE_BIT_RESET | VOICE_BIT_LINK_LOST;
+    const TickType_t retry_interval = pdMS_TO_TICKS(VOICE_RETRY_MS);
+    bool service_ready = false;
+    bool service_checked = false;
+    TickType_t last_service_check = 0;
     for (;;) {
-        EventBits_t bits = xEventGroupGetBits(voice_events);
-        EventBits_t needed = (bits & VOICE_BIT_ENABLED) ? VOICE_BIT_NET : VOICE_BIT_ENABLED;
-        xEventGroupWaitBits(voice_events, needed | VOICE_BIT_RESET, pdFALSE, pdFALSE, portMAX_DELAY);
-        if (xSemaphoreTake(network_lock, pdMS_TO_TICKS(VOICE_POLL_MS)) != pdTRUE) {
-            continue;
-        }
         if (session.cleanup_pending) {
+            xSemaphoreTake(network_lock, portMAX_DELAY);
             close_session();
-            if (!session.cleanup_pending && suspended && network_ready()) {
-                xEventGroupSetBits(voice_events, VOICE_BIT_ARMED);
+            xSemaphoreGive(network_lock);
+            if (session.cleanup_pending) {
+                vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
+            } else if (VOICE_LOCAL_READY(xEventGroupGetBits(voice_events))
+                       && !(xEventGroupGetBits(voice_events) & VOICE_BIT_TRIGGER))
+            {
                 voice_feedback_publish(VOICE_STATE_READY, NULL);
             }
-            xSemaphoreGive(network_lock);
-            vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
             continue;
         }
-        bits = xEventGroupGetBits(voice_events);
+
+        EventBits_t bits = xEventGroupGetBits(voice_events);
         if (bits & VOICE_BIT_RESET) {
-            close_session();
-            if (session.cleanup_pending) {
-                xSemaphoreGive(network_lock);
+            service_ready = false;
+            service_checked = false;
+            xEventGroupClearBits(voice_events, VOICE_BIT_RESET | VOICE_BIT_LINK_LOST);
+            finish_wake();
+            if (VOICE_LOCAL_READY(xEventGroupGetBits(voice_events))) {
+                voice_feedback_publish(VOICE_STATE_READY, NULL);
+            } else {
+                voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL);
+            }
+            continue;
+        }
+        if (bits & VOICE_BIT_LINK_LOST) {
+            xEventGroupClearBits(voice_events, VOICE_BIT_LINK_LOST);
+            continue;
+        }
+        if (!(bits & VOICE_BIT_ENABLED)) {
+            xEventGroupWaitBits(voice_events, VOICE_BIT_ENABLED | VOICE_BIT_RESET, pdFALSE, pdFALSE, portMAX_DELAY);
+            continue;
+        }
+
+        bool woke = (bits & VOICE_BIT_TRIGGER) != 0;
+        if (!(bits & VOICE_BIT_NET)) {
+            TickType_t wait = woke ? pdMS_TO_TICKS(VOICE_NETWORK_WAIT_MS) : portMAX_DELAY;
+            EventBits_t mask = woke ? VOICE_BIT_NET | VOICE_BIT_RESET : work | VOICE_BIT_NET;
+            if (woke) {
+                net_request_reconnect();
+            }
+            bits = xEventGroupWaitBits(voice_events, mask, pdFALSE, pdFALSE, wait);
+            if (woke && !(bits & mask)) {
+                voice_feedback_publish(VOICE_STATE_OFFLINE, NULL);
+                finish_wake();
+            }
+            continue;
+        }
+
+        if (!woke) {
+            if (voice_feedback_get().state == VOICE_STATE_OFFLINE) {
+                voice_feedback_publish(VOICE_STATE_READY, NULL);
+            }
+            if (!(bits & VOICE_BIT_CHECK_INFO)) {
+                xEventGroupWaitBits(voice_events, work | VOICE_BIT_CHECK_INFO, pdFALSE, pdFALSE, portMAX_DELAY);
                 continue;
             }
-            suspended = false;
-            xEventGroupClearBits(voice_events, VOICE_BIT_RESET | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE | VOICE_BIT_TRIGGER
-                                                   | VOICE_BIT_INTERRUPT | VOICE_BIT_HANGUP | VOICE_BIT_FOLLOWUP
-                                                   | VOICE_BIT_SPEECH | VOICE_TURN_BITS);
-            // An ordinary outage preserves a pending activation code; provisioning clears it.
-            voice_feedback_publish((bits & VOICE_BIT_ENABLED) ? VOICE_STATE_OFFLINE : VOICE_STATE_WAIT_NETWORK, NULL);
-            xSemaphoreGive(network_lock);
-            continue;
-        }
-        if (!VOICE_NETWORK_READY(bits)) {
-            xSemaphoreGive(network_lock);
-            continue;
-        }
-        // 服务端说了 goodbye：释放 WS/MCP/编解码器，只留唤醒
-        if (xEventGroupGetBits(voice_events) & VOICE_BIT_HANGUP) {
-            xEventGroupClearBits(voice_events, VOICE_BIT_HANGUP);
-            close_session();
-            suspended = true;
-            if (!session.cleanup_pending) {
-                xEventGroupClearBits(voice_events, VOICE_TURN_BITS | VOICE_BIT_CAPTURE | VOICE_BIT_TRIGGER);
-                xEventGroupSetBits(voice_events, VOICE_BIT_ARMED);
-                voice_feedback_publish(VOICE_STATE_READY, NULL);
-            }
-            xSemaphoreGive(network_lock);
-            ESP_LOGI(log_tag, "session released, waiting for wake word");
-            continue;
-        }
-        // 挂起中：等唤醒再重建会话
-        if (suspended) {
-            xSemaphoreGive(network_lock);
-            bits = xEventGroupWaitBits(voice_events, VOICE_BIT_TRIGGER | VOICE_BIT_RESET, pdFALSE, pdFALSE,
-                                       pdMS_TO_TICKS(VOICE_POLL_MS));
-            if (bits & VOICE_BIT_TRIGGER) {
-                suspended = false;
-            }
-            continue;
-        }
-        esp_err_t err = ESP_OK;
-        if (network_ready() && session.chat == 0) {
-            err = open_session();
-            if (err == ESP_OK && network_ready()) {
-                xEventGroupClearBits(voice_events, VOICE_TURN_BITS);
-                xEventGroupSetBits(voice_events, VOICE_BIT_ARMED);
-                if (!(xEventGroupGetBits(voice_events) & VOICE_BIT_TRIGGER)) {
-                    voice_feedback_publish(VOICE_STATE_READY, NULL);
-                }
+            TickType_t elapsed = xTaskGetTickCount() - last_service_check;
+            if (service_ready || (service_checked && elapsed < retry_interval)) {
+                TickType_t wait = service_ready ? portMAX_DELAY : retry_interval - elapsed;
+                xEventGroupWaitBits(voice_events, work, pdFALSE, pdFALSE, wait);
+                continue;
             }
         }
-        xSemaphoreGive(network_lock);
-        if (err != ESP_OK) {
-            // Failed stop retains callback-owned resources; pending cleanup runs before the next setup.
-            xEventGroupWaitBits(voice_events, VOICE_BIT_RESET, pdFALSE, pdFALSE, pdMS_TO_TICKS(VOICE_RETRY_MS));
+
+        xSemaphoreTake(network_lock, portMAX_DELAY);
+        if (!network_ready()) {
+            xSemaphoreGive(network_lock);
             continue;
         }
-        bits = xEventGroupWaitBits(voice_events, VOICE_BIT_TRIGGER | VOICE_BIT_RESET | VOICE_BIT_HANGUP, pdFALSE,
-                                   pdFALSE, pdMS_TO_TICKS(VOICE_POLL_MS));
-        if (!(bits & VOICE_BIT_TRIGGER) || (bits & VOICE_BIT_HANGUP) || !network_ready()) {
-            continue;
+        // The capture task may have detected a wake while weather held the network lock.
+        woke = (xEventGroupGetBits(voice_events) & VOICE_BIT_TRIGGER) != 0;
+        if (woke) {
+            net_set_wifi_low_latency(true);
         }
-        if (xSemaphoreTake(network_lock, pdMS_TO_TICKS(VOICE_POLL_MS)) != pdTRUE) {
-            continue;
+        if (!service_ready) {
+            service_ready = prepare_service() == ESP_OK;
+            service_checked = true;
+            last_service_check = xTaskGetTickCount();
         }
-        if (network_ready() && session.chat != 0) {
-            xEventGroupClearBits(voice_events, VOICE_BIT_TRIGGER);
-            err = run_turn();
-            ESP_LOGI(log_tag, "voice stack minimum free: %u bytes", (unsigned)uxTaskGetStackHighWaterMark(NULL));
-            xEventGroupClearBits(voice_events, VOICE_BIT_CAPTURE);
-            if (network_ready() && !(xEventGroupGetBits(voice_events) & VOICE_BIT_HANGUP)) {
-                if (err != ESP_OK) {
-                    voice_feedback_publish(VOICE_STATE_ERROR, NULL);
-                    ESP_LOGW(log_tag, "turn failed: %s", esp_err_to_name(err));
+        if (woke) {
+            if (service_ready && network_ready()) {
+                if (open_session() == ESP_OK) {
+                    esp_err_t err = run_turn();
+                    bits = xEventGroupGetBits(voice_events);
+                    if (err != ESP_OK && !(bits & (VOICE_BIT_HANGUP | VOICE_BIT_RESET | VOICE_BIT_LINK_LOST))) {
+                        ESP_LOGW(log_tag, "turn failed: %s", esp_err_to_name(err));
+                    }
+                    ESP_LOGI(log_tag, "voice stack minimum free: %u bytes",
+                             (unsigned)uxTaskGetStackHighWaterMark(NULL));
                     close_session();
+                    if (!session.cleanup_pending && VOICE_LOCAL_READY(xEventGroupGetBits(voice_events))) {
+                        voice_state_t state = VOICE_STATE_READY;
+                        if (err != ESP_OK && !(bits & VOICE_BIT_HANGUP)) {
+                            state = (bits & VOICE_BIT_LINK_LOST) ? VOICE_STATE_OFFLINE : VOICE_STATE_ERROR;
+                        }
+                        voice_feedback_publish(state, NULL);
+                    }
                 } else {
-                    xEventGroupClearBits(voice_events, VOICE_TURN_BITS);
-                    xEventGroupSetBits(voice_events, VOICE_BIT_ARMED);
-                    voice_feedback_publish(VOICE_STATE_READY, NULL);
+                    // Try fresh service parameters after a failed WebSocket setup.
+                    service_ready = false;
+                    last_service_check = xTaskGetTickCount();
                 }
             }
+            net_set_wifi_low_latency(false);
+            finish_wake();
+        } else if (service_ready && network_ready() && !(xEventGroupGetBits(voice_events) & VOICE_BIT_TRIGGER)) {
+            voice_feedback_publish(VOICE_STATE_READY, NULL);
         }
         xSemaphoreGive(network_lock);
     }
@@ -706,6 +737,7 @@ esp_err_t voice_init(void)
     err = ESP_ERR_NO_MEM;
     voice_events = xEventGroupCreate();
     if (voice_events != NULL) {
+        voice_net_set_connected(net_has_ip());
         ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_CONNECTED,
                                                    on_chat_lifecycle, NULL));
         ESP_ERROR_CHECK(esp_event_handler_register(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_SERVER_GOODBYE,
@@ -766,10 +798,19 @@ failed:
     return err;
 }
 
+void voice_enable_wake(void)
+{
+    if (voice_events != NULL && !(xEventGroupGetBits(voice_events) & VOICE_BIT_ENABLED)) {
+        xEventGroupSetBits(voice_events, VOICE_BIT_ENABLED | VOICE_BIT_ARMED);
+        voice_feedback_publish(VOICE_STATE_READY, NULL);
+    }
+}
+
 void voice_net_ready(void)
 {
+    voice_enable_wake();
     if (voice_events != NULL) {
-        xEventGroupSetBits(voice_events, VOICE_BIT_ENABLED);
+        xEventGroupSetBits(voice_events, VOICE_BIT_CHECK_INFO);
     }
 }
 
@@ -782,8 +823,8 @@ void voice_net_set_connected(bool connected)
         xEventGroupSetBits(voice_events, VOICE_BIT_NET);
     } else {
         EventBits_t previous = xEventGroupClearBits(voice_events, VOICE_BIT_NET);
-        if (VOICE_NETWORK_READY(previous)) {
-            xEventGroupSetBits(voice_events, VOICE_BIT_RESET);
+        if (previous & VOICE_BIT_NET) {
+            xEventGroupSetBits(voice_events, VOICE_BIT_LINK_LOST);
         }
     }
 }
@@ -791,9 +832,10 @@ void voice_net_set_connected(bool connected)
 void voice_net_pause(void)
 {
     if (voice_events != NULL) {
-        xEventGroupClearBits(voice_events, VOICE_BIT_ENABLED | VOICE_BIT_NET | VOICE_BIT_TRIGGER | VOICE_BIT_RECEIVING
-                                               | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE | VOICE_BIT_INTERRUPT
-                                               | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS);
+        xEventGroupClearBits(voice_events, VOICE_BIT_ENABLED | VOICE_BIT_CHECK_INFO | VOICE_BIT_NET | VOICE_BIT_TRIGGER
+                                               | VOICE_BIT_RECEIVING | VOICE_BIT_ARMED | VOICE_BIT_CAPTURE
+                                               | VOICE_BIT_INTERRUPT | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH
+                                               | VOICE_BIT_LOCAL_EOS);
         voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL);
         xEventGroupSetBits(voice_events, VOICE_BIT_RESET);
     }

@@ -291,6 +291,8 @@ static const char *selected_status(char *buf, size_t size)
         switch (status_display.voice.state) {
         case VOICE_STATE_CONNECTING:
             return "语音连接";
+        case VOICE_STATE_OFFLINE:
+            return "无网络";
         case VOICE_STATE_ACTIVATION:
             return "等待激活";
         case VOICE_STATE_LISTENING:
@@ -314,8 +316,6 @@ static const char *selected_status(char *buf, size_t size)
         switch (status_display.voice.state) {
         case VOICE_STATE_DISABLED:
             return "语音不可用";
-        case VOICE_STATE_OFFLINE:
-            return "无网络";
         case VOICE_STATE_NEED_SETUP:
             return "设置语音";
         case VOICE_STATE_ERROR:

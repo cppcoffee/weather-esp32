@@ -17,13 +17,14 @@ BOUNDARIES = (
      "// The session task owns teardown. Callbacks only wake its current wait."),
     ("static void on_chat_lifecycle(void *arg, esp_event_base_t base, int32_t id, void *data)",
      "static void close_session(void)"),
-    ("static void close_session(void)", "static esp_err_t open_session(void)"),
+    ("static void close_session(void)", "static esp_err_t prepare_service(void)"),
+    ("static esp_err_t prepare_service(void)", "static esp_err_t open_session(void)"),
     ("static esp_err_t open_session(void)", "static bool turn_can_continue(void)"),
     ("static bool turn_can_continue(void)", "static esp_err_t stream_microphone(void)"),
     ("static esp_err_t stream_microphone(void)", "static esp_err_t play_response(bool *played)"),
     ("static esp_err_t play_response(bool *played)", "// Returns with the network lock held again, including on timeout or disconnect."),
     ("static bool wait_followup(void)", "static esp_err_t run_turn(void)"),
-    ("static esp_err_t run_turn(void)", "static void voice_task(void *arg)"),
+    ("static esp_err_t run_turn(void)", "static void finish_wake(void)"),
     ("bool voice_weather_begin(void)", "void voice_weather_end(void)"),
     ("void voice_weather_end(void)", "/* end of voice code */"),
 )
@@ -83,8 +84,6 @@ struct voice_packet {
 #define OPUS_SET_COMPLEXITY(x) (100 + (x))
 #define OPUS_RESET_STATE 2
 
-static void net_set_wifi_low_latency(bool enable) { (void)enable; }
-
 static const char *wake_word = "wake";
 static EventBits_t event_bits;
 static EventBits_t *voice_events = &event_bits;
@@ -134,6 +133,7 @@ static struct {
     EventBits_t *events;
     int *microphone;
     void *vad;
+    int wake_fill;
     int16_t (*vad_history)[FOLLOWUP_SAMPLES];
     size_t vad_fill, vad_next, vad_count;
     size_t endpoint_fill;
@@ -144,6 +144,8 @@ static struct {
     int16_t endpoint_frame[FOLLOWUP_SAMPLES];
 } capture_buffers;
 #define VAD_SPEECH 1
+
+static void vad_reset_trigger(void *vad) { assert(vad == &mic); }
 
 static int vad_process_with_trigger(void *vad, int16_t *frame) {
     assert(vad == &mic && frame[0] != 0);
@@ -267,7 +269,7 @@ static void packet(uint8_t original) {
 
 static EventBits_t xEventGroupWaitBits(EventBits_t *group, EventBits_t mask, int clear, int all, TickType_t wait) {
     assert(group == voice_events && !clear && !all);
-    if (mask == VOICE_BIT_WS_READY) {
+    if (mask == (VOICE_BIT_WS_READY | VOICE_END_BITS)) {
         assert(wait == VOICE_CONNECT_TIMEOUT_MS);
         return *group; /* No ticks: the real connect normally completes before the wait. */
     }
@@ -458,7 +460,15 @@ static void pairing(enum info_case reply, const char *value, esp_err_t result, v
     info_case = reply;
     code = value;
     unsigned previous = chat_inits;
-    assert(open_session() == result);
+    esp_err_t err = prepare_service();
+    assert(chat_inits == previous);
+    if (err == ESP_OK) {
+        unsigned requests = info_requests;
+        event_bits = VOICE_BIT_ENABLED | VOICE_BIT_NET;
+        err = open_session();
+        assert(info_requests == requests);
+    }
+    assert(err == result);
     assert(info_requests == info_frees && chat_inits - previous == expected_inits);
     voice_feedback_t snapshot = voice_feedback_get();
     assert(snapshot.state == state && !strcmp(snapshot.activation_code, displayed));
@@ -486,7 +496,7 @@ static void test_pairing(void) {
     assert(chat_stops == 1 && mcp_destroys == 2 && !session.chat && !session.mcp && !session.encoder && !session.decoder);
     // A socket that never connects must not produce a `chat ready` the wake word cannot use.
     info_case = CONNECT_TIMEOUT;
-    event_bits = 0;
+    event_bits = VOICE_BIT_ENABLED | VOICE_BIT_NET;
     assert(open_session() == ESP_ERR_TIMEOUT);
     assert(chat_starts == 2 && chat_stops == 2 && !session.chat && !session.mcp && !session.encoder && !session.decoder);
     // A retained activation code deliberately survives this failure with a retryable state.
@@ -586,7 +596,20 @@ static void test_capture(void) {
     }
     detect_endpoint(frames, FOLLOWUP_SAMPLES);
     assert(event_bits == VOICE_BIT_LOCAL_EOS);
-    puts("PASS local VAD: ordered pre-roll, speech endpoint and minimum capture after wake");
+
+    event_bits = VOICE_BIT_ENABLED | VOICE_BIT_ARMED;
+    on_wake_word();
+    assert(event_bits == (VOICE_BIT_ENABLED | VOICE_BIT_TRIGGER | VOICE_BIT_CAPTURE));
+    assert(captured_samples == 0);
+    for (size_t i = 0; i < sizeof(captured) / sizeof(*captured); i++) {
+        buffer_microphone(frames, 1);
+    }
+    buffer_microphone(frames, 1);
+    assert(event_bits == (VOICE_BIT_ENABLED | VOICE_BIT_TRIGGER | VOICE_BIT_LOCAL_EOS));
+    event_bits = VOICE_BIT_ARMED | VOICE_BIT_RESET;
+    on_wake_word();
+    assert(event_bits == VOICE_BIT_RESET);
+    puts("PASS local VAD and offline wake: pre-roll, endpoint, bounded capture and provisioning guard");
 }
 
 static void test_weather_priority(void) {
@@ -648,6 +671,7 @@ def main():
     macros = re.findall(r"^#define FOLLOWUP_[A-Z_]+ [^\n]+", capture_source, re.MULTILINE)
     assert len(macros) == 3
     capture_functions, _ = extract(capture_source, capture, (
+        ("static void on_wake_word(void)", "static void buffer_microphone(const int16_t *mono, size_t samples)"),
         ("static void buffer_microphone(const int16_t *mono, size_t samples)",
          "static void detect_followup(const int16_t *mono, size_t samples)"),
         ("static void detect_followup(const int16_t *mono, size_t samples)",

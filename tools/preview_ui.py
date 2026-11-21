@@ -566,9 +566,13 @@ int main(void) {
     epd_init();
     weather_t w = {
         .city = "Chengdu", .utc_offset = 28800, .ok = true,
-        .days = {{"2026-11-14",21,12,63,80}, {"2026-11-15",23,14,2,20},
-                 {"2026-11-16",20,13,3,30}, {"2026-11-17",18,10,63,70},
-                 {"2026-11-18",19,9,95,90}},
+        .days = {
+            {.date = "2026-11-14", .tmax = 21, .tmin = 12, .code = 63, .precip_probability = 80},
+            {.date = "2026-11-15", .tmax = 23, .tmin = 14, .code = 2, .precip_probability = 20},
+            {.date = "2026-11-16", .tmax = 20, .tmin = 13, .code = 3, .precip_probability = 30},
+            {.date = "2026-11-17", .tmax = 18, .tmin = 10, .code = 63, .precip_probability = 70},
+            {.date = "2026-11-18", .tmax = 19, .tmin = 9, .code = 95, .precip_probability = 90},
+        },
     };
     unsigned char unknown[FRAME_BYTES], saved[FRAME_BYTES];
     render(&w, NULL);

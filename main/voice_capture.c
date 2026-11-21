@@ -10,6 +10,7 @@
 #include "esp_vad.h"
 #include "freertos/task.h"
 #include "voice_audio.h"
+#include "voice_feedback.h"
 #include "voice_internal.h"
 
 static const char *log_tag = "voice_cap";
@@ -119,8 +120,11 @@ static void on_wake_word(void)
 {
     // ESP-SR 2.4.7's WakeNet9 clean() can dereference a null queue. Keep the model
     // alive across turns and discard only the application's pending microphone data.
-    xEventGroupClearBits(capture_state.events, VOICE_BIT_ARMED);
+    EventBits_t bits = xEventGroupClearBits(capture_state.events, VOICE_BIT_ARMED);
     capture_state.wake_fill = 0;
+    if (!VOICE_LOCAL_READY(bits) || !(bits & VOICE_BIT_ARMED)) {
+        return;
+    }
     xStreamBufferReset(capture_state.microphone);
     if (capture_state.vad != NULL) {
         vad_reset_trigger(capture_state.vad);
@@ -130,11 +134,12 @@ static void on_wake_word(void)
     capture_state.endpoint_holdoff_frames = VOICE_WAKE_MIN_CAPTURE_MS / FOLLOWUP_FRAME_MS;
     capture_state.endpoint_heard_speech = false;
     xEventGroupClearBits(capture_state.events, VOICE_BIT_LOCAL_EOS);
-    if (xEventGroupGetBits(capture_state.events) & VOICE_BIT_RECEIVING) {
+    if (bits & VOICE_BIT_RECEIVING) {
         xEventGroupSetBits(capture_state.events, VOICE_BIT_CAPTURE | VOICE_BIT_INTERRUPT);
         ESP_LOGI(log_tag, "barge-in: wake word detected while speaking");
         return;
     }
+    voice_feedback_publish(VOICE_STATE_CONNECTING, NULL);
     xEventGroupSetBits(capture_state.events, VOICE_BIT_CAPTURE | VOICE_BIT_TRIGGER);
     ESP_LOGI(log_tag, "wake word detected");
 }
@@ -143,8 +148,10 @@ static void buffer_microphone(const int16_t *mono, size_t samples)
 {
     size_t bytes = samples * sizeof(int16_t);
     if (xStreamBufferSpacesAvailable(capture_state.microphone) < bytes) {
+        EventBits_t bits = xEventGroupGetBits(capture_state.events);
+        // Keep the buffered question if connection setup outlasts the pre-roll.
+        xEventGroupSetBits(capture_state.events, (bits & VOICE_BIT_TRIGGER) ? VOICE_BIT_LOCAL_EOS : VOICE_BIT_ERROR);
         xEventGroupClearBits(capture_state.events, VOICE_BIT_CAPTURE);
-        xEventGroupSetBits(capture_state.events, VOICE_BIT_ERROR);
     } else {
         xStreamBufferSend(capture_state.microphone, mono, bytes, 0);
     }
@@ -327,14 +334,14 @@ static void capture_task(void *arg)
     for (;;) {
         xEventGroupWaitBits(capture_state.events, VOICE_BIT_ARMED | VOICE_BIT_CAPTURE | VOICE_BIT_FOLLOWUP, pdFALSE,
                             pdFALSE, portMAX_DELAY);
-        if (!VOICE_NETWORK_READY(xEventGroupGetBits(capture_state.events))) {
+        if (!VOICE_LOCAL_READY(xEventGroupGetBits(capture_state.events))) {
             vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
             continue;
         }
         size_t read = 0;
         esp_err_t err = audio_read(capture_buffers.stereo, stereo_bytes, &read);
         EventBits_t bits = xEventGroupGetBits(capture_state.events);
-        if (!VOICE_NETWORK_READY(bits)) {
+        if (!VOICE_LOCAL_READY(bits)) {
             capture_state.wake_fill = 0;
             continue;
         }

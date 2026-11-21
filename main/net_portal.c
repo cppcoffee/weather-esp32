@@ -28,6 +28,8 @@ const char *net_ap_ssid(void)
 
 void net_portal(void)
 {
+    // Stop the previous station before starting the independent APSTA scan path.
+    ESP_ERROR_CHECK(esp_wifi_stop());
     const char *name = net_ap_ssid();
     wifi_config_t ap = {.ap = {
                             .channel = 1,
@@ -57,8 +59,7 @@ void net_portal(void)
     esp_netif_dhcps_start(ap_netif);
 
     // APSTA 而不是纯 AP：扫描周边热点需要 STA 模式。
-    // STA 配置要清空：上次连接失败留下的 ssid 会让驱动一启动就自动重连，重连期间扫描
-    // 直接被拒（ESP_ERR_WIFI_STATE），而且 STA 还会带着 AP 一起跳信道、把手机踢下线。
+    // Clear the previous station config before running portal scans.
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     wifi_config_t no_sta = {0};

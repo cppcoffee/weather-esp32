@@ -9,8 +9,10 @@
 // Load the WakeNet model and start the audio tasks. Capture starts after voice_net_ready().
 esp_err_t voice_init(void);
 
-// Enable voice after the first weather attempt, including after provisioning.
-// Runtime STA availability is reported separately by the network event handler.
+// Enable local wake detection once Wi-Fi credentials are configured.
+void voice_enable_wake(void);
+
+// Allow background activation checks after the first weather attempt.
 void voice_net_ready(void);
 
 // Report STA IP acquisition/loss. Disconnect schedules teardown on the voice task.
