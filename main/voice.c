@@ -476,9 +476,6 @@ static esp_err_t run_turn(void)
 
     net_set_wifi_low_latency(true);
     while (turn_can_continue()) {
-        if (!channel_open) {
-            voice_feedback_publish(VOICE_STATE_CONNECTING, NULL);
-        }
         xQueueReset(rx_audio_queue);
         xEventGroupClearBits(voice_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_INTERRUPT
                                                | VOICE_BIT_ABORT_DRAIN);

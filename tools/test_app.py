@@ -296,6 +296,7 @@ HARNESS = r'''
 #include "driver/spi_master.h"
 #include "epd.h"
 #include "net.h"
+#include "sensor.h"
 #include "ui.h"
 #include "device_mcp.h"
 #include "button.h"
@@ -309,6 +310,10 @@ typedef int esp_err_t;
 #define ESP_OK 0
 void app_main(void);
 esp_err_t audio_init(void) { return ESP_OK; }
+esp_err_t sensor_init(void) { return ESP_OK; }
+bool sensor_read(sensor_reading_t *out) { if (out) *out = (sensor_reading_t){0}; return false; }
+const char *sensor_name(void) { return "none"; }
+void device_mcp_publish_sensor(const sensor_reading_t *sensor) { assert(sensor && !sensor->valid); }
 /* The dedicated clock regression runs the real clock task with pthread-backed RTOS stubs. */
 static bool display_locked;
 void *xSemaphoreCreateMutex(void) { return (void *)1; }
@@ -1008,19 +1013,21 @@ int main(int argc, char **argv) {
         w.days[i].precip_probability = probabilities[i];
     }
     if (!strcmp(mode, "city_long")) strcpy(w.city, "ABCDEFGHIJKLMNOPQRSTUVW");
-    sensor_reading_t sensor = {.temperature_c = 91.2f, .humidity_percent = 17, .valid = false};
+    sensor_reading_t sensor = {.temperature_c = 91.2f, .humidity_percent = 17, .pressure_hpa = 1012, .valid = false};
     const sensor_reading_t *reading = &sensor;
     if (!strcmp(mode, "sensor_null")) reading = NULL;
     if (!strcmp(mode, "sensor_invalid_poison")) {
         sensor.temperature_c = -123.4f;
         sensor.humidity_percent = 98;
+        sensor.pressure_hpa = 999;
     }
     if (!strncmp(mode, "sensor_", 7) && strcmp(mode, "sensor_null") &&
         strcmp(mode, "sensor_invalid_poison")) {
-        sensor = (sensor_reading_t){.temperature_c = 21.4f, .humidity_percent = 65, .valid = true};
+        sensor = (sensor_reading_t){.temperature_c = 21.4f, .humidity_percent = 65, .pressure_hpa = 1013.2f, .valid = true};
         if (!strcmp(mode, "sensor_sample")) {
             sensor.temperature_c = 23.4f;
             sensor.humidity_percent = 56;
+            sensor.pressure_hpa = 1008.4f;
         }
         if (!strcmp(mode, "sensor_temp_wide")) sensor.temperature_c = FLT_MAX;
         if (!strcmp(mode, "sensor_temp_nan")) sensor.temperature_c = NAN;
@@ -1028,11 +1035,15 @@ int main(int argc, char **argv) {
         if (!strcmp(mode, "sensor_humidity_nan")) sensor.humidity_percent = NAN;
         if (!strcmp(mode, "sensor_humidity_negative")) sensor.humidity_percent = -1;
         if (!strcmp(mode, "sensor_humidity_over100")) sensor.humidity_percent = 101;
+        if (!strcmp(mode, "sensor_pressure_nan")) sensor.pressure_hpa = NAN;
+        if (!strcmp(mode, "sensor_pressure_low")) sensor.pressure_hpa = 299;
+        if (!strcmp(mode, "sensor_pressure_high")) sensor.pressure_hpa = 1101;
         if (!strcmp(mode, "sensor_temp")) sensor.temperature_c = -8.7f;
         if (!strcmp(mode, "sensor_humidity")) sensor.humidity_percent = 43;
+        if (!strcmp(mode, "sensor_pressure")) sensor.pressure_hpa = 987.6f;
     }
     if (!strcmp(mode, "no_forecast_sensor")) {
-        sensor = (sensor_reading_t){.temperature_c = 21.4f, .humidity_percent = 65, .valid = true};
+        sensor = (sensor_reading_t){.temperature_c = 21.4f, .humidity_percent = 65, .pressure_hpa = 1013.2f, .valid = true};
     }
     if (!strncmp(mode, "no_forecast", 11)) {
         w.ok = false;
@@ -1846,16 +1857,16 @@ def check_ui(executable, work, source):
                available, mode == "city_long")
         return result
 
-    def footer(result, temperature="--.- °C", humidity="-- %"):
+    def footer(result, temperature="--.-°C", humidity="--.-%", pressure="---.-kPa"):
         entries = [e for e in result["texts"] if e["y"] >= 109]
-        expected = {8: "温度", 46: temperature, 110: "湿度", 146: humidity}
-        require(len(entries) == 4 and {e["x"]: e["text"] for e in entries} == expected,
+        expected = {8: temperature, 68: humidity, 124: pressure}
+        require(len(entries) == 3 and {e["x"]: e["text"] for e in entries} == expected,
                 f"ui: expected footer {expected}, got {entries}")
         require(all(e["y"] == 124 and e["font"] == "mid" for e in entries),
-                "ui: footer labels/values must use font_mid at baseline124, never font downgrade")
-        require(all(e["width"] <= (100 if e["x"] == 46 else 96)
-                    for e in entries if e["x"] in (46, 198)),
-                "ui: footer values exceeding their fixed width must fall back to unknown")
+                "ui: footer values must use font_mid at baseline 124, never font downgrade")
+        limits = {8: 56, 68: 52, 124: 72}
+        require(all(e["width"] <= limits[e["x"]] and e["x"] + e["width"] < 200 for e in entries),
+                "ui: footer values must stay within their fixed slots and clear of status corner")
 
     def icon(result, day):
         # Normalize actual rendered pixels to a column's center; shapes stay in ui.c.
@@ -2092,28 +2103,32 @@ def check_ui(executable, work, source):
             "ui: no-forecast body must be the grid, not a central no-network message")
 
     valid = capture("sensor_valid")
-    footer(valid, "21.4 °C", "65 %")
+    footer(valid, "21.4°C", "65.0%", "101.3kPa")
     delta = forecast["ink"] ^ valid["ink"]
-    require(delta and all(y >= 109 for x, y in delta),
-            "ui: valid sensors may change only the footer, never the forecast or header")
-    for mode, temperature, humidity, x0, x1 in (
-        ("sensor_temp", "-8.7 °C", "65 %", 46, 146),
-        ("sensor_humidity", "21.4 °C", "43 %", 146, 198),
-        ("sensor_sample", "23.4 °C", "56 %", 46, 198),
-        ("sensor_temp_wide", "--.- °C", "65 %", 46, 146),
-        ("sensor_temp_nan", "--.- °C", "65 %", 46, 146),
-        ("sensor_temp_inf", "--.- °C", "65 %", 46, 146),
-        ("sensor_humidity_nan", "21.4 °C", "-- %", 146, 198),
-        ("sensor_humidity_negative", "21.4 °C", "-- %", 146, 198),
-        ("sensor_humidity_over100", "21.4 °C", "-- %", 146, 198),
+    require(delta and all(y >= 109 and x < 200 for x, y in delta),
+            "ui: valid sensors may change only the footer sensor area, never forecast/header/status")
+    for mode, temperature, humidity, pressure, x0, x1 in (
+        ("sensor_temp", "-8.7°C", "65.0%", "101.3kPa", 8, 64),
+        ("sensor_humidity", "21.4°C", "43.0%", "101.3kPa", 68, 120),
+        ("sensor_pressure", "21.4°C", "65.0%", "98.8kPa", 124, 196),
+        ("sensor_sample", "23.4°C", "56.0%", "100.8kPa", 8, 196),
+        ("sensor_temp_wide", "--.-°C", "65.0%", "101.3kPa", 8, 64),
+        ("sensor_temp_nan", "--.-°C", "65.0%", "101.3kPa", 8, 64),
+        ("sensor_temp_inf", "--.-°C", "65.0%", "101.3kPa", 8, 64),
+        ("sensor_humidity_nan", "21.4°C", "--.-%", "101.3kPa", 68, 120),
+        ("sensor_humidity_negative", "21.4°C", "--.-%", "101.3kPa", 68, 120),
+        ("sensor_humidity_over100", "21.4°C", "--.-%", "101.3kPa", 68, 120),
+        ("sensor_pressure_nan", "21.4°C", "65.0%", "---.-kPa", 124, 196),
+        ("sensor_pressure_low", "21.4°C", "65.0%", "---.-kPa", 124, 196),
+        ("sensor_pressure_high", "21.4°C", "65.0%", "---.-kPa", 124, 196),
     ):
         changed = capture(mode)
-        footer(changed, temperature, humidity)
+        footer(changed, temperature, humidity, pressure)
         delta = valid["ink"] ^ changed["ink"]
         require(delta and all(109 <= y < 128 and x0 <= x < x1 for x, y in delta),
                 f"ui/{mode}: sensor change must affect only its own fixed footer area")
     no_forecast_sensor = capture("no_forecast_sensor")
-    footer(no_forecast_sensor, "21.4 °C", "65 %")
+    footer(no_forecast_sensor, "21.4°C", "65.0%", "101.3kPa")
     require(region(no_forecast_sensor, 109, 128) == region(valid, 109, 128),
             "ui: real sensors must work independently of forecast availability")
     require(region(no_forecast_sensor, 0, 109) == region(absent, 0, 109),

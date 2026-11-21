@@ -17,9 +17,9 @@
 #define AFE_TASK_PRIO       6
 #define WAKE_TASK_PRIO      7
 #define VOICE_AUDIO_CORE    1
-// Guard window after the wake word: the tail must not trigger the silence verdict. Longer
-// values are felt as "it does not hear that I stopped talking"; 600 ms covers the tail.
-#define VOICE_WAKE_MIN_CAPTURE_MS    600
+// Guard window after the wake word: gives the e-paper partial refresh time to show
+// "正在聆听" and prevents the wake word's tail or an early pause from ending the turn.
+#define VOICE_WAKE_MIN_CAPTURE_MS    2400
 #define VOICE_TURN_TIMEOUT_MS        15000
 #define VOICE_RESPONSE_TIMEOUT_MS    30000
 #define VOICE_FIRST_AUDIO_TIMEOUT_MS 90000

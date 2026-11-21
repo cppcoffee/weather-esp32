@@ -209,6 +209,14 @@ static void detect_endpoint(const int16_t *mono, size_t samples)
             if (capture_state.endpoint_holdoff_frames > 0) {
                 capture_state.endpoint_holdoff_frames--;
             }
+#ifdef ESP_PLATFORM
+            // Ignore the wake word's own acoustic tail during the first 300 ms after wake
+            // so silence while the e-paper refreshes "正在聆听" cannot end the turn early.
+            if (capture_state.endpoint_holdoff_frames > (VOICE_WAKE_MIN_CAPTURE_MS - 300) / FOLLOWUP_FRAME_MS) {
+                vad_reset_trigger(capture_state.vad);
+                continue;
+            }
+#endif
             if (vad_process_with_trigger(capture_state.vad, capture_buffers.endpoint_frame) == VAD_SPEECH) {
                 capture_state.endpoint_heard_speech = true;
             } else if (capture_state.endpoint_heard_speech && capture_state.endpoint_holdoff_frames == 0) {
@@ -368,9 +376,9 @@ esp_err_t voice_capture_start(EventGroupHandle_t events, StreamBufferHandle_t mi
         ESP_LOGW(log_tag, "AEC unavailable (%s); wake word disabled during playback", esp_err_to_name(err));
     }
     // The capture task owns this detector after startup; its absence leaves the hard timer intact.
-    // start 60 ms / end 300 ms: end is how long silence must last before the utterance is
-    // closed, so it is most of the delay between the last word and "listen stop".
-    capture_state.vad = vad_create_with_param(VAD_MODE_2, VOICE_SAMPLE_RATE, FOLLOWUP_FRAME_MS, 60, 300);
+    // VAD_MODE_1 rejects quiet ambient hum while catching normal speech; 900 ms tail silence prevents
+    // cutting mid-sentence pauses while still closing turns after the user finishes asking.
+    capture_state.vad = vad_create_with_param(VAD_MODE_1, VOICE_SAMPLE_RATE, FOLLOWUP_FRAME_MS, 60, 900);
     if (capture_state.vad == NULL) {
         ESP_LOGW(log_tag, "VAD unavailable; using the recording timeout and server endpoint");
     }

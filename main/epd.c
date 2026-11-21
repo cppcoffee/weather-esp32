@@ -144,6 +144,11 @@ static void refresh_full(void)
     full_lut();
     cmd(0x24); // black/white RAM
     data(framebuffer, FB_SIZE);
+    // Keep RED/old RAM (0x26) synchronized with 0x24 across full refreshes so the next
+    // ping-pong partial refresh (0x22=0x0F) only toggles pixels that actually changed.
+    cmd(0x26);
+    data(framebuffer, FB_SIZE / 2);
+    data(framebuffer + FB_SIZE / 2, FB_SIZE - FB_SIZE / 2);
     cmd1(0x22, 0xC7); // full update sequence
     cmd(0x20);
     wait_idle("full refresh", 15000);

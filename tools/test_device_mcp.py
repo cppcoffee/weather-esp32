@@ -408,7 +408,7 @@ static void behavior(esp_mcp_t *mcp)
     weather_t w = fixture(0);
     weather_t partial = fixture(1);
     partial.ok = false;
-    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f};
+    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f, .pressure_hpa = 1013.25f};
     emit(mcp, "initial_time", 0);
     emit(mcp, "initial_forecast", 1);
     emit(mcp, "initial_sensor", 2);
@@ -485,13 +485,13 @@ static void behavior(esp_mcp_t *mcp)
         {.valid = true, .temperature_c = 25, .humidity_percent = -INFINITY},
         {.valid = true, .temperature_c = 25, .humidity_percent = -0.25f},
         {.valid = true, .temperature_c = 25, .humidity_percent = 100.25f},
-        {.valid = true, .temperature_c = -12.5f, .humidity_percent = 0},
-        {.valid = true, .temperature_c = 35.25f, .humidity_percent = 100},
+        {.valid = true, .temperature_c = -12.5f, .humidity_percent = 0, .pressure_hpa = 299.5f},
+        {.valid = true, .temperature_c = 35.25f, .humidity_percent = 100, .pressure_hpa = 1012.5f},
     };
     for (int i = 0; i < 11; i++) {
         char label[32];
         snprintf(label, sizeof(label), "sensor_%d", i);
-        device_mcp_publish(NULL, &samples[i], false, false);
+        device_mcp_publish_sensor(&samples[i]);
         emit(mcp, label, 2);
     }
 }
@@ -534,7 +534,7 @@ static void allocation_tests(esp_mcp_t *mcp)
     allocation_sweep(mcp, 1, "unavailable forecast");
     allocation_sweep(mcp, 2, "unavailable sensor");
     weather_t w = fixture(0);
-    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f};
+    sensor_reading_t sensor = {.valid = true, .temperature_c = 23.75f, .humidity_percent = 61.5f, .pressure_hpa = 1013.25f};
     device_mcp_publish(&w, &sensor, false, true);
     allocation_sweep(mcp, 1, "unknown fetch time");
     synced = true;
@@ -850,10 +850,11 @@ def validate_behavior(output, *, legacy=False):
             **(LEGACY_FORECAST_METADATA if legacy else {}),
         })
 
-    def sensor(label, temperature=None, humidity=None, reason=None):
+    def sensor(label, temperature=None, humidity=None, pressure=None, reason=None):
         expected = {
             "available": reason is None, "source": "local_sensor",
             "temperature_c": temperature, "humidity_percent": humidity,
+            **({} if legacy else {"pressure_hpa": pressure}),
         }
         if reason:
             expected["reason"] = reason
@@ -876,7 +877,7 @@ def validate_behavior(output, *, legacy=False):
     for label in ("success", "copied_forecast"):
         forecast(label)
     for label in ("real_sensor", "copied_sensor"):
-        sensor(label, 23.75, 61.5)
+        sensor(label, 23.75, 61.5, 1013.25)
     forecast("wall_forward", age=2.5)
     forecast("wall_backward", age=3.75)
     forecast("failed_partial", age=3.75, retrying=True)
@@ -895,8 +896,8 @@ def validate_behavior(output, *, legacy=False):
     clock("minimum_clock", 1704067200, 28800)
     for i in range(9):
         sensor(f"sensor_{i}", reason="sensor_unavailable" if i == 0 else "invalid_sensor_reading")
-    sensor("sensor_9", -12.5, 0)
-    sensor("sensor_10", 35.25, 100)
+    sensor("sensor_9", -12.5, 0, None)
+    sensor("sensor_10", 35.25, 100, 1012.5)
     require(checked == records.keys(), f"unvalidated records: {records.keys() - checked}")
     require(len(checked) == 44, "behavior scenario must retain all 44 results")
     print(f"PASS behavior: {len(checked)} results; time, sensor, full forecast and cache lifecycle")

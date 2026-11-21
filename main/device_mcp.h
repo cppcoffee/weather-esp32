@@ -12,6 +12,9 @@ typedef struct esp_mcp_s esp_mcp_t;
 forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_reading_t *sensor, bool retrying,
                                     bool forecast_updated);
 
+// Publish a fresh local sensor reading without touching the cached forecast snapshot.
+void device_mcp_publish_sensor(const sensor_reading_t *sensor);
+
 // Register the device data and audio controls. The engine owns tools after success;
 // the caller must destroy the engine if registration fails partway through.
 esp_err_t device_mcp_register(esp_mcp_t *mcp);

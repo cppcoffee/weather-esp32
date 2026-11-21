@@ -38,7 +38,8 @@ typedef struct {
     char city[24];
     weather_day_t days[WEATHER_DAYS];
     weather_hour_t hours[WEATHER_HOURS];
-    int utc_offset; // seconds east of UTC, from the weather API
+    int utc_offset; // seconds east of UTC, from the weather API or coordinates
+    bool tz_known;
     bool ok;
 } weather_t;
 

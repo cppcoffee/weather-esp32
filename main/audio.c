@@ -27,7 +27,7 @@ _Static_assert(!PSRAM_PIN_IN_USE(AUDIO_PA_EN_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2
 #define AUDIO_I2S_PORT            I2S_NUM_0
 #define AUDIO_I2C_SPEED_HZ        400000
 #define AUDIO_DEFAULT_VOLUME      80
-#define AUDIO_DEFAULT_MIC_GAIN_DB 18.0f
+#define AUDIO_DEFAULT_MIC_GAIN_DB 30.0f
 
 static const char *log_tag = "audio";
 

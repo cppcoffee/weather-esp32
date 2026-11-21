@@ -6,6 +6,7 @@
 typedef struct {
     float temperature_c;
     float humidity_percent;
+    float pressure_hpa;
     bool valid;
 } sensor_reading_t;
 
@@ -38,6 +39,9 @@ bool ui_update_clock(void);
 // Apply a copied voice snapshot; redraw only the status corner and, for pairing,
 // the title. Reset and setup screens take precedence. Caller serializes and refreshes.
 bool ui_update_voice(const voice_feedback_t *feedback);
+// Redraw only the footer sensor area if visible and the formatted values changed.
+// Reset and setup screens take precedence. Caller serializes and refreshes.
+bool ui_update_sensor(const sensor_reading_t *sensor);
 // Replace only the title; attempt is the next retry number (1 after the first failure).
 void ui_draw_retry(unsigned attempt, unsigned retry_seconds);
 void ui_draw_resetting(void);

@@ -41,12 +41,22 @@ forecast_stamp_t device_mcp_publish(const weather_t *weather, const sensor_readi
 
         published_snapshot.stamp.fetched_at = clock_known ? now : 0;
         published_snapshot.stamp.fetched_uptime_us = uptime;
+    } else if (weather && weather->tz_known && !published_snapshot.weather.ok) {
+        published_snapshot.weather.utc_offset = weather->utc_offset;
+        published_snapshot.weather.tz_known = true;
     }
     published_snapshot.sensor = sensor ? *sensor : (sensor_reading_t){0};
     published_snapshot.stamp.retrying = retrying;
     forecast_stamp_t stamp = published_snapshot.stamp;
     portEXIT_CRITICAL(&snapshot_lock);
     return stamp;
+}
+
+void device_mcp_publish_sensor(const sensor_reading_t *sensor)
+{
+    portENTER_CRITICAL(&snapshot_lock);
+    published_snapshot.sensor = sensor ? *sensor : (sensor_reading_t){0};
+    portEXIT_CRITICAL(&snapshot_lock);
 }
 
 static struct device_snapshot snapshot(void)
@@ -77,7 +87,8 @@ static esp_err_t get_time(const esp_mcp_property_list_t *properties, esp_mcp_too
     struct device_snapshot copy = snapshot();
     time_t now = time(NULL);
     int offset = copy.weather.utc_offset;
-    bool timezone_known = copy.weather.ok && offset >= -14 * 3600 && offset <= 14 * 3600 && offset % 60 == 0;
+    bool timezone_known =
+        (copy.weather.ok || copy.weather.tz_known) && offset >= -14 * 3600 && offset <= 14 * 3600 && offset % 60 == 0;
     bool synchronized = net_time_is_synced() && now >= NET_MIN_SYNCED_EPOCH && timezone_known;
     char iso[40] = {0};
     if (synchronized) {
@@ -108,20 +119,32 @@ static esp_err_t get_time(const esp_mcp_property_list_t *properties, esp_mcp_too
     return send_json(result, json, ok);
 }
 
+static double round2(double value)
+{
+    // Strip 32-bit float -> double promotion noise (e.g. 11.7f -> 11.699999809265137)
+    // so MCP tool JSON stays compact for LLM prefill.
+    return round(value * 100.0) / 100.0;
+}
+
 static esp_err_t get_sensor(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
     (void)properties;
     sensor_reading_t sensor = snapshot().sensor;
     bool available = sensor.valid && isfinite(sensor.temperature_c) && isfinite(sensor.humidity_percent)
                      && sensor.humidity_percent >= 0 && sensor.humidity_percent <= 100;
+    bool pressure_ok =
+        available && isfinite(sensor.pressure_hpa) && sensor.pressure_hpa >= 300 && sensor.pressure_hpa <= 1100;
     cJSON *json = cJSON_CreateObject();
     bool ok = json && cJSON_AddBoolToObject(json, "available", available)
               && cJSON_AddStringToObject(json, "source", "local_sensor");
     if (ok && available) {
-        ok = cJSON_AddNumberToObject(json, "temperature_c", sensor.temperature_c)
-             && cJSON_AddNumberToObject(json, "humidity_percent", sensor.humidity_percent);
+        ok = cJSON_AddNumberToObject(json, "temperature_c", round2(sensor.temperature_c))
+             && cJSON_AddNumberToObject(json, "humidity_percent", round2(sensor.humidity_percent))
+             && (pressure_ok ? cJSON_AddNumberToObject(json, "pressure_hpa", round2(sensor.pressure_hpa))
+                             : cJSON_AddNullToObject(json, "pressure_hpa"));
     } else if (ok) {
         ok = cJSON_AddNullToObject(json, "temperature_c") && cJSON_AddNullToObject(json, "humidity_percent")
+             && cJSON_AddNullToObject(json, "pressure_hpa")
              && cJSON_AddStringToObject(json, "reason", sensor.valid ? "invalid_sensor_reading" : "sensor_unavailable");
     }
     return send_json(result, json, ok);
@@ -131,10 +154,10 @@ static cJSON *day_json(const weather_day_t *day)
 {
     cJSON *json = cJSON_CreateObject();
     if (!json || !cJSON_AddStringToObject(json, "date", day->date)
-        || !cJSON_AddNumberToObject(json, "temperature_min_c", day->tmin)
-        || !cJSON_AddNumberToObject(json, "temperature_max_c", day->tmax)
+        || !cJSON_AddNumberToObject(json, "temperature_min_c", round2(day->tmin))
+        || !cJSON_AddNumberToObject(json, "temperature_max_c", round2(day->tmax))
         || !cJSON_AddNumberToObject(json, "weather_code", day->code)
-        || !cJSON_AddNumberToObject(json, "precip_probability", day->precip_probability))
+        || !cJSON_AddNumberToObject(json, "precip_probability", round2(day->precip_probability)))
     {
         cJSON_Delete(json);
         return NULL;
@@ -146,9 +169,9 @@ static cJSON *hour_json(const weather_hour_t *hour)
 {
     cJSON *json = cJSON_CreateObject();
     if (!json || !cJSON_AddNumberToObject(json, "hour", hour->hour)
-        || !cJSON_AddNumberToObject(json, "temperature_c", hour->temperature_c)
+        || !cJSON_AddNumberToObject(json, "temperature_c", round2(hour->temperature_c))
         || !cJSON_AddNumberToObject(json, "weather_code", hour->code)
-        || !cJSON_AddNumberToObject(json, "precip_probability", hour->precip_probability))
+        || !cJSON_AddNumberToObject(json, "precip_probability", round2(hour->precip_probability)))
     {
         cJSON_Delete(json);
         return NULL;
@@ -237,7 +260,8 @@ static const struct device_tool_spec device_tools[] = {
      "precip_probability: forecast percent, not observed rain. Hours: API order at fetch, each with local date "
      "(YYYY-MM-DD) and hour. A repeated local hour may appear twice near a clock change.",
      get_forecast, false},
-    {"self.get_sensor_reading", "Read actual local temperature/humidity; available=false means no valid reading.",
+    {"self.get_sensor_reading",
+     "Read actual local temperature, humidity and barometric pressure (hPa); available=false means no valid reading.",
      get_sensor, false},
     {"self.get_device_status", "Read the device speaker's current volume (0–100).", get_device_status, false},
     {"self.audio_speaker.set_volume", "Set and save the speaker volume as an integer from 0 to 100.", set_volume, true},

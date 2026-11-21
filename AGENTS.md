@@ -78,7 +78,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 - `app->w` = 本次请求结果（开始时被清空，失败可为脏数据）；`app->shown` = 最近成功快照。**失败重绘只读 `shown`**，不能靠 `w` 保留旧预报。
 - 失败时 `present()` 用旧快照（首次失败用占位）重画，再覆盖顶部重试标题与底栏状态；正文像素不动。
 - 首列显示 `今天` 仅当日期等于已同步当地日期。
-- 底栏温湿度只取 `sensor_reading_t`；未接驱动时 `valid=false` → `--.- °C` / `-- %`，禁止用天气温湿度代替。接入后填 `temperature_c`、`humidity_percent`、`valid=true`。
+- 底栏温湿度气压只取 `sensor_reading_t`（`main/sensor.c` 走 `I2C_NUM_1` SDA=5/SCL=6 自动识别 BME280/BME680/AHT20+BMP280/SHT3x/SHT4x/BMP3xx，每 60 s 采样并局部刷新）；未接或读数无效时显示 `--.-°C` / `--.-%` / `---.-kPa`，禁止用天气温湿度代替。
 - 已对时逐时页随当地小时滚动；未对时从缓存首条开始。MCP 始终返回全部 21 条。
 
 ## 启动、重试、按键
@@ -105,12 +105,12 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 - 协议层用 `espressif/esp_xiaozhi`（依赖 `esp_websocket_client`、`mcp-c-sdk`）；**不要重写 WebSocket/MQTT/hello/认证/MCP**。本地修改范围见 `components/esp_xiaozhi/LOCAL_PATCH.md`。
 - 顺序：`chat_init`（回调）→ `get_info`（POST 板卡信息，拿激活码，MQTT/WS 配置写 NVS）→ `chat_start` → `open_audio_channel`（自动发 hello）→ `send_audio_data` → `stop`/`deinit`。事件回调只报协议事实，状态机/UI/命令由应用决定。
 - 音频契约：hello = `opus`/16000 Hz/1 ch/60 ms。`audio.c` 是 16 kHz/16 bit/**双声道**（左声道为麦克风），语音任务必须转单声道并 60 ms 分帧，不要把双声道直接当单声道发。接线真值在 `main/audio.h` 顶部 `#define`（EN=15、DOUT=16、WS=17、DIN=18、BCLK=9、MCLK=10、SCL=11、SDA=12）；改线只改那里。
-- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，`MCLK_MULTIPLE_384`，默认音量 80（0..100，NVS 恢复），麦克风增益 18 dB。`audio_init()` 后 DAC 静音且 PA_EN 拉低（板载 WS2812 在 GPIO48，与 PA_EN 无关）；播放前 `audio_set_mute(false)`。`esp_codec_dev` 音量是 dB 线性映射（0=−50 dB），自检别用 30。
+- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，`MCLK_MULTIPLE_384`，默认音量 80（0..100，NVS 恢复），麦克风增益 30 dB。`audio_init()` 后 DAC 静音且 PA_EN 拉低（板载 WS2812 在 GPIO48，与 PA_EN 无关）；播放前 `audio_set_mute(false)`。`esp_codec_dev` 音量是 dB 线性映射（0=−50 dB），自检别用 30。
 - `voice_init()` 载模型建任务；联网后取配置建会话；返回激活码时复制到反馈快照（1–16 个无空格可打印 ASCII）并上屏/串口，等待绑定后重试，不打开未激活会话。challenge 激活未实现。
 - 唤醒：WakeNet（`esp-sr` 2.4.7 `wn9_xiaoluxiaolu_tts2`）只在本地；命中后才开麦上传。模型必须在 `model` 分区；无 PSRAM 时跳过语音。
 - 建连：`open_session()` 在 `chat_start` 后等 `ESP_XIAOZHI_CHAT_EVENT_CONNECTED`（≤ `VOICE_CONNECT_TIMEOUT_MS`），超时按失败重试——`chat ready` 表示套接字已通。断网/STA 停止后停止接收并清会话；快速恢复 IP 也要先清旧会话；普通断线保留激活码，重配网清除。
 - 追问（VAD 可用时自动启用）：播放结束静音后开 6 s 本地 VAD 窗口；确认开口带 ≤120 ms 前滚，复用同一通道 `listen start/stop`；窗口内取数最多等 4 s（网络锁）。沉默退回待唤醒。
-- 端点：唤醒后的录音至少保留 600 ms，避免唤醒词尾音提前触发静默收尾。保护窗口过后，本地 VAD 约 300 ms 静默结束录音；追问无首句保护窗口。上行**不做逐帧增益归一**（会放大静音、让服务端能量 VAD 判不出停顿，且逐帧泵动）；音量只靠 codec 的麦克风增益。录音上限 15 s，随后发 `listen stop`；服务端收尾另行保留。
+- 端点：唤醒后的录音至少保留 2.4 s（并跳过前 300 ms 唤醒词尾音置位），避免墨水屏刷新「正在聆听」期间或句首停顿提前收尾。保护窗口过后，本地 VAD（`VAD_MODE_1`）约 900 ms 静默结束录音；追问无首句保护窗口。上行**不做逐帧增益归一**（会放大静音、让服务端能量 VAD 判不出停顿，且逐帧泵动）；音量只靠 codec 的麦克风增益。录音上限 15 s，随后发 `listen stop`；服务端保留 1.2 s 静音兜底。
 - 播放：正常结束等 I²S DMA 尾帧（`AUDIO_PLAYBACK_TAIL_MS`）再静音；打断/断线/出错立即停。
 - AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考），参考信号是 `play_response()` 实际写入 I²S 的 PCM（`playback_ref_stream`，按写入顺序，不加延迟）。WakeNet 在 AFE 之外，检测 AEC 输出；播放期间保持 `ARMED`，命中后置 `VOICE_BIT_INTERRUPT`，由 `run_turn()` 静音、丢音频、发 `abort`(wake_word_detected)、同通道重新 `listen start`。AFE 失败则回退为播放期不检测。
 - 两任务只通过 `voice_internal.h` 的事件位 + 两个流缓冲通信；新增位同步更新该头与主机 harness。
@@ -118,7 +118,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 - WS stop 失败：保留 chat/MCP/Opus，释放网络锁后由语音任务重试清理，禁止开新会话；成功后 `deinit` 消费句柄。
 - 屏上反馈：`voice_feedback.c/.h` 临界区发布/读取快照，状态变更通过观察者即时唤醒显示任务；连接重试/断网/错误保留待激活码，其他状态清空。显示任务合并更新：顶部激活码、右下角状态（纯局刷），保留天气正文/温湿度/时钟；配网页优先。新增中文文案必须重跑 `tools/genfont.py`。
 - 隐私：接上后麦克风音频与识别文本会发到配置的服务端，不是本地处理。
-- MCP：`device_mcp_publish()` 发布 `app->shown` + `sensor_reading_t`；工具 `self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading`（无参数只读）、`self.get_device_status`、`self.audio_speaker.set_volume`（0–100 写 NVS）。不要为一次问答重跑天气；未接入传感器必须 `available=false`；时间仅 SNTP 成功且时区已知时 `synchronized=true`；天气含抓取时间、单调时钟 age、`stale`/`retrying`，未对时抓取时间为 null。
+- MCP：`device_mcp_publish()` 发布 `app->shown` + `sensor_reading_t`，`device_mcp_publish_sensor()` 由 `clock_task` 每 60 s 更新传感器读数；工具 `self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading`（含 `temperature_c`/`humidity_percent`/`pressure_hpa`，无参数只读）、`self.get_device_status`、`self.audio_speaker.set_volume`（0–100 写 NVS）。不要为一次问答重跑天气；未接入传感器必须 `available=false`；时间仅 SNTP 成功且时区已知时 `synchronized=true`；天气含抓取时间、单调时钟 age、`stale`/`retrying`，未对时抓取时间为 null。
 
 ## 配网页
 

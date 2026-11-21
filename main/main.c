@@ -5,11 +5,13 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "net.h"
+#include "sensor.h"
 #include "ui.h"
 #include "voice.h"
 #include "voice_feedback.h"
@@ -21,6 +23,7 @@
 #define REFRESH_S          (30 * 60)
 #define RETRY_MIN_S        5
 #define RETRY_MAX_S        60
+#define SENSOR_POLL_US     (60LL * 1000000LL)
 
 enum app_view {
     VIEW_DAILY,
@@ -95,7 +98,7 @@ static unsigned retry_seconds(unsigned failures)
 
 static const weather_t *current_weather(const struct app_state *app)
 {
-    return app->have_weather ? &app->shown : NULL;
+    return (app->have_weather || app->shown.tz_known) ? &app->shown : NULL;
 }
 
 static void draw_page(const struct app_state *app)
@@ -154,15 +157,30 @@ static void set_network_busy(struct app_state *app, bool busy)
 static void clock_task(void *arg)
 {
     struct app_state *app = arg;
+    int64_t last_sensor_us = esp_timer_get_time();
     for (;;) {
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
-        voice_feedback_t feedback = voice_feedback_get();
+        sensor_reading_t sampled = {0};
+        bool sensor_polled = false;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_sensor_us >= SENSOR_POLL_US) {
+            last_sensor_us = now_us;
+            (void)sensor_read(&sampled);
+            device_mcp_publish_sensor(&sampled);
+            sensor_polled = true;
+        }
         xSemaphoreTake(display_lock, portMAX_DELAY);
+        voice_feedback_t feedback = voice_feedback_get();
         bool status_changed = false;
         if (app->status == UI_STATUS_SYNCING && net_time_is_synced()) {
             app->status = UI_STATUS_UPDATED;
             app->status_attempt = 0;
             status_changed = ui_update_status(app->status, app->status_attempt);
+        }
+        bool sensor_changed = false;
+        if (sensor_polled) {
+            app->sensor = sampled;
+            sensor_changed = ui_update_sensor(&app->sensor);
         }
         bool voice_changed = ui_update_voice(&feedback);
         bool clock_changed = ui_update_clock();
@@ -180,7 +198,7 @@ static void clock_task(void *arg)
             epd_refresh_page_switch();
         } else if (clock_changed) {
             epd_refresh();
-        } else if (voice_changed || status_changed) {
+        } else if (voice_changed || status_changed || sensor_changed) {
             epd_refresh_partial();
         }
         xSemaphoreGive(display_lock);
@@ -343,6 +361,13 @@ static void run_weather_phase(struct app_state *app)
         app->shown = app->w;
         set_status(app, net_time_is_synced() ? UI_STATUS_UPDATED : UI_STATUS_SYNCING, 0, false);
     } else {
+        if (!app->have_weather && app->w.tz_known) {
+            xSemaphoreTake(display_lock, portMAX_DELAY);
+            net_apply_tz(app->w.utc_offset);
+            app->shown.utc_offset = app->w.utc_offset;
+            app->shown.tz_known = true;
+            xSemaphoreGive(display_lock);
+        }
         app->retrying = true;
         app->retry_delay = retry_seconds(++app->retry_attempt);
         wait_s = app->retry_delay;
@@ -350,7 +375,11 @@ static void run_weather_phase(struct app_state *app)
         ESP_LOGW(log_tag, "update failed, retry #%u in %us", app->retry_attempt, app->retry_delay);
     }
 
-    app->stamp = device_mcp_publish(app->have_weather ? &app->shown : NULL, &app->sensor, app->retrying, updated);
+    sensor_reading_t sensor_snapshot;
+    xSemaphoreTake(display_lock, portMAX_DELAY);
+    sensor_snapshot = app->sensor;
+    xSemaphoreGive(display_lock);
+    app->stamp = device_mcp_publish(current_weather(app), &sensor_snapshot, app->retrying, updated);
     voice_weather_end();
     start_voice();
     voice_net_ready();
@@ -395,6 +424,9 @@ void app_main(void)
     ESP_ERROR_CHECK(button_event_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
     epd_init();
     net_init();
+    if (sensor_init() != ESP_OK) {
+        ESP_LOGW(log_tag, "local sensor unavailable");
+    }
     esp_err_t audio_err = audio_init();
     if (audio_err == ESP_FAIL) {
         vTaskDelay(pdMS_TO_TICKS(150));
@@ -415,6 +447,8 @@ void app_main(void)
     app.view = VIEW_DAILY;
     app.status = UI_STATUS_CONNECTING;
     app.phase = APP_PHASE_CONNECT;
+    (void)sensor_read(&app.sensor);
+    device_mcp_publish_sensor(&app.sensor);
 
     // The glass keeps the last session's image, and the first forecast is seconds to minutes
     // away, so paint the placeholder page now. One full refresh scrubs the old image and leaves

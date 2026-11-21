@@ -14,7 +14,9 @@ ESP32-S3 + 2.9" 墨水屏（SSD1680，可见 296×128）天气面板，纯 ESP-I
 | BUSY | GPIO21 | | I²S MCLK | GPIO10 |
 | VCC | 3V3 | | I²C SCL / SDA | GPIO11 / GPIO12 |
 
-改引脚只动 `main/epd.h` 和 `main/audio.h` 顶部的 `#define`。屏幕用 3.3V；ES8311 与 NS415B 电源按模块规格，必须与 ESP32 共地。Octal PSRAM 占用 GPIO33–37，GPIO43/44 留给外接 UART，GPIO19/20 保留 USB-JTAG。
+改引脚只动 `main/epd.h`、`main/audio.h` 和 `main/sensor.h` 顶部的 `#define`。屏幕用 3.3V；ES8311 与 NS415B 电源按模块规格，必须与 ESP32 共地。Octal PSRAM 占用 GPIO33–37，GPIO43/44 留给外接 UART，GPIO19/20 保留 USB-JTAG。
+
+本地温湿度气压传感器接独立 I²C 总线 `I2C_NUM_1`：**SDA = GPIO5，SCL = GPIO6**，3.3V 供电；启动自动扫描识别常见型号（BME280、BME680/688、AHT20+BMP280、AHT20/SHT3x/SHT4x + BMP280/BMP388/390），每分钟采样并局部刷新屏幕底栏（`23.5°C 58.0% 101.3kPa`）。
 
 ## 编译与烧录
 
@@ -43,7 +45,7 @@ idf.py -p 实际串口 monitor    # 需在真实终端运行
 
 - **短按**切页（按天 / 未来 10 小时）。
 - 说 **“小鹿小鹿”** 唤醒：本地 WakeNet 命中后才开麦上传，空闲时不上传音频。
-- 一轮问答：唤醒后至少录 600 毫秒，之后约 300 毫秒静默即结束录音，最长 15 秒。
+- 一轮问答：唤醒后至少录 2.4 秒，之后约 900 毫秒静默即结束录音，最长 15 秒。
 - **免唤醒追问默认开启**：回复播完后约 6 秒内可直接说下一句，设备先在本地确认开口再上传；窗口内不说话则回到待唤醒。
 - 播放中说“小鹿小鹿”可打断（需要 AEC 初始化成功）。
 - 说 **“退下”/“退下吧”/“再见”/“拜拜”** 结束会话：服务端下发 `goodbye` 并断开，设备释放 WebSocket/MCP/Opus，只留本地唤醒；下次唤醒重新走 OTA 建连。
@@ -58,7 +60,7 @@ idf.py -p 实际串口 monitor    # 需在真实终端运行
 |---|---|
 | `self.get_current_time` | 设备时钟 + 天气返回的 UTC 偏移；仅在 SNTP 成功且时区已知时 `synchronized=true` |
 | `self.get_weather_forecast` | 与屏幕同源的最近成功快照（5 天 + 21 小时），含抓取时间、缓存年龄、`stale`/`retrying` |
-| `self.get_sensor_reading` | 本地温湿度；**当前未接传感器驱动**，返回 `available=false` |
+| `self.get_sensor_reading` | 本地温湿度与气压传感器（`temperature_c`、`humidity_percent`、`pressure_hpa`）；未接入或读数异常时返回 `available=false` |
 | `self.get_device_status` | 扬声器当前音量 |
 | `self.audio_speaker.set_volume` | 音量 0–100，写入 NVS，重启恢复（首次默认 80） |
 

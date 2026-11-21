@@ -177,6 +177,24 @@ static bool parse_geo(const char *buf, size_t length, double *lat, double *lon, 
     return ok;
 }
 
+static int utc_offset_from_coords(double lat, double lon)
+{
+    if (!isfinite(lat) || !isfinite(lon) || lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+        return 0;
+    }
+    // Mainland China, Hong Kong, Macau and Taiwan all observe UTC+8 across 73E..135E.
+    if (lat >= 18.0 && lat <= 54.0 && lon >= 73.0 && lon <= 135.0) {
+        return 8 * 3600;
+    }
+    int zone = (int)lround(lon / 15.0);
+    if (zone < -12) {
+        zone = -12;
+    } else if (zone > 14) {
+        zone = 14;
+    }
+    return zone * 3600;
+}
+
 static bool parse_forecast(const char *buf, size_t length, weather_t *weather)
 {
     cJSON *root = json_parse(buf, length);
@@ -209,7 +227,12 @@ bool weather_update(weather_t *w)
         return false;
     }
 
-    ESP_LOGI(log_tag, "ip located: %s %.4f,%.4f", w->city, lat, lon);
+    int coord_offset = utc_offset_from_coords(lat, lon);
+#ifdef ESP_PLATFORM
+    w->utc_offset = coord_offset;
+    w->tz_known = true;
+#endif
+    ESP_LOGI(log_tag, "ip located: %s %.4f,%.4f (coord tz %+d)", w->city, lat, lon, coord_offset);
 
     char lat_s[16], lon_s[16];
     snprintf(lat_s, sizeof(lat_s), "%.4f", lat);
@@ -224,6 +247,14 @@ bool weather_update(weather_t *w)
         ESP_LOGE(log_tag, "weather parse failed: invalid timezone, daily or hourly data");
         return false;
     }
+#ifdef ESP_PLATFORM
+    if ((lat >= 18.0 && lat <= 54.0 && lon >= 73.0 && lon <= 135.0) || (w->utc_offset == 0 && coord_offset != 0)) {
+        w->utc_offset = coord_offset;
+    }
+#else
+    (void)coord_offset;
+#endif
+    w->tz_known = true;
     w->ok = true;
     ESP_LOGI(log_tag, "%s %.1f/%.1fC, %d days, %d hours, tz %+d", w->days[0].date, w->days[0].tmax, w->days[0].tmin,
              WEATHER_DAYS, WEATHER_HOURS, w->utc_offset);

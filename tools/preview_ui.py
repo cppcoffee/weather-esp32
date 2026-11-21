@@ -225,10 +225,11 @@ void epd_text(int x, int y, const aafont *f, const char *text) {
             }
             if (weather_scene && y == 124) {
                 assert(f == &font_mid && top >= 109 && bottom <= 128);
-                if (x == 46) assert(left >= 46 && right <= 104);
-                else if (x == 146) assert(left >= 146 && right <= 196);
+                if (x == 8) assert(left >= 8 && right <= 64);
+                else if (x == 68) assert(left >= 68 && right <= 120);
+                else if (x == 124) assert(left >= 124 && right <= 196);
                 else if (x >= 200) assert(left >= 200 && right <= 292); /* status corner */
-                else assert((x == 8 && right <= 40) || (x == 110 && right <= 142));
+                else assert(0 && "unexpected footer x");
             }
             if (weather_scene && (y == DATE_BASE || y == UNKNOWN_ICON_BASE ||
                                   y == DAILY_TEMP_BASE || y == PRECIP_BASE)) {
@@ -575,22 +576,22 @@ int main(void) {
     render(&w, NULL);
     expect(8, 16, &font_mid, "Chengdu");
     expect(EPD_W - 8 - epd_text_w(&font_clock, "08:30"), 16, &font_clock, "08:30");
-    expect(46, 124, &font_mid, "--.- °C");
-    expect(146, 124, &font_mid, "-- %");
-    expect(8, 124, &font_mid, "温度");
-    expect(110, 124, &font_mid, "湿度");
+    expect(8, 124, &font_mid, "--.-°C");
+    expect(68, 124, &font_mid, "--.-%");
+    expect(124, 124, &font_mid, "---.-kPa");
     centered(174, 16, &font_mid, "今日带伞");
     expect_forecast(&w);
     memcpy(unknown, frame, sizeof(unknown));
     emit("demo");
 
-    sensor_reading_t s = {.temperature_c = 23.4f, .humidity_percent = 56, .valid = false};
+    sensor_reading_t s = {.temperature_c = 23.4f, .humidity_percent = 56, .pressure_hpa = 1013.2f, .valid = false};
     render(&w, &s);
     assert(!memcmp(unknown, frame, sizeof(frame)));
     s.valid = true;
     render(&w, &s);
-    expect(46, 124, &font_mid, "23.4 °C");
-    expect(146, 124, &font_mid, "56 %");
+    expect(8, 124, &font_mid, "23.4°C");
+    expect(68, 124, &font_mid, "56.0%");
+    expect(124, 124, &font_mid, "101.3kPa");
     forecast_unchanged(unknown);
     emit("sensor");
     memcpy(saved, frame, sizeof(saved));
@@ -601,39 +602,49 @@ int main(void) {
 
     s.temperature_c = -123.4f;
     s.humidity_percent = 100;
+    s.pressure_hpa = 1013.2f;
     render(&w, &s);
-    /* The temperature slot is 58px wide so the status corner stays clear: -123.4 °C does
-       not fit and falls back to the placeholder, 100 % still does. */
-    expect(46, 124, &font_mid, "--.- °C");
-    expect(146, 124, &font_mid, "100 %");
+    /* The temperature slot is 56px wide: -123.4°C does not fit and falls back to the
+       placeholder, while 100.0% and 101.3kPa still fit clear of the status corner. */
+    expect(8, 124, &font_mid, "--.-°C");
+    expect(68, 124, &font_mid, "100.0%");
+    expect(124, 124, &font_mid, "101.3kPa");
     forecast_unchanged(unknown);
     s.temperature_c = 1e20f;
+    s.pressure_hpa = 1e20f;
     render(&w, &s);
-    expect(46, 124, &font_mid, "--.- °C");
-    expect(146, 124, &font_mid, "100 %");
+    expect(8, 124, &font_mid, "--.-°C");
+    expect(68, 124, &font_mid, "100.0%");
+    expect(124, 124, &font_mid, "---.-kPa");
     forecast_unchanged(unknown);
     emit("wide-values");
 
     const float invalid_temp[] = {NAN, INFINITY, -INFINITY, FLT_MAX, -FLT_MAX};
     const float invalid_humidity[] = {NAN, INFINITY, -INFINITY, -0.1f, 100.1f};
+    const float invalid_pressure[] = {NAN, INFINITY, -INFINITY, 299.9f, 1100.1f};
     for (unsigned i = 0; i < sizeof(invalid_temp) / sizeof(invalid_temp[0]); ++i) {
         s.temperature_c = invalid_temp[i];
         s.humidity_percent = invalid_humidity[i];
+        s.pressure_hpa = invalid_pressure[i];
         render(&w, &s);
         assert(!memcmp(unknown, frame, sizeof(frame)));
     }
     /* Fields validate independently; genuine measured zero is not an unknown. */
     s.temperature_c = 0;
     s.humidity_percent = NAN;
+    s.pressure_hpa = NAN;
     render(&w, &s);
-    expect(46, 124, &font_mid, "0.0 °C");
-    expect(146, 124, &font_mid, "-- %");
+    expect(8, 124, &font_mid, "0.0°C");
+    expect(68, 124, &font_mid, "--.-%");
+    expect(124, 124, &font_mid, "---.-kPa");
     forecast_unchanged(unknown);
     s.temperature_c = NAN;
     s.humidity_percent = 0;
+    s.pressure_hpa = 1013;
     render(&w, &s);
-    expect(46, 124, &font_mid, "--.- °C");
-    expect(146, 124, &font_mid, "0 %");
+    expect(8, 124, &font_mid, "--.-°C");
+    expect(68, 124, &font_mid, "0.0%");
+    expect(124, 124, &font_mid, "101.3kPa");
     forecast_unchanged(unknown);
 
     /* Sensor changes must leave the entire header/forecast/divider untouched. */
@@ -672,8 +683,9 @@ int main(void) {
 
     weather_t empty = {0};
     render(&empty, NULL);
-    expect(46, 124, &font_mid, "--.- °C");
-    expect(146, 124, &font_mid, "-- %");
+    expect(8, 124, &font_mid, "--.-°C");
+    expect(68, 124, &font_mid, "--.-%");
+    expect(124, 124, &font_mid, "---.-kPa");
     centered(174, 16, &font_mid, "预报待更新");
     for (int i = 0; i < 5; ++i) {
         centered(GRID_X + COL_W / 2 + i * COL_W, DATE_BASE, &font_small, "--/--");
@@ -692,9 +704,11 @@ int main(void) {
     assert(!memcmp(saved, frame, sizeof(frame)));
     s.temperature_c = 23.4f;
     s.humidity_percent = 56;
+    s.pressure_hpa = 1013.2f;
     render(&empty, &s);
-    expect(46, 124, &font_mid, "23.4 °C");
-    expect(146, 124, &font_mid, "56 %");
+    expect(8, 124, &font_mid, "23.4°C");
+    expect(68, 124, &font_mid, "56.0%");
+    expect(124, 124, &font_mid, "101.3kPa");
     forecast_unchanged(saved);
     centered(GRID_X + COL_W / 2, DATE_BASE, &font_small, "--/--");
 

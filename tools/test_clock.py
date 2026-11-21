@@ -33,6 +33,7 @@ HARNESS = r'''
 #include "freertos/task.h"
 #include "epd.h"
 #include "esp_err.h"
+#include "sensor.h"
 #include "ui.h"
 #include "voice_feedback.h"
 
@@ -53,8 +54,9 @@ static atomic_llong uptime;
 static unsigned generation, completed, frames, pending_notifies, notify_done;
 static unsigned full_refreshes, partial_refreshes;
 static int dc_level = 1, last_cmd;
-static bool allow_forecast_pixels, allow_hourly_pixels, allow_page_switch, allow_status_pixels;
-static unsigned forecast_pixels;
+static bool allow_forecast_pixels, allow_hourly_pixels, allow_page_switch, allow_status_pixels, allow_sensor_pixels;
+static unsigned forecast_pixels, sensor_publications;
+static sensor_reading_t mock_sensor;
 static bool ready, blocked, stopping, allow_weather_return, erased, reprovisioned;
 enum { FRAME_BYTES = PANEL_W / 8 * PANEL_H };
 static unsigned char frame[FRAME_BYTES];
@@ -200,6 +202,20 @@ int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *tran
     return 0;
 }
 esp_err_t audio_init(void) { return ESP_OK; }
+esp_err_t sensor_init(void) { return ESP_OK; }
+bool sensor_read(sensor_reading_t *out) {
+    pthread_mutex_lock(&gate);
+    *out = mock_sensor;
+    pthread_mutex_unlock(&gate);
+    return out->valid;
+}
+const char *sensor_name(void) { return "mock"; }
+void device_mcp_publish_sensor(const sensor_reading_t *sensor) {
+    assert(sensor != NULL);
+    pthread_mutex_lock(&gate);
+    sensor_publications++;
+    pthread_mutex_unlock(&gate);
+}
 esp_err_t voice_init(void) {
     return voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL) ? ESP_OK : ESP_FAIL;
 }
@@ -248,9 +264,11 @@ static void advance(long seconds, bool expect_refresh) {
         if ((before[index] ^ frame[index]) & mask) {
             bool clock_pixel = x >= 230 && y < 22;
             bool status_pixel = x >= 200 && y >= 110;
+            bool sensor_pixel = x < 200 && y >= 110;
             bool forecast_pixel = (x >= 110 && x < 230 && y < 22)
                                   || (x >= 18 && x < 70 && y > 22 && y < 46);
             assert(clock_pixel || (allow_status_pixels && status_pixel)
+                   || (allow_sensor_pixels && sensor_pixel)
                    || (allow_forecast_pixels && forecast_pixel)
                    || (allow_hourly_pixels && y > 22 && y < 108) || allow_page_switch);
             forecast_pixels += !clock_pixel;
@@ -427,6 +445,25 @@ int main(void) {
         publish_status(rapid[i], NULL, true);
     }
     publish_status(VOICE_STATE_WAIT_NETWORK, NULL, true);
+
+    /* Periodic sensor poll updates only x < 200, y >= 110 via partial refresh and publishes to MCP. */
+    unsigned before_pub, before_full, before_partial;
+    pthread_mutex_lock(&gate);
+    mock_sensor = (sensor_reading_t){.temperature_c = 23.5f, .humidity_percent = 58.0f, .pressure_hpa = 1013.2f, .valid = true};
+    before_pub = sensor_publications;
+    before_full = full_refreshes;
+    before_partial = partial_refreshes;
+    pthread_mutex_unlock(&gate);
+    allow_sensor_pixels = true;
+    atomic_fetch_add(&uptime, 60LL * 1000000LL);
+    advance(0, true);
+    allow_sensor_pixels = false;
+    assert(sensor_publications == before_pub + 1);
+    assert(full_refreshes == before_full && partial_refreshes == before_partial + 1);
+    /* Identical sensor reading on next 60 s poll must not trigger a redundant refresh. */
+    atomic_fetch_add(&uptime, 60LL * 1000000LL);
+    advance(0, false);
+    assert(sensor_publications == before_pub + 2);
 
     assert(!erased && !reprovisioned); /* WiFi credentials stay intact during HTTP I/O. */
     pthread_mutex_lock(&gate);

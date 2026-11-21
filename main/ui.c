@@ -32,7 +32,15 @@ static struct {
     char text[6];
     bool visible;
     bool local_time;
+    int utc_offset;
 } clock_display;
+
+static struct {
+    char temp[24];
+    char humidity[16];
+    char pressure[24];
+    bool drawn;
+} sensor_display;
 
 static struct {
     voice_feedback_t voice;
@@ -193,29 +201,70 @@ static bool format_number(char *buf, size_t size, float value, int decimals)
     return n >= 0 && (size_t)n < size;
 }
 
-static void sensor_value(int x, int width, float value, bool valid, int decimals, const char *unit, const char *unknown)
+// Compact footer sensor slots (font_mid, baseline 124), strictly clear of STATUS_LEFT (200).
+#define SENSOR_TEMP_X     8
+#define SENSOR_TEMP_W     56
+#define SENSOR_HUMIDITY_X 68
+#define SENSOR_HUMIDITY_W 52
+#define SENSOR_PRESSURE_X 124
+#define SENSOR_PRESSURE_W 72
+
+static void format_sensor_field(char *out, size_t cap, int max_width, float value, bool valid, int decimals,
+                                const char *unit, const char *unknown)
 {
     char buf[48];
-    int n = valid && isfinite(value) ? snprintf(buf, sizeof(buf), "%.*f %s", decimals, (double)value, unit) : -1;
-    const char *text = n >= 0 && (size_t)n < sizeof(buf) && epd_text_w(&font_mid, buf) <= width ? buf : unknown;
-    epd_text(x, 124, &font_mid, text);
+    int n = valid && isfinite(value) ? snprintf(buf, sizeof(buf), "%.*f%s", decimals, (double)value, unit) : -1;
+    const char *text =
+        n >= 0 && (size_t)n < cap && (size_t)n < sizeof(buf) && epd_text_w(&font_mid, buf) <= max_width ? buf : unknown;
+    size_t len = strnlen(text, cap - 1);
+    memcpy(out, text, len);
+    out[len] = '\0';
+}
+
+static void format_sensor_fields(const sensor_reading_t *sensor, char temp[24], char humidity[16], char pressure[24])
+{
+    bool valid = sensor && sensor->valid;
+    format_sensor_field(temp, 24, SENSOR_TEMP_W, valid ? sensor->temperature_c : NAN, valid, 1, "°C", "--.-°C");
+    bool humidity_valid =
+        valid && isfinite(sensor->humidity_percent) && sensor->humidity_percent >= 0 && sensor->humidity_percent <= 100;
+    format_sensor_field(humidity, 16, SENSOR_HUMIDITY_W, humidity_valid ? sensor->humidity_percent : NAN,
+                        humidity_valid, 1, "%", "--.-%");
+    bool pressure_valid =
+        valid && isfinite(sensor->pressure_hpa) && sensor->pressure_hpa >= 300 && sensor->pressure_hpa <= 1100;
+    format_sensor_field(pressure, 24, SENSOR_PRESSURE_W, pressure_valid ? sensor->pressure_hpa * 0.1f : NAN,
+                        pressure_valid, 1, "kPa", "---.-kPa");
 }
 
 static void draw_sensor(const sensor_reading_t *sensor)
 {
-    bool valid = sensor && sensor->valid;
-    epd_text(8, 124, &font_mid, "温度");
-    sensor_value(46, 58, valid ? sensor->temperature_c : NAN, valid, 1, "°C", "--.- °C");
-    bool humidity_valid =
-        valid && isfinite(sensor->humidity_percent) && sensor->humidity_percent >= 0 && sensor->humidity_percent <= 100;
-    epd_text(110, 124, &font_mid, "湿度");
-    sensor_value(146, 50, humidity_valid ? sensor->humidity_percent : NAN, humidity_valid, 0, "%", "-- %");
+    format_sensor_fields(sensor, sensor_display.temp, sensor_display.humidity, sensor_display.pressure);
+    sensor_display.drawn = true;
+    epd_text(SENSOR_TEMP_X, 124, &font_mid, sensor_display.temp);
+    epd_text(SENSOR_HUMIDITY_X, 124, &font_mid, sensor_display.humidity);
+    epd_text(SENSOR_PRESSURE_X, 124, &font_mid, sensor_display.pressure);
 }
 
 // Status corner: right of the sensor values, so it never collides with them.
 #define STATUS_LEFT  200
 #define STATUS_RIGHT (PANEL_H - 6)
 #define STATUS_MAX_W (STATUS_RIGHT - STATUS_LEFT)
+
+bool ui_update_sensor(const sensor_reading_t *sensor)
+{
+    char temp[24], humidity[16], pressure[24];
+    format_sensor_fields(sensor, temp, humidity, pressure);
+    if (!clock_display.visible) {
+        return false;
+    }
+    if (sensor_display.drawn && strcmp(sensor_display.temp, temp) == 0 && strcmp(sensor_display.humidity, humidity) == 0
+        && strcmp(sensor_display.pressure, pressure) == 0)
+    {
+        return false;
+    }
+    epd_fill_rect(0, 110, STATUS_LEFT, EPD_H - 110, EPD_WHITE);
+    draw_sensor(sensor);
+    return true;
+}
 
 static const char *status_text(ui_status_t status, unsigned attempt, char *buf, size_t size)
 {
@@ -322,12 +371,22 @@ static bool clock_is_known(time_t now)
     return now >= NET_MIN_SYNCED_EPOCH && net_time_is_synced();
 }
 
+static bool local_time_tm(time_t now, struct tm *tm)
+{
+#ifdef ESP_PLATFORM
+    time_t local = now + clock_display.utc_offset;
+    return gmtime_r(&local, tm) != NULL;
+#else
+    return localtime_r(&now, tm) != NULL;
+#endif
+}
+
 static bool render_clock(time_t now)
 {
     char buf[sizeof(clock_display.text)] = "--:--";
     struct tm tm;
     if (clock_display.local_time && clock_is_known(now)) {
-        if (!localtime_r(&now, &tm) || strftime(buf, sizeof(buf), "%H:%M", &tm) == 0) {
+        if (!local_time_tm(now, &tm) || strftime(buf, sizeof(buf), "%H:%M", &tm) == 0) {
             strcpy(buf, "--:--");
         }
     }
@@ -347,7 +406,7 @@ static void update_forecast_date(time_t now)
         forecast_display.stamp_set && forecast_is_stale(forecast_display.stamp, esp_timer_get_time());
     struct tm local;
     char today[11];
-    if (clock_display.local_time && forecast_display.first_date[0] && clock_is_known(now) && localtime_r(&now, &local)
+    if (clock_display.local_time && forecast_display.first_date[0] && clock_is_known(now) && local_time_tm(now, &local)
         && strftime(today, sizeof(today), "%Y-%m-%d", &local) > 0)
     {
         int relation = strcmp(today, forecast_display.first_date);
@@ -385,8 +444,10 @@ static void draw_header(const weather_t *w, const char *label)
     const char *city = w && w->ok ? w->city : "无数据";
     snprintf(weather_header.city, sizeof(weather_header.city), "%.*s", (int)sizeof(weather_header.city) - 1, city);
     snprintf(weather_header.label, sizeof(weather_header.label), "%s", label);
+    bool has_tz = w && (w->ok || w->tz_known);
     clock_display.local_time =
-        w && w->ok && w->utc_offset >= -14 * 3600 && w->utc_offset <= 14 * 3600 && w->utc_offset % 60 == 0;
+        has_tz && w->utc_offset >= -14 * 3600 && w->utc_offset <= 14 * 3600 && w->utc_offset % 60 == 0;
+    clock_display.utc_offset = clock_display.local_time ? w->utc_offset : 0;
     char label_date[6];
     if (w && w->ok && date_label(w->days[0].date, label_date)) {
         memcpy(forecast_display.first_date, w->days[0].date, sizeof(forecast_display.first_date));
@@ -416,7 +477,7 @@ static int select_hourly_start(time_t now)
 {
     struct tm local;
     if (!hourly_display.available || !clock_display.local_time || !clock_is_known(now)
-        || hourly_display.cache[0].date == 0 || !localtime_r(&now, &local))
+        || hourly_display.cache[0].date == 0 || !local_time_tm(now, &local))
     {
         return 0;
     }
@@ -426,7 +487,7 @@ static int select_hourly_start(time_t now)
     // anchors the first row. The device only has the last reported UTC offset.
     if (hourly_display.discontinuous && forecast_display.stamp_set && forecast_display.stamp.fetched_at) {
         struct tm fetched;
-        if (localtime_r(&forecast_display.stamp.fetched_at, &fetched)
+        if (local_time_tm(forecast_display.stamp.fetched_at, &fetched)
             && date_key(&fetched) == hourly_display.cache[0].date && fetched.tm_hour == hourly_display.cache[0].hour)
         {
             double hours =
