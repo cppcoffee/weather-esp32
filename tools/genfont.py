@@ -16,7 +16,7 @@ import re
 
 def screen_chars():
     used = set()
-    for path in ('main/main.c', 'main/ui.c', 'main/weather.c'):
+    for path in ('main/main.c', 'main/ui/ui.c', 'main/weather/weather.c'):
         for lit in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', open(path, encoding='utf-8').read()):
             used.update(ch for ch in lit if ord(ch) > 0x7F)
     return ''.join(sorted(used))
@@ -53,7 +53,7 @@ outputs = {}
 for name, size, weight, cjk in SPECS:
     if args.only and name != f'font_{args.only}':
         continue
-    path = 'main/font_clock.c' if name == 'font_clock' else 'main/fonts_aa.c'
+    path = 'main/ui/font_clock.c' if name == 'font_clock' else 'main/ui/fonts_aa.c'
     decls, tables = outputs.setdefault(path, ([], []))
     latin = load(LATIN_TTF, size, weight)
     han = load(CJK_TTF, size, weight) if cjk else None
@@ -92,7 +92,7 @@ for name, size, weight, cjk in SPECS:
     print(f'{name}: {len(cps)} glyphs, {len(data)} bytes', file=sys.stderr)
 
 for path, (decls, tables) in outputs.items():
-    header = out if path == 'main/fonts_aa.c' else [
+    header = out if path == 'main/ui/fonts_aa.c' else [
         '// Generated from Roboto Variable Bold with PIL; 1bpp glyphs, FreeType mono rasterizer.',
         '#include "fonts_aa.h"', '', '']
     with open(path, 'w', encoding='utf-8') as output:

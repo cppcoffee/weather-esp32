@@ -1,4 +1,5 @@
-#pragma once
+#ifndef __DEVICE_MCP_H__
+#define __DEVICE_MCP_H__
 
 #include "esp_err.h"
 #include "ui.h"
@@ -22,3 +23,5 @@ void device_mcp_publish_display_page(const char *page);
 // Register the device data and audio controls. The engine owns tools after success;
 // the caller must destroy the engine if registration fails partway through.
 esp_err_t device_mcp_register(esp_mcp_t *mcp);
+
+#endif

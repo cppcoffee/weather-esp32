@@ -4,7 +4,41 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>连接 Wi-Fi</title>
-    <style>{{STYLE}}</style>
+    <style>
+:root { color-scheme: light dark; --paper: #fafaf8; --field: #fff; --ink: #191a18; --muted: #555953; --line: #8b9087; --rule: #d9dcd5; }
+@media (prefers-color-scheme: dark) { :root { --paper: #171916; --field: #20231f; --ink: #f1f3ee; --muted: #b4baaf; --line: #767e72; --rule: #3c4139; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: clamp(1.5rem, 6vw, 4rem) 1.25rem 2rem; background: var(--paper); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; -webkit-text-size-adjust: 100%; }
+main { max-width: 25rem; margin: auto; }
+h1 { margin: 0 0 1.25rem; font-size: 2rem; line-height: 1.2; }
+h2 { margin: 0 0 .75rem; font-size: 1rem; }
+p { margin: 0; color: var(--muted); }
+.row, .password { display: flex; align-items: center; gap: .5rem; }
+.row { justify-content: space-between; }
+label, summary, #rescan { font-size: .875rem; }
+label { display: block; }
+summary, #rescan, #eye { color: var(--muted); }
+summary, button { cursor: pointer; }
+#rescan { padding: .5rem 0; border: 0; background: none; font: inherit; text-decoration: underline; text-underline-offset: .2em; }
+details { margin: .25rem 0 .75rem; }
+summary { padding: .5rem 0; }
+section { margin-top: 1.125rem; padding-top: .875rem; border-top: 1px solid var(--rule); }
+input, select { display: block; width: 100%; min-width: 0; min-height: 2.75rem; margin-top: .25rem; padding: .5rem .65rem; border: 1px solid var(--line); border-radius: .375rem; background: var(--field); color: var(--ink); font: inherit; }
+input::placeholder { color: var(--muted); }
+.password { align-items: end; }
+#eye { flex: none; min-width: 2.75rem; min-height: 2.75rem; padding: 0; border: 0; background: none; }
+#eye svg { display: block; width: 1.25rem; height: 1.25rem; margin: auto; }
+#eye .eye-off, #eye.revealed .eye-open { display: none; }
+#eye.revealed .eye-off { display: block; }
+.hint, footer { font-size: .8125rem; color: var(--muted); }
+.hint { margin-top: .375rem; }
+code { overflow-wrap: anywhere; }
+.save { width: 100%; min-height: 2.875rem; margin-top: .625rem; border: 1px solid var(--ink); border-radius: .375rem; background: var(--ink); color: var(--paper); font: inherit; font-weight: 650; }
+.save:hover { opacity: .87; }
+.save:active { opacity: .74; }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+footer { margin-top: 1.25rem; }
+    </style>
 </head>
 <body>
     <main>
@@ -12,9 +46,11 @@
         <form method="post" action="/save">
             <div class="row">
                 <label for="ssid">网络</label>
-                <a id="rescan" href="/">重新扫描</a>
+                <button id="rescan" type="button">重新扫描</button>
             </div>
-            <select id="ssid" name="ssid">{{OPTIONS}}</select>
+            <select id="ssid" name="ssid">
+                <option value="" selected disabled>正在扫描附近网络…</option>
+            </select>
             <details>
                 <summary>手动输入网络名称</summary>
                 <input type="text" name="ssid2" aria-label="网络名称" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Wi-Fi 名称">
@@ -35,13 +71,56 @@
             <section aria-labelledby="voice-title">
                 <h2 id="voice-title">语音设置</h2>
                 <label for="voice-url">服务信息地址（OTA）</label>
-                <input type="url" name="voice_url" id="voice-url" required maxlength="255" value="{{VOICE_URL}}" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-url-help">
+                <input type="url" name="voice_url" id="voice-url" required maxlength="255" autocapitalize="none" autocorrect="off" spellcheck="false" aria-describedby="voice-url-help">
                 <p class="hint" id="voice-url-help">填写服务电脑的局域网地址，例如 <code>http://192.168.1.2:8000/xiaozhi/ota/</code></p>
             </section>
             <button class="save" type="submit">保存并连接</button>
         </form>
-        <footer>{{AP_SSID}} · {{AP_URL}}</footer>
+        <footer id="ap-footer"></footer>
     </main>
-    <script>{{SCRIPT}}</script>
+    <script>
+var ssidEl = document.getElementById('ssid');
+var rescanBtn = document.getElementById('rescan');
+var voiceUrlEl = document.getElementById('voice-url');
+var footerEl = document.getElementById('ap-footer');
+var password = document.getElementById('pw');
+var eye = document.getElementById('eye');
+
+eye.hidden = false;
+eye.onclick = function () {
+    var reveal = password.type === 'password';
+    password.type = reveal ? 'text' : 'password';
+    eye.classList.toggle('revealed', reveal);
+    eye.setAttribute('aria-label', reveal ? '隐藏密码' : '显示密码');
+};
+
+function loadState(keepUrl) {
+    rescanBtn.disabled = true;
+    rescanBtn.textContent = '扫描中…';
+    fetch('/api/state', {cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (d) {
+        ssidEl.length = 0;
+        var aps = d.aps || [];
+        if (!aps.length) {
+            var empty = new Option('附近没扫到网络，试试重新扫描', '', true, true);
+            empty.disabled = true;
+            ssidEl.add(empty);
+        } else {
+            aps.forEach(function (name, idx) { ssidEl.add(new Option(name, name, idx === 0, idx === 0)); });
+        }
+        if (!keepUrl && !voiceUrlEl.value && d.voice_url) voiceUrlEl.value = d.voice_url;
+        if (d.ap_ssid && d.ap_url) footerEl.textContent = d.ap_ssid + ' · ' + d.ap_url;
+    }).catch(function () {
+        ssidEl.length = 0;
+        var err = new Option('扫描失败，可手动输入网络名称', '', true, true);
+        err.disabled = true;
+        ssidEl.add(err);
+    }).finally(function () {
+        rescanBtn.disabled = false;
+        rescanBtn.textContent = '重新扫描';
+    });
+}
+rescanBtn.onclick = function () { loadState(true); };
+loadState(false);
+    </script>
 </body>
 </html>

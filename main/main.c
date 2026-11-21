@@ -1,5 +1,6 @@
 #include "audio.h"
 #include "button.h"
+#include "button_gpio.h"
 #include "device_mcp.h"
 #include "epd.h"
 #include "esp_err.h"
@@ -10,7 +11,10 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "iot_button.h"
 #include "net.h"
+#include "net_portal.h"
+#include "net_time.h"
 #include "sensor.h"
 #include "ui.h"
 #include "voice.h"
@@ -68,21 +72,33 @@ static void notify_clock_task(void)
     }
 }
 
-static void button_task(void *arg)
+enum app_button {
+    APP_BUTTON_TAP,
+    APP_BUTTON_HOLD,
+};
+
+static void enqueue_button(enum app_button event)
 {
-    (void)arg;
-    TickType_t last_sample = xTaskGetTickCount();
-    for (;;) {
-        xTaskDelayUntil(&last_sample, pdMS_TO_TICKS(BUTTON_POLL_MS));
-        button_event_t event = button_poll(BUTTON_POLL_MS);
-        if (event == BUTTON_HOLD) {
-            // Reset takes precedence over page changes that have not been drawn yet.
-            xQueueReset(button_event_queue);
-        }
-        if (event != BUTTON_NONE) {
-            xQueueSend(button_event_queue, &event, 0);
-        }
+    if (event == APP_BUTTON_HOLD) {
+        // Reset takes precedence over page changes that have not been drawn yet.
+        xQueueReset(button_event_queue);
     }
+    xQueueSend(button_event_queue, &event, 0);
+    notify_clock_task();
+}
+
+static void on_button_tap(void *handle, void *user_data)
+{
+    (void)handle;
+    (void)user_data;
+    enqueue_button(APP_BUTTON_TAP);
+}
+
+static void on_button_hold(void *handle, void *user_data)
+{
+    (void)handle;
+    (void)user_data;
+    enqueue_button(APP_BUTTON_HOLD);
 }
 
 // Stepped retry interval: 5, 10, 20, 40, 60, 60, ... seconds.
@@ -188,9 +204,9 @@ static void clock_task(void *arg)
         bool voice_changed = ui_update_voice(&feedback);
         bool clock_changed = ui_update_clock();
         bool switched = false;
-        button_event_t event;
+        enum app_button event;
         if (app->network_busy && !app->deferred_hold && xQueueReceive(button_event_queue, &event, 0) == pdTRUE) {
-            if (event == BUTTON_HOLD) {
+            if (event == APP_BUTTON_HOLD) {
                 app->deferred_hold = true;
             } else {
                 switch_page(app);
@@ -214,17 +230,10 @@ static void show_portal(void)
 }
 
 // Returns true when a long hold clears the stored credentials and opens the portal.
-static bool button_service(struct app_state *app)
+static bool handle_button_event(struct app_state *app, enum app_button event)
 {
-    button_event_t event;
-    if (app->deferred_hold) {
-        app->deferred_hold = false;
-        event = BUTTON_HOLD;
-    } else if (xQueueReceive(button_event_queue, &event, 0) != pdTRUE) {
-        return false;
-    }
     switch (event) {
-    case BUTTON_HOLD:
+    case APP_BUTTON_HOLD:
         ESP_LOGW(log_tag, "button held: erasing stored credentials");
         voice_net_pause();
         xSemaphoreTake(display_lock, portMAX_DELAY);
@@ -242,7 +251,7 @@ static bool button_service(struct app_state *app)
         xQueueReset(button_event_queue);
         return true;
 
-    case BUTTON_TAP:
+    case APP_BUTTON_TAP:
         xSemaphoreTake(display_lock, portMAX_DELAY);
         switch_page(app);
         xSemaphoreGive(display_lock);
@@ -253,20 +262,36 @@ static bool button_service(struct app_state *app)
     }
 }
 
-// Sleeps ms in slices so a hold is serviced while waiting for the network. Returns true on
-// credential reset.
+static bool button_service(struct app_state *app)
+{
+    enum app_button event;
+    if (app->deferred_hold) {
+        app->deferred_hold = false;
+        event = APP_BUTTON_HOLD;
+    } else if (xQueueReceive(button_event_queue, &event, 0) != pdTRUE) {
+        return false;
+    }
+    return handle_button_event(app, event);
+}
+
+// Blocks on the button queue until ms elapses or a hold resets stored credentials.
 static bool wait_serviced(unsigned ms, struct app_state *app)
 {
-    unsigned remaining = ms;
-    while (remaining) {
-        unsigned slice = remaining < BUTTON_POLL_MS ? remaining : BUTTON_POLL_MS;
-        vTaskDelay(pdMS_TO_TICKS(slice));
-        remaining -= slice;
-        if (button_service(app)) {
+    if (app->deferred_hold && button_service(app)) {
+        return true;
+    }
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(ms);
+    for (;;) {
+        TickType_t now = xTaskGetTickCount();
+        TickType_t remaining = (int32_t)(deadline - now) > 0 ? (deadline - now) : 0;
+        enum app_button event;
+        if (xQueueReceive(button_event_queue, &event, remaining) != pdTRUE) {
+            return false;
+        }
+        if (handle_button_event(app, event)) {
             return true;
         }
     }
-    return false;
 }
 
 static void run_connect_phase(struct app_state *app)
@@ -336,7 +361,7 @@ static void start_voice(void)
 static void run_weather_phase(struct app_state *app)
 {
     if (!voice_weather_begin()) {
-        if (wait_serviced(BUTTON_POLL_MS, app)) {
+        if (wait_serviced(50, app)) {
             app->connect_attempt = 0;
             app->phase = APP_PHASE_CONNECT;
         }
@@ -421,7 +446,7 @@ void app_main(void)
              (unsigned)esp_get_free_heap_size());
     display_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(display_lock != NULL ? ESP_OK : ESP_ERR_NO_MEM);
-    button_event_queue = xQueueCreate(8, sizeof(button_event_t));
+    button_event_queue = xQueueCreate(8, sizeof(enum app_button));
     ESP_ERROR_CHECK(button_event_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
     epd_init();
     net_init();
@@ -437,8 +462,18 @@ void app_main(void)
     if (audio_err != ESP_OK) {
         ESP_LOGW(log_tag, "audio unavailable: %s", esp_err_to_name(audio_err));
     }
-    button_init();
-    ESP_ERROR_CHECK(xTaskCreate(button_task, "button", 2048, NULL, 2, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    const button_config_t btn_cfg = {
+        .long_press_time = BUTTON_LONG_PRESS_MS,
+        .short_press_time = 50,
+    };
+    const button_gpio_config_t gpio_cfg = {
+        .gpio_num = BUTTON_GPIO,
+        .active_level = 0,
+    };
+    button_handle_t button = NULL;
+    ESP_ERROR_CHECK(iot_button_new_gpio_device(&btn_cfg, &gpio_cfg, &button));
+    ESP_ERROR_CHECK(iot_button_register_cb(button, BUTTON_SINGLE_CLICK, NULL, on_button_tap, NULL));
+    ESP_ERROR_CHECK(iot_button_register_cb(button, BUTTON_LONG_PRESS_START, NULL, on_button_hold, NULL));
     // Local wake detection runs in its own task so microphone reads never stall weather.
     if (voice_init() != ESP_OK) {
         ESP_LOGW(log_tag, "voice unavailable");

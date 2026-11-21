@@ -12,7 +12,7 @@ ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气与 AI 语音面板（ESP
 |---|---|
 | 墨水屏（SSD1680） | `SCK=38` `SDA(MOSI)=39` `RST=40` `DC=41` `CS1=42` `BUSY=21` `VCC=3V3` |
 | 音频（ES8311 + NS415B） | `PA_EN=15` `DOUT=16` `WS=17` `DIN=18` `BCLK=9` `MCLK=10` `SCL=11` `SDA=12` |
-| 传感器（AHT20+BMP280，可选） | `SDA=5` `SCL=6` `VCC=3V3`（兼容 BME280/680、AHT20/SHT3x/SHT4x + BMP280/388/390） |
+| 传感器（AHT20+BMP280，可选） | `SDA=5` `SCL=6` `VCC=3V3`（固定地址 `AHT20=0x38`、`BMP280=0x77`，改地址见 `main/sensor.h`） |
 | 按键 | `GPIO4` 接微动开关到 `GND`（内部上拉） |
 
 - 避开预留引脚：`GPIO33–37`（Octal PSRAM）、`GPIO19/20`（USB-JTAG）、`GPIO43/44`（外接 UART 日志）。

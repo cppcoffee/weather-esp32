@@ -9,6 +9,20 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.4.1
+  espressif/button:
+    component_hash: 26345e8700d3c6435925f9a8f246d224f9c1b99f937c243fe400844eec514b4a
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=4.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 4.2.3
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -142,8 +156,47 @@ dependencies:
     source:
       type: idf
     version: 6.0.2
+  k0i05/esp_ahtxx:
+    component_hash: 34ecd4cc05b54a8ee64a813f80cf2b8efea6f22ecdbf7244640fc29627416fed
+    dependencies:
+    - name: idf
+      require: private
+      version: '>5.3.0'
+    - name: k0i05/esp_type_utils
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.0.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.7
+  k0i05/esp_bmp280:
+    component_hash: 8dd4be3510d908209f42498683c3ba6719e25ffeebdd4710b33ad94055e63a0a
+    dependencies:
+    - name: idf
+      require: private
+      version: '>5.3.0'
+    - name: k0i05/esp_type_utils
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.0.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.7
+  k0i05/esp_type_utils:
+    component_hash: 95d8ec40268e045f7e264d8035f451e53844b4a2f6d5f112ece6645c5effd639
+    dependencies:
+    - name: idf
+      require: private
+      version: '>5.3.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.2.7
 direct_dependencies:
 - esphome/micro-opus
+- espressif/button
 - espressif/cjson
 - espressif/cmake_utilities
 - espressif/esp-sr
@@ -153,6 +206,8 @@ direct_dependencies:
 - espressif/mcp-c-sdk
 - espressif/mqtt
 - idf
-manifest_hash: 67f959b8e605c60059bb131f33a2099c9d2917862ffe1f4fa452c240c23441ab
+- k0i05/esp_ahtxx
+- k0i05/esp_bmp280
+manifest_hash: e14c7616c4390dc1b3d7d70b3c3cf18d3b461c826be8739cb91486b96ef0e060
 target: esp32s3
 version: 3.0.0

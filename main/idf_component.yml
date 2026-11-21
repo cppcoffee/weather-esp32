@@ -6,3 +6,6 @@ dependencies:
   espressif/esp_xiaozhi:
     override_path: ../components/esp_xiaozhi
   esphome/micro-opus: ^0.4.1
+  k0i05/esp_ahtxx: ^1.2.7
+  k0i05/esp_bmp280: ^1.2.7
+  espressif/button: ^4.2.3

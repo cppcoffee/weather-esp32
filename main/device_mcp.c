@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "net.h"
+#include "net_time.h"
 
 #define PRESSURE_HISTORY_CAP        24
 #define PRESSURE_SAMPLE_INTERVAL_US (10LL * 60 * 1000000)
