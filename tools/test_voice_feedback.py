@@ -57,6 +57,8 @@ static void isolated(const unsigned char *before, bool title) {
             assert((x >= 200 && y >= 110) || (title && x < 230 && y < 22));
     }
 }
+static unsigned observer_calls;
+static void count_observer(void) { observer_calls++; }
 static bool apply(voice_state_t state, const char *code) {
     assert(voice_feedback_publish(state, code));
     voice_feedback_t feedback = voice_feedback_get();
@@ -64,9 +66,14 @@ static bool apply(voice_state_t state, const char *code) {
 }
 int main(void) {
     assert(voice_feedback_get().state == VOICE_STATE_DISABLED);
+    voice_feedback_set_observer(count_observer);
     assert(voice_feedback_publish(VOICE_STATE_READY, NULL));
+    assert(observer_calls == 1);
+    assert(voice_feedback_publish(VOICE_STATE_READY, NULL));
+    assert(observer_calls == 1); /* Duplicate publish does not spuriously wake display. */
     char source[] = "123456";
     assert(voice_feedback_publish(VOICE_STATE_ACTIVATION, source));
+    assert(observer_calls == 2);
     memset(source, 'x', 6);
     voice_feedback_t copy = voice_feedback_get();
     assert(!strcmp(copy.activation_code, "123456"));
@@ -74,6 +81,8 @@ int main(void) {
     assert(!strcmp(voice_feedback_get().activation_code, "123456"));
     assert(voice_feedback_publish(VOICE_STATE_CONNECTING, NULL));
     assert(voice_feedback_publish(VOICE_STATE_ERROR, NULL));
+    assert(voice_feedback_publish(VOICE_STATE_OFFLINE, NULL));
+    assert(observer_calls == 2); /* Ignored outage/retry preserves activation without waking. */
     assert(voice_feedback_get().state == VOICE_STATE_ACTIVATION);
     const char *invalid[] = {NULL, "", "12345678901234567", "12 34", "12\n34", "中文"};
     for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
@@ -84,7 +93,9 @@ int main(void) {
     assert(!voice_feedback_publish((voice_state_t)100, NULL));
     assert(!voice_feedback_publish(VOICE_STATE_READY, "123456"));
     assert(voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL));
+    assert(observer_calls == 3);
     assert(!voice_feedback_get().activation_code[0]);
+    voice_feedback_set_observer(NULL);
     for (int state = VOICE_STATE_DISABLED; state <= VOICE_STATE_ERROR; state++) {
         assert(voice_feedback_publish((voice_state_t)state, state == VOICE_STATE_ACTIVATION ? "123456" : NULL));
     }
@@ -101,14 +112,25 @@ int main(void) {
     weather_t weather = sample_weather(0); sensor_reading_t sensor = {0};
     epd_init(); ui_draw_weather(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
     unsigned char before[FRAME_BYTES], expected[FRAME_BYTES];
-    const voice_state_t states[] = {VOICE_STATE_CONNECTING, VOICE_STATE_NEED_SETUP, VOICE_STATE_READY,
-        VOICE_STATE_LISTENING, VOICE_STATE_WAITING, VOICE_STATE_SPEAKING, VOICE_STATE_ERROR,
-        VOICE_STATE_DISABLED, VOICE_STATE_WAIT_NETWORK};
+    const voice_state_t states[] = {VOICE_STATE_READY, VOICE_STATE_CONNECTING, VOICE_STATE_NEED_SETUP,
+        VOICE_STATE_LISTENING, VOICE_STATE_FOLLOWUP, VOICE_STATE_WAITING, VOICE_STATE_SPEAKING,
+        VOICE_STATE_OFFLINE, VOICE_STATE_ERROR, VOICE_STATE_DISABLED, VOICE_STATE_WAIT_NETWORK};
     for (unsigned i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
         memcpy(before, frame, sizeof(before));
         assert(apply(states[i], NULL)); epd_refresh(); isolated(before, false);
         assert(!apply(states[i], NULL));
     }
+    /* Ready voice yields to active connecting/fetching/syncing/retry weather states, then resumes. */
+    assert(apply(VOICE_STATE_READY, NULL)); epd_refresh();
+    const ui_status_t priority[] = {UI_STATUS_CONNECTING, UI_STATUS_FETCHING, UI_STATUS_SYNCING, UI_STATUS_RETRY};
+    for (unsigned i = 0; i < sizeof(priority) / sizeof(priority[0]); i++) {
+        memcpy(before, frame, sizeof(before));
+        assert(ui_update_status(priority[i], i + 1)); epd_refresh(); isolated(before, false);
+        assert(!ui_update_status(priority[i], i + 1));
+    }
+    memcpy(before, frame, sizeof(before));
+    assert(ui_update_status(UI_STATUS_UPDATED, 0)); epd_refresh(); isolated(before, false);
+    assert(apply(VOICE_STATE_WAIT_NETWORK, NULL)); epd_refresh();
     memcpy(before, frame, sizeof(before));
     assert(apply(VOICE_STATE_ACTIVATION, "123456")); epd_refresh(); isolated(before, true);
     assert(!apply(VOICE_STATE_ACTIVATION, "123456"));
@@ -169,8 +191,9 @@ def main():
             raise RuntimeError(result.stderr + result.stdout[-1500:])
         labels = {line.split(":", 9)[-1] for line in result.stdout.splitlines()
                   if line.startswith("text:") and line.split(":", 9)[2] == "124"}
-        assert {"语音连接", "设置语音", "待唤醒", "正在聆听", "等待回答", "正在说话", "语音失败",
-                "语音不可用", "等待激活"} <= labels, labels
+        assert {"语音连接", "设置语音", "待唤醒", "正在聆听", "等待追问", "等待回答", "正在说话",
+                "无网络", "语音失败", "语音不可用", "等待激活", "正在联网", "正在取数", "同步时间",
+                "重试 #4"} <= labels, labels
         print(result.stdout.splitlines()[-1])
 
 

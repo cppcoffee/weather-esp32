@@ -14,12 +14,12 @@
 #define EPD_H      128
 #define EPD_ROT_CW 1 // 1: content rotated 90 deg clockwise; 0: counter-clockwise
 
-#define EPD_SCK  9
-#define EPD_MOSI 10
-#define EPD_RST  11
-#define EPD_DC   12
-#define EPD_CS   13
-#define EPD_BUSY 14
+#define EPD_SCK  38
+#define EPD_MOSI 39
+#define EPD_RST  40
+#define EPD_DC   41
+#define EPD_CS   42
+#define EPD_BUSY 21
 
 #define EPD_WHITE 1
 #define EPD_BLACK 0
@@ -33,6 +33,8 @@ void epd_fill_rect(int x, int y, int w, int h, int color);
 void epd_text(int x, int y_baseline, const aafont *f, const char *s); // y = baseline
 int epd_text_w(const aafont *f, const char *s);
 void epd_refresh(void);
+// Partial waveform now, without advancing or triggering the periodic full-refresh cadence.
+void epd_refresh_partial(void);
 // Page-switch refresh: switches 1..7 use the partial waveform; switch 8 uses a full refresh
 // (also consuming any due maintenance refresh) and restarts the switch count.
 void epd_refresh_page_switch(void);

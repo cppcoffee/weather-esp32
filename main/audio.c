@@ -11,6 +11,7 @@ _Static_assert(!PSRAM_PIN_IN_USE(AUDIO_PA_EN_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2
                "Audio wiring overlaps GPIO33-37 reserved for octal PSRAM");
 #endif
 
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "es8311_codec.h"
@@ -19,12 +20,13 @@ _Static_assert(!PSRAM_PIN_IN_USE(AUDIO_PA_EN_GPIO) && !PSRAM_PIN_IN_USE(AUDIO_I2
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "nvs.h"
 
 #define AUDIO_I2C_PORT            I2C_NUM_0
 #define AUDIO_I2S_PORT            I2S_NUM_0
 #define AUDIO_I2C_SPEED_HZ        400000
-#define AUDIO_DEFAULT_VOLUME      60
+#define AUDIO_DEFAULT_VOLUME      80
 #define AUDIO_DEFAULT_MIC_GAIN_DB 18.0f
 
 static const char *log_tag = "audio";
@@ -41,9 +43,10 @@ struct audio_device {
     SemaphoreHandle_t control_lock;
     int volume;
     bool ready;
+    bool muted;
 };
 
-static struct audio_device audio_device = {.volume = AUDIO_DEFAULT_VOLUME};
+static struct audio_device audio_device = {.volume = AUDIO_DEFAULT_VOLUME, .muted = true};
 
 static esp_err_t check_codec_result(int result, const char *operation)
 {
@@ -56,6 +59,12 @@ static esp_err_t check_codec_result(int result, const char *operation)
 
 static void cleanup_failed_init(void)
 {
+    // A failed esp_codec_dev_open() can leave the amplifier enabled, so drive PA_EN low
+    // here instead of relying on the codec teardown to do it.
+    gpio_config_t pa = {.pin_bit_mask = 1ULL << AUDIO_PA_EN_GPIO, .mode = GPIO_MODE_OUTPUT};
+    if (gpio_config(&pa) == ESP_OK) {
+        gpio_set_level(AUDIO_PA_EN_GPIO, 0);
+    }
     if (audio_device.control_lock) {
         vSemaphoreDelete(audio_device.control_lock);
     }
@@ -85,7 +94,7 @@ static void cleanup_failed_init(void)
     if (audio_device.i2c_bus) {
         i2c_del_master_bus(audio_device.i2c_bus);
     }
-    audio_device = (struct audio_device){.volume = AUDIO_DEFAULT_VOLUME};
+    audio_device = (struct audio_device){.volume = AUDIO_DEFAULT_VOLUME, .muted = true};
 }
 
 static esp_err_t init_i2s(void)
@@ -252,8 +261,7 @@ static esp_err_t init_codec(void)
         return err;
     }
     // esp_codec_dev_open() enables the codec and drives the PA enable pin high. Muting only
-    // gates the DAC, so drop the PA enable as well: an indicator LED on that net would
-    // otherwise stay lit while the device is idle.
+    // gates the DAC, so drop the PA enable as well and keep the amplifier off while idle.
     err = check_codec_result(esp_codec_dev_set_out_mute(audio_device.codec, true), "mute speaker");
     if (err != ESP_OK) {
         return err;
@@ -292,6 +300,7 @@ esp_err_t audio_init(void)
         return ESP_ERR_NO_MEM;
     }
     audio_device.ready = true;
+    audio_device.muted = true;
     ESP_LOGI(log_tag, "ES8311 audio ready: %d Hz, %d-bit stereo, PA GPIO %d", AUDIO_SAMPLE_RATE_HZ,
              AUDIO_BITS_PER_SAMPLE, AUDIO_PA_EN_GPIO);
     return ESP_OK;
@@ -332,13 +341,29 @@ esp_err_t audio_set_mute(bool muted)
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(audio_device.control_lock, portMAX_DELAY);
-    // The codec mute only gates the DAC. Drive the PA enable too so the amplifier (and any
-    // LED sharing that net) is off whenever nothing is playing.
-    esp_err_t err = check_codec_result(esp_codec_dev_set_out_mute(audio_device.codec, muted),
-                                       muted ? "mute speaker" : "unmute speaker");
+    if (audio_device.muted == muted) {
+        xSemaphoreGive(audio_device.control_lock);
+        return ESP_OK;
+    }
+    // The codec mute only gates the DAC. Drive the PA enable too so the amplifier is off
+    // whenever nothing is playing. Enable PA before unmuting so the first syllable is not clipped.
+    esp_err_t err = ESP_OK;
+    if (!muted) {
+        err = check_codec_result(audio_device.gpio_if->set(AUDIO_PA_EN_GPIO, true), "enable speaker amp");
+        if (err == ESP_OK) {
+            err = check_codec_result(esp_codec_dev_set_out_mute(audio_device.codec, false), "unmute speaker");
+        }
+        if (err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    } else {
+        err = check_codec_result(esp_codec_dev_set_out_mute(audio_device.codec, true), "mute speaker");
+        if (err == ESP_OK) {
+            err = check_codec_result(audio_device.gpio_if->set(AUDIO_PA_EN_GPIO, false), "disable speaker amp");
+        }
+    }
     if (err == ESP_OK) {
-        err = check_codec_result(audio_device.gpio_if->set(AUDIO_PA_EN_GPIO, !muted),
-                                 muted ? "disable speaker amp" : "enable speaker amp");
+        audio_device.muted = muted;
     }
     xSemaphoreGive(audio_device.control_lock);
     return err;

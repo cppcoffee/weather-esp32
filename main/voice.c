@@ -19,6 +19,7 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "model_path.h"
+#include "net.h"
 #include "nvs.h"
 #include "opus.h"
 #include "voice_audio.h"
@@ -65,6 +66,10 @@ static struct {
     struct voice_packet packet;
 } voice_buffers;
 
+// Only websocket_task's on_audio callback writes rx_ingress_packet, keeping the 1.4 KB
+// copy off websocket_task's stack.
+static struct voice_packet rx_ingress_packet;
+
 static bool network_ready(void)
 {
     return VOICE_NETWORK_READY(xEventGroupGetBits(voice_events));
@@ -74,20 +79,21 @@ static void on_audio(const uint8_t *data, int len, void *ctx)
 {
     (void)ctx;
     EventBits_t bits = xEventGroupGetBits(voice_events);
-    if (!VOICE_NETWORK_READY(bits) || (bits & VOICE_END_BITS) || !(bits & VOICE_BIT_RECEIVING)) {
+    if (!VOICE_NETWORK_READY(bits) || (bits & (VOICE_END_BITS | VOICE_BIT_ABORT_DRAIN))
+        || !(bits & VOICE_BIT_RECEIVING))
+    {
         return;
     }
     // The component owns data only until this callback returns. Never decode or
-    // block on I2S here; queue a copy and fail the turn rather than growing memory.
-    struct voice_packet packet;
-    if (data == NULL || len <= 0 || len > (int)sizeof(packet.data)) {
+    // block on I2S here; queue a copy and drop on burst instead of tearing down the session.
+    if (data == NULL || len <= 0 || len > (int)sizeof(rx_ingress_packet.data)) {
         xEventGroupSetBits(voice_events, VOICE_BIT_ERROR);
         return;
     }
-    packet.len = len;
-    memcpy(packet.data, data, (size_t)len);
-    if (xQueueSend(rx_audio_queue, &packet, 0) != pdTRUE) {
-        xEventGroupSetBits(voice_events, VOICE_BIT_ERROR);
+    rx_ingress_packet.len = len;
+    memcpy(rx_ingress_packet.data, data, (size_t)len);
+    if (xQueueSend(rx_audio_queue, &rx_ingress_packet, 0) != pdTRUE) {
+        ESP_LOGW(log_tag, "rx audio queue full (%d frames), dropping packet", VOICE_RX_QUEUE_LEN);
     }
 }
 
@@ -102,8 +108,10 @@ static void on_event(esp_xiaozhi_chat_event_t event, void *data, void *ctx)
         }
         // Sticky until the next turn: a fast start/stop must still end recording.
         if (state->state == ESP_XIAOZHI_CHAT_TTS_STATE_START) {
+            xEventGroupClearBits(voice_events, VOICE_BIT_ABORT_DRAIN);
             xEventGroupSetBits(voice_events, VOICE_BIT_TTS_STARTED);
         } else if (state->state == ESP_XIAOZHI_CHAT_TTS_STATE_STOP) {
+            xEventGroupClearBits(voice_events, VOICE_BIT_ABORT_DRAIN);
             // An abort may deliver the previous reply's stop after the new round opened.
             if (xEventGroupGetBits(voice_events) & VOICE_BIT_TTS_STARTED) {
                 xEventGroupSetBits(voice_events, VOICE_BIT_TTS_STOPPED);
@@ -235,7 +243,8 @@ static esp_err_t open_session(void)
     esp_xiaozhi_chat_free_info(&info);
     if (err != ESP_OK || !config.has_websocket_config) {
         voice_feedback_publish(VOICE_STATE_ERROR, NULL);
-        ESP_LOGW(log_tag, "server config unavailable: %s; retry after network recovery", esp_err_to_name(err));
+        ESP_LOGW(log_tag, "server config unavailable from %s: %s; retry after network recovery", settings.info_url,
+                 esp_err_to_name(err));
         return err == ESP_OK ? ESP_ERR_INVALID_STATE : err;
     }
 
@@ -282,7 +291,7 @@ static esp_err_t open_session(void)
         goto failed;
     }
     if (opus_encoder_ctl(session.encoder, OPUS_SET_BITRATE(24000)) != OPUS_OK
-        || opus_encoder_ctl(session.encoder, OPUS_SET_COMPLEXITY(3)) != OPUS_OK)
+        || opus_encoder_ctl(session.encoder, OPUS_SET_COMPLEXITY(0)) != OPUS_OK)
     {
         err = ESP_FAIL;
         goto failed;
@@ -323,7 +332,8 @@ static esp_err_t stream_microphone(void)
         }
         bool ending = (bits & VOICE_BIT_LOCAL_EOS) != 0;
         filled += xStreamBufferReceive(microphone_stream, (uint8_t *)voice_buffers.mono + filled,
-                                       sizeof(voice_buffers.mono) - filled, ending ? 0 : pdMS_TO_TICKS(VOICE_POLL_MS));
+                                       sizeof(voice_buffers.mono) - filled,
+                                       ending ? 0 : pdMS_TO_TICKS(VOICE_CAPTURE_POLL_MS));
         if (filled < sizeof(voice_buffers.mono)) {
             if (!ending) {
                 continue;
@@ -427,7 +437,7 @@ static bool wait_followup(void)
     xEventGroupClearBits(voice_events, VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS);
     xEventGroupSetBits(voice_events, VOICE_BIT_FOLLOWUP);
     xEventGroupClearBits(voice_events, VOICE_BIT_RECEIVING);
-    voice_feedback_publish(VOICE_STATE_LISTENING, NULL);
+    voice_feedback_publish(VOICE_STATE_FOLLOWUP, NULL);
     xSemaphoreGive(network_lock);
 
     EventBits_t bits = xEventGroupWaitBits(voice_events, VOICE_BIT_SPEECH | VOICE_END_BITS, pdFALSE, pdFALSE,
@@ -464,10 +474,14 @@ static esp_err_t run_turn(void)
     bool interrupted = false;
     esp_err_t err = ESP_OK;
 
+    net_set_wifi_low_latency(true);
     while (turn_can_continue()) {
-        voice_feedback_publish(VOICE_STATE_CONNECTING, NULL);
+        if (!channel_open) {
+            voice_feedback_publish(VOICE_STATE_CONNECTING, NULL);
+        }
         xQueueReset(rx_audio_queue);
-        xEventGroupClearBits(voice_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_INTERRUPT);
+        xEventGroupClearBits(voice_events, VOICE_BIT_TTS_STARTED | VOICE_BIT_TTS_STOPPED | VOICE_BIT_INTERRUPT
+                                               | VOICE_BIT_ABORT_DRAIN);
         opus_encoder_ctl(session.encoder, OPUS_RESET_STATE);
         opus_decoder_ctl(session.decoder, OPUS_RESET_STATE);
         if (!channel_open) {
@@ -483,12 +497,14 @@ static esp_err_t run_turn(void)
             }
         } else if (interrupted) {
             audio_set_mute(true);
+            xEventGroupSetBits(voice_events, VOICE_BIT_ABORT_DRAIN);
             err = esp_xiaozhi_chat_send_abort_speaking(session.chat,
                                                        ESP_XIAOZHI_CHAT_ABORT_SPEAKING_REASON_WAKE_WORD_DETECTED);
             if (err != ESP_OK) {
                 break;
             }
-            // Accept downstream audio again only after the server was told to stop talking.
+            xQueueReset(rx_audio_queue);
+            // Accept downstream audio again once the abort drain finishes on stop/start.
             xEventGroupSetBits(voice_events, VOICE_BIT_RECEIVING);
             ESP_LOGI(log_tag, "reply aborted, listening again");
         }
@@ -527,9 +543,10 @@ static esp_err_t run_turn(void)
             break;
         }
     }
-    EventBits_t bits = xEventGroupClearBits(voice_events, VOICE_BIT_RECEIVING | VOICE_BIT_ARMED | VOICE_BIT_INTERRUPT
-                                                              | VOICE_BIT_CAPTURE | VOICE_BIT_FOLLOWUP
-                                                              | VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS);
+    net_set_wifi_low_latency(false);
+    EventBits_t bits = xEventGroupClearBits(
+        voice_events, VOICE_BIT_RECEIVING | VOICE_BIT_ARMED | VOICE_BIT_INTERRUPT | VOICE_BIT_CAPTURE
+                          | VOICE_BIT_FOLLOWUP | VOICE_BIT_SPEECH | VOICE_BIT_LOCAL_EOS | VOICE_BIT_ABORT_DRAIN);
     audio_set_mute(true);
     if (channel_open && VOICE_NETWORK_READY(bits) && !(bits & (VOICE_BIT_WS_LOST | VOICE_BIT_HANGUP))) {
         esp_xiaozhi_chat_close_audio_channel(session.chat);
@@ -572,7 +589,7 @@ static void voice_task(void *arg)
                                                    | VOICE_BIT_INTERRUPT | VOICE_BIT_HANGUP | VOICE_BIT_FOLLOWUP
                                                    | VOICE_BIT_SPEECH | VOICE_TURN_BITS);
             // An ordinary outage preserves a pending activation code; provisioning clears it.
-            voice_feedback_publish((bits & VOICE_BIT_ENABLED) ? VOICE_STATE_ERROR : VOICE_STATE_WAIT_NETWORK, NULL);
+            voice_feedback_publish((bits & VOICE_BIT_ENABLED) ? VOICE_STATE_OFFLINE : VOICE_STATE_WAIT_NETWORK, NULL);
             xSemaphoreGive(network_lock);
             continue;
         }
@@ -610,7 +627,9 @@ static void voice_task(void *arg)
             if (err == ESP_OK && network_ready()) {
                 xEventGroupClearBits(voice_events, VOICE_TURN_BITS);
                 xEventGroupSetBits(voice_events, VOICE_BIT_ARMED);
-                voice_feedback_publish(VOICE_STATE_READY, NULL);
+                if (!(xEventGroupGetBits(voice_events) & VOICE_BIT_TRIGGER)) {
+                    voice_feedback_publish(VOICE_STATE_READY, NULL);
+                }
             }
         }
         xSemaphoreGive(network_lock);
@@ -630,6 +649,7 @@ static void voice_task(void *arg)
         if (network_ready() && session.chat != 0) {
             xEventGroupClearBits(voice_events, VOICE_BIT_TRIGGER);
             err = run_turn();
+            ESP_LOGI(log_tag, "voice stack minimum free: %u bytes", (unsigned)uxTaskGetStackHighWaterMark(NULL));
             xEventGroupClearBits(voice_events, VOICE_BIT_CAPTURE);
             if (network_ready() && !(xEventGroupGetBits(voice_events) & VOICE_BIT_HANGUP)) {
                 if (err != ESP_OK) {
@@ -697,7 +717,8 @@ esp_err_t voice_init(void)
                                                    on_chat_lifecycle, NULL));
     }
     network_lock = xSemaphoreCreateMutex();
-    rx_audio_queue = xQueueCreate(VOICE_RX_QUEUE_LEN, sizeof(struct voice_packet));
+    rx_audio_queue =
+        xQueueCreateWithCaps(VOICE_RX_QUEUE_LEN, sizeof(struct voice_packet), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     microphone_stream =
         xStreamBufferCreateWithCaps(WAKE_BUFFER_BYTES, sizeof(voice_buffers.mono), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (voice_events && network_lock && rx_audio_queue && microphone_stream) {
@@ -705,7 +726,10 @@ esp_err_t voice_init(void)
                                   wake_model.wakenet, wake_model.data, wake_model.samples);
         if (err == ESP_OK) {
             voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL);
-            if (xTaskCreate(voice_task, "voice", VOICE_TASK_STACK, NULL, VOICE_TASK_PRIO, NULL) == pdPASS) {
+            if (xTaskCreatePinnedToCore(voice_task, "voice", VOICE_TASK_STACK, NULL, VOICE_TASK_PRIO, NULL,
+                                        VOICE_AUDIO_CORE)
+                == pdPASS)
+            {
                 return ESP_OK;
             }
             err = ESP_ERR_NO_MEM;
@@ -723,7 +747,7 @@ failed:
         microphone_stream = NULL;
     }
     if (rx_audio_queue != NULL) {
-        vQueueDelete(rx_audio_queue);
+        vQueueDeleteWithCaps(rx_audio_queue);
         rx_audio_queue = NULL;
     }
     if (network_lock != NULL) {

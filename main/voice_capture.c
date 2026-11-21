@@ -40,6 +40,7 @@ struct voice_capture_state {
     int16_t (*vad_history)[FOLLOWUP_SAMPLES];
     size_t vad_fill, vad_next, vad_count;
     size_t endpoint_fill;
+    unsigned endpoint_holdoff_frames;
     bool endpoint_heard_speech;
     bool in_followup;
 };
@@ -74,6 +75,8 @@ static esp_err_t init_afe(srmodel_list_t *models)
     config->fixed_output_channel = true;
     config->output_playback_channel = false;
     config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    config->afe_perferred_core = VOICE_AUDIO_CORE;
+    config->afe_perferred_priority = AFE_TASK_PRIO;
     // The AFE keeps its configuration for its lifetime; this component never frees it.
     config = afe_config_check(config);
     if (config == NULL) {
@@ -114,7 +117,8 @@ static esp_err_t init_afe(srmodel_list_t *models)
 // mutes the speaker, drops the aborted reply and restarts listening.
 static void on_wake_word(void)
 {
-    capture_state.wakenet->clean(capture_state.wake_model);
+    // ESP-SR 2.4.7's WakeNet9 clean() can dereference a null queue. Keep the model
+    // alive across turns and discard only the application's pending microphone data.
     xEventGroupClearBits(capture_state.events, VOICE_BIT_ARMED);
     capture_state.wake_fill = 0;
     xStreamBufferReset(capture_state.microphone);
@@ -122,6 +126,8 @@ static void on_wake_word(void)
         vad_reset_trigger(capture_state.vad);
     }
     capture_state.endpoint_fill = 0;
+    // The wake word's tail can trigger VAD before the question starts.
+    capture_state.endpoint_holdoff_frames = VOICE_WAKE_MIN_CAPTURE_MS / FOLLOWUP_FRAME_MS;
     capture_state.endpoint_heard_speech = false;
     xEventGroupClearBits(capture_state.events, VOICE_BIT_LOCAL_EOS);
     if (xEventGroupGetBits(capture_state.events) & VOICE_BIT_RECEIVING) {
@@ -179,6 +185,7 @@ static void detect_followup(const int16_t *mono, size_t samples)
         buffer_microphone(mono, samples);
         // Continue the same VAD state from speech onset through the question.
         capture_state.endpoint_fill = 0;
+        capture_state.endpoint_holdoff_frames = 0;
         capture_state.endpoint_heard_speech = true;
         xEventGroupClearBits(capture_state.events, VOICE_BIT_LOCAL_EOS);
         xEventGroupSetBits(capture_state.events, VOICE_BIT_SPEECH);
@@ -199,9 +206,12 @@ static void detect_endpoint(const int16_t *mono, size_t samples)
         samples -= take;
         if (capture_state.endpoint_fill == FOLLOWUP_SAMPLES) {
             capture_state.endpoint_fill = 0;
+            if (capture_state.endpoint_holdoff_frames > 0) {
+                capture_state.endpoint_holdoff_frames--;
+            }
             if (vad_process_with_trigger(capture_state.vad, capture_buffers.endpoint_frame) == VAD_SPEECH) {
                 capture_state.endpoint_heard_speech = true;
-            } else if (capture_state.endpoint_heard_speech) {
+            } else if (capture_state.endpoint_heard_speech && capture_state.endpoint_holdoff_frames == 0) {
                 // The last microphone chunk is already in the buffer.
                 xEventGroupSetBits(capture_state.events, VOICE_BIT_LOCAL_EOS);
                 xEventGroupClearBits(capture_state.events, VOICE_BIT_CAPTURE);
@@ -317,7 +327,6 @@ static void capture_task(void *arg)
         esp_err_t err = audio_read(capture_buffers.stereo, stereo_bytes, &read);
         EventBits_t bits = xEventGroupGetBits(capture_state.events);
         if (!VOICE_NETWORK_READY(bits)) {
-            capture_state.wakenet->clean(capture_state.wake_model);
             capture_state.wake_fill = 0;
             continue;
         }
@@ -325,7 +334,6 @@ static void capture_task(void *arg)
             if (bits & VOICE_BIT_CAPTURE) {
                 xEventGroupSetBits(capture_state.events, VOICE_BIT_ERROR);
             }
-            capture_state.wakenet->clean(capture_state.wake_model);
             capture_state.wake_fill = 0;
             vTaskDelay(pdMS_TO_TICKS(VOICE_POLL_MS));
             continue;
@@ -360,11 +368,16 @@ esp_err_t voice_capture_start(EventGroupHandle_t events, StreamBufferHandle_t mi
         ESP_LOGW(log_tag, "AEC unavailable (%s); wake word disabled during playback", esp_err_to_name(err));
     }
     // The capture task owns this detector after startup; its absence leaves the hard timer intact.
-    capture_state.vad = vad_create_with_param(VAD_MODE_2, VOICE_SAMPLE_RATE, FOLLOWUP_FRAME_MS, 60, 660);
+    // start 60 ms / end 300 ms: end is how long silence must last before the utterance is
+    // closed, so it is most of the delay between the last word and "listen stop".
+    capture_state.vad = vad_create_with_param(VAD_MODE_2, VOICE_SAMPLE_RATE, FOLLOWUP_FRAME_MS, 60, 300);
     if (capture_state.vad == NULL) {
         ESP_LOGW(log_tag, "VAD unavailable; using the recording timeout and server endpoint");
     }
-    if (xTaskCreate(capture_task, "wake", WAKE_TASK_STACK, NULL, VOICE_TASK_PRIO, &capture_state.task) != pdPASS) {
+    if (xTaskCreatePinnedToCore(capture_task, "wake", WAKE_TASK_STACK, NULL, WAKE_TASK_PRIO, &capture_state.task,
+                                VOICE_AUDIO_CORE)
+        != pdPASS)
+    {
         voice_capture_stop();
         return ESP_ERR_NO_MEM;
     }

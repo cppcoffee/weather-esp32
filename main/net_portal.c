@@ -36,7 +36,12 @@ void net_portal(void)
                         }};
     snprintf((char *)ap.ap.ssid, sizeof(ap.ap.ssid), "%s", name);
     ap.ap.ssid_len = strlen(name);
-    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    // Re-provisioning re-enters this function in the same boot; WIFI_AP_DEF may only be
+    // created once, and esp_netif_new() asserts on a duplicate key.
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif == NULL) {
+        ap_netif = esp_netif_create_default_wifi_ap();
+    }
     // Static AP address: 192.168.1.1/24 with the DHCP server handing out 192.168.1.x.
     esp_netif_ip_info_t ip = {0};
     IP4_ADDR(&ip.ip, 192, 168, 1, 1);

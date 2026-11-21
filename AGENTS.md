@@ -49,7 +49,7 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 | `main/voice_capture.c` / `.h` | 采集任务：I²S 读、AEC 前端、WakeNet、端点检测；只操作事件组 + 两个流缓冲 |
 | `main/voice_internal.h` | 两语音任务共享的采样格式、缓冲尺寸、事件位契约 |
 | `main/voice_settings.c` / `.h` | OTA 地址的 NVS 存取、URL 校验 |
-| `main/voice_audio.c` / `.h` | 纯函数：立体声↔单声道（无 SDK 依赖，主机可测） |
+| `main/voice_audio.c` / `.h` | 纯函数：立体声↔单声道、上传前限幅增益（无 SDK 依赖，主机可测） |
 | `main/device_mcp.c` / `.h` | 发布屏幕同源快照，注册时间/天气/传感器/音量工具 |
 | `main/fonts_aa.c`、`main/font_clock.c`、`main/font_icons.c` | 生成的 1bpp 字模，勿手改 |
 | `tools/genfont.py`、`tools/genicons.swift` | 字模生成器（字体文件不进仓库） |
@@ -104,19 +104,19 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 
 - 协议层用 `espressif/esp_xiaozhi`（依赖 `esp_websocket_client`、`mcp-c-sdk`）；**不要重写 WebSocket/MQTT/hello/认证/MCP**。本地修改范围见 `components/esp_xiaozhi/LOCAL_PATCH.md`。
 - 顺序：`chat_init`（回调）→ `get_info`（POST 板卡信息，拿激活码，MQTT/WS 配置写 NVS）→ `chat_start` → `open_audio_channel`（自动发 hello）→ `send_audio_data` → `stop`/`deinit`。事件回调只报协议事实，状态机/UI/命令由应用决定。
-- 音频契约：hello = `opus`/16000 Hz/1 ch/60 ms。`audio.c` 是 16 kHz/16 bit/**双声道**（左声道为麦克风），语音任务必须转单声道并 60 ms 分帧，不要把双声道直接当单声道发。接线真值在 `main/audio.h` 顶部 `#define`（EN=2、DOUT=47、WS=48、DIN=38、BCLK=39、MCLK=40、SCL=41、SDA=42）；改线只改那里。
-- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，`MCLK_MULTIPLE_384`，默认音量 60（0..100，NVS 恢复），麦克风增益 18 dB。`audio_init()` 后 DAC 静音且 PA_EN 拉低（可能同接板载 LED）；播放前 `audio_set_mute(false)`。`esp_codec_dev` 音量是 dB 线性映射（0=−50 dB），自检别用 30。
+- 音频契约：hello = `opus`/16000 Hz/1 ch/60 ms。`audio.c` 是 16 kHz/16 bit/**双声道**（左声道为麦克风），语音任务必须转单声道并 60 ms 分帧，不要把双声道直接当单声道发。接线真值在 `main/audio.h` 顶部 `#define`（EN=15、DOUT=16、WS=17、DIN=18、BCLK=9、MCLK=10、SCL=11、SDA=12）；改线只改那里。
+- 音频参数：`I2S_NUM_0` 全双工 + `I2C_NUM_0` 400 kHz，`MCLK_MULTIPLE_384`，默认音量 80（0..100，NVS 恢复），麦克风增益 18 dB。`audio_init()` 后 DAC 静音且 PA_EN 拉低（板载 WS2812 在 GPIO48，与 PA_EN 无关）；播放前 `audio_set_mute(false)`。`esp_codec_dev` 音量是 dB 线性映射（0=−50 dB），自检别用 30。
 - `voice_init()` 载模型建任务；联网后取配置建会话；返回激活码时复制到反馈快照（1–16 个无空格可打印 ASCII）并上屏/串口，等待绑定后重试，不打开未激活会话。challenge 激活未实现。
 - 唤醒：WakeNet（`esp-sr` 2.4.7 `wn9_xiaoluxiaolu_tts2`）只在本地；命中后才开麦上传。模型必须在 `model` 分区；无 PSRAM 时跳过语音。
 - 建连：`open_session()` 在 `chat_start` 后等 `ESP_XIAOZHI_CHAT_EVENT_CONNECTED`（≤ `VOICE_CONNECT_TIMEOUT_MS`），超时按失败重试——`chat ready` 表示套接字已通。断网/STA 停止后停止接收并清会话；快速恢复 IP 也要先清旧会话；普通断线保留激活码，重配网清除。
 - 追问（VAD 可用时自动启用）：播放结束静音后开 6 s 本地 VAD 窗口；确认开口带 ≤120 ms 前滚，复用同一通道 `listen start/stop`；窗口内取数最多等 4 s（网络锁）。沉默退回待唤醒。
-- 端点：本地 VAD 约 660 ms 静默结束录音，录音上限 15 s，随后发 `listen stop`；服务端收尾另行保留。
+- 端点：唤醒后的录音至少保留 600 ms，避免唤醒词尾音提前触发静默收尾。保护窗口过后，本地 VAD 约 300 ms 静默结束录音；追问无首句保护窗口。上行**不做逐帧增益归一**（会放大静音、让服务端能量 VAD 判不出停顿，且逐帧泵动）；音量只靠 codec 的麦克风增益。录音上限 15 s，随后发 `listen stop`；服务端收尾另行保留。
 - 播放：正常结束等 I²S DMA 尾帧（`AUDIO_PLAYBACK_TAIL_MS`）再静音；打断/断线/出错立即停。
 - AEC 打断：`voice_capture.c` 用 ESP-SR AFE（`afe_config_init("MR", ...)`，1 麦克风 + 1 播放参考），参考信号是 `play_response()` 实际写入 I²S 的 PCM（`playback_ref_stream`，按写入顺序，不加延迟）。WakeNet 在 AFE 之外，检测 AEC 输出；播放期间保持 `ARMED`，命中后置 `VOICE_BIT_INTERRUPT`，由 `run_turn()` 静音、丢音频、发 `abort`(wake_word_detected)、同通道重新 `listen start`。AFE 失败则回退为播放期不检测。
 - 两任务只通过 `voice_internal.h` 的事件位 + 两个流缓冲通信；新增位同步更新该头与主机 harness。
 - 预算（两端要一起改）：设备首音频 90 s、播放断流 30 s；Rust 正常首音频 65 s、含失败提示 75 s、整回合 180 s（不含 ASR）。
 - WS stop 失败：保留 chat/MCP/Opus，释放网络锁后由语音任务重试清理，禁止开新会话；成功后 `deinit` 消费句柄。
-- 屏上反馈：`voice_feedback.c/.h` 临界区发布/读取快照；连接重试/错误保留待激活码，其他状态清空。显示任务每秒合并更新：顶部激活码、右下角状态，保留天气正文/温湿度/时钟；配网页优先。新增中文文案必须重跑 `tools/genfont.py`。
+- 屏上反馈：`voice_feedback.c/.h` 临界区发布/读取快照，状态变更通过观察者即时唤醒显示任务；连接重试/断网/错误保留待激活码，其他状态清空。显示任务合并更新：顶部激活码、右下角状态（纯局刷），保留天气正文/温湿度/时钟；配网页优先。新增中文文案必须重跑 `tools/genfont.py`。
 - 隐私：接上后麦克风音频与识别文本会发到配置的服务端，不是本地处理。
 - MCP：`device_mcp_publish()` 发布 `app->shown` + `sensor_reading_t`；工具 `self.get_current_time`、`self.get_weather_forecast`、`self.get_sensor_reading`（无参数只读）、`self.get_device_status`、`self.audio_speaker.set_volume`（0–100 写 NVS）。不要为一次问答重跑天气；未接入传感器必须 `available=false`；时间仅 SNTP 成功且时区已知时 `synchronized=true`；天气含抓取时间、单调时钟 age、`stale`/`retrying`，未对时抓取时间为 null。
 
@@ -130,11 +130,11 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 ## 屏幕驱动与刷新
 
 - 可见 296×128；面板 RAM `PANEL_W=128`/`PANEL_H=296`；帧缓冲 4736 B。`EPD_W=300` 是逻辑画布，`epd_pixel()` 裁掉 `x≥296`——新内容不能画在裁掉区。
-- 引脚：SCK 9、MOSI 10、RST 11、DC 12、CS 13、BUSY 14；SPI2 4 MHz；旋转只在 `epd_pixel()` 做。
+- 引脚：SCK 38、MOSI 39、RST 40、DC 41、CS 42、BUSY 21；SPI2 4 MHz；旋转只在 `epd_pixel()` 做。
 - `0x01` 门线 `0x27,0x01,0x00`，`0x45` Y 结尾 `0x27,0x01`。**不要改成 300 行 `0x2B`/4800 B**：多 4 行会回绕（右侧像素跑到左侧）。
 - 全刷：复位 → 全配置 → `0x32` 前 153 B + 6 B 电压 → `0x24` 写 4736 B → `0x22 0xC7` → `0x20`。
 - 局刷：复位 → 基础寄存器 → `0x3C 0x80` → `0x32` partial LUT 153 B → `0x37` 10 B → `0x22 0xC0`+`0x20` 预置 → `0x24` 图 → `0x22 0x0F`+`0x20`。不能只把全刷 `0x22` 改成 `0xFF`。
-- `epd_refresh()` 从启动全刷后开始计普通刷新；每 `FULL_REFRESH_EVERY`（=5）次做一次维护全刷，其余局刷。时钟帧/状态帧/重试帧/天气更新都走普通刷新并推进计数；切页单独计数。
+- `epd_refresh()` 从启动全刷后开始计普通刷新；每 `FULL_REFRESH_EVERY`（=5）次做一次维护全刷，其余局刷。时钟帧/重试帧/天气更新走普通刷新并推进计数；`epd_refresh_partial()` 仅做局刷、不推进计数，用于右下角状态单独更新；切页单独计数。
 - 切页规则：第 1–7 次只局刷；第 8 次全刷并清零（若普通维护全刷同时到期，合并为一次）。`epd_refresh_full()` 强制全刷但不推进普通计数，只用于启动占位、首次进配网、长按重置；它也清零切页计数。
 - BUSY 高电平为忙；初始化等 2 s、刷新等 15 s，超时只记日志。
 - 局部刷新仍传整帧，不是只传矩形。
@@ -148,8 +148,8 @@ python3 tools/preview_ui.py                # 布局预览 PNG（演示数据，�
 - 日页日期：今天→`font_mid`，其他→`font_small` `MM/DD`，无数据 `--/--`。温度单行 `最低°-最高°`，上限 48 px：`font_temp`→`font_small`→`--`（`12°-25°` 在 16px 是 53 px，装不进 52 px 列）。
 - 逐时温度上限 26 px（`font_temp`→`font_small`→`--`）；概率超宽去 `%`（`100%`→`100`），未知 `--%`。
 - 底栏基线 124：温度标签 x=8/读数 x=46（≤58 px）；湿度标签 x=110/读数 x=146（≤50 px）；全用 `font_mid`。
-- 状态角落 x≥200、y≥110，右对齐到 290，≤90 px：`正在联网`/`正在取数`/`已更新`/`重试 #n`（另有 `UI_STATUS_NONE`）。有空间时用 `font_small` 显示上次抓取 `HH:MM`（与 MCP 同源）。`set_status(..., true)` 的帧缓冲改动只能落在该角落。
-- 时钟：`font_clock` 12px Bold，基线 16，右对齐 292；未对时 `--:--`，无天气时区加 `UTC` 前缀。分钟更新只改 x=230..295、y=0..21；跨午夜或缓存过期可同时改日期标签/`预报待更新` 标题。重试文案限 x<230。配网页隐藏时钟，返回后恢复。
+- 状态角落 x≥200、y≥110，右对齐到 290，≤90 px：网络/天气（`正在联网`/`正在取数`/`同步时间`/`已更新`/`重试 #n`，另有 `UI_STATUS_NONE`）与语音（`语音连接`/`等待激活`/`待唤醒`/`正在聆听`/`等待追问`/`等待回答`/`正在说话`/`无网络`/`设置语音`/`语音失败`/`语音不可用`）。语音活动态优先，其次正在联网/取数/重试，语音就绪在同步时间完成后显示 `待唤醒`。`set_status(..., true)` 的帧缓冲改动只能落在该角落，且只走局刷。
+- 时钟：`font_clock` 12px Bold，基线 16，右对齐 292；对时且有天气时区时显示当地 `HH:MM`，否则显示 `--:--`。分钟更新只改 x=230..295、y=0..21；跨午夜或缓存过期可同时改日期标签/`预报待更新` 标题。重试文案限 x<230。配网页隐藏时钟，返回后恢复。
 - 字模：1bpp，16/14/12 px（+ `font_clock` 12 px Bold）；**中文只在 `font_mid`**；`°` 在所有字号。图标来自 `font_icons.c`，未知 WMO 码画 `?`，不要在 `ui.c` 手绘图标。
 - 日页顶部建议只看 `days[0]`：无数据/概率非法 → `预报待更新`；雷雨/冰雹 → `雷雨注意安全`；其余四舍五入后概率 ≥51% → `今日带伞`；已知天气低概率 → `降水概率低`；未知码低概率 → `预报待更新`。百分比显示与阈值用同一舍入。
 

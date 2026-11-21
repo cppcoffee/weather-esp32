@@ -684,7 +684,7 @@ int main(void) {
     memcpy(saved, frame, sizeof(saved));
     render(NULL, NULL);
     assert(!memcmp(saved, frame, sizeof(frame)));
-    retry_preserves_body(saved, 1, "UTC 08:30");
+    retry_preserves_body(saved, 1, "--:--");
     emit("initial-failure");
     empty = w;
     empty.ok = false;

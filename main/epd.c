@@ -66,9 +66,10 @@ static void cmd1(uint8_t c, uint8_t d)
 }
 
 // SSD1680: BUSY high while busy, low when idle.
+// Use at least 10 ms (1 tick at CONFIG_FREERTOS_HZ=100) so polling sleeps instead of spinning.
 static void wait_idle(const char *what, uint32_t timeout_ms)
 {
-    vTaskDelay(pdMS_TO_TICKS(2)); // BUSY needs a moment to assert
+    vTaskDelay(pdMS_TO_TICKS(10)); // BUSY needs a moment to assert
     if (gpio_get_level(EPD_BUSY) == 0) {
         return;
     }
@@ -78,7 +79,7 @@ static void wait_idle(const char *what, uint32_t timeout_ms)
             ESP_LOGE(log_tag, "%s: BUSY stuck high after %u ms", what, timeout_ms);
             return;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     ESP_LOGI(log_tag, "%s: busy %lld ms", what, (esp_timer_get_time() - t0) / 1000);
 }
@@ -88,7 +89,7 @@ static void panel_reset(void)
     gpio_set_level(EPD_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(EPD_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level(EPD_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
     wait_idle("reset", 2000);
@@ -341,6 +342,11 @@ void epd_refresh(void)
         refresh_partial();
         refresh_state.ordinary_count++;
     }
+}
+
+void epd_refresh_partial(void)
+{
+    refresh_partial();
 }
 
 void epd_refresh_page_switch(void)

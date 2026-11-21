@@ -80,8 +80,10 @@ struct voice_packet {
 #define OPUS_OK 0
 #define OPUS_APPLICATION_VOIP 1
 #define OPUS_SET_BITRATE(x) (x)
-#define OPUS_SET_COMPLEXITY(x) (x)
+#define OPUS_SET_COMPLEXITY(x) (100 + (x))
 #define OPUS_RESET_STATE 2
+
+static void net_set_wifi_low_latency(bool enable) { (void)enable; }
 
 static const char *wake_word = "wake";
 static EventBits_t event_bits;
@@ -109,6 +111,7 @@ static struct {
     uint8_t tx_opus[VOICE_TX_OPUS_MAX];
     struct voice_packet packet;
 } voice_buffers;
+static struct voice_packet rx_ingress_packet;
 static TickType_t ticks;
 
 enum turn_case { EARLY, BEFORE_TTS, BURST, OVERFLOW, SLOW_FIRST, NO_FIRST, STALL, DROP_LISTEN, DROP_PLAY, BARGE,
@@ -134,6 +137,7 @@ static struct {
     int16_t (*vad_history)[FOLLOWUP_SAMPLES];
     size_t vad_fill, vad_next, vad_count;
     size_t endpoint_fill;
+    unsigned endpoint_holdoff_frames;
     bool endpoint_heard_speech;
 } capture_state = {.events = &event_bits, .microphone = &mic};
 static struct {
@@ -297,7 +301,7 @@ static size_t xStreamBufferReceive(int *buffer, void *data, size_t len, TickType
         assert(wait == 0 && (event_bits & VOICE_BIT_LOCAL_EOS));
         return 0;
     }
-    assert(buffer == microphone_stream && wait == VOICE_POLL_MS && listens && !injected);
+    assert(buffer == microphone_stream && wait == VOICE_CAPTURE_POLL_MS && listens && !injected);
     injected = true;
     ticks += wait;
     if (turn_case == LOCAL_ENDPOINT) {
@@ -501,8 +505,12 @@ static void test_turn(enum turn_case scenario) {
     assert(count == 0);
     queue[count++] = (struct voice_packet){.len = 1, .data = {2}}; /* Stale data must be cleared. */
     esp_err_t result = run_turn();
-    if (scenario == OVERFLOW || scenario == DROP_LISTEN || scenario == DROP_PLAY) {
+    if (scenario == DROP_LISTEN || scenario == DROP_PLAY) {
         assert(result == ESP_FAIL && !writes);
+    } else if (scenario == OVERFLOW) {
+        /* Overflow drops excess packets gracefully instead of tearing down the session. */
+        assert(result == ESP_OK && writes == VOICE_RX_QUEUE_LEN && drains == 1);
+        for (unsigned i = 0; i < VOICE_RX_QUEUE_LEN; i++) assert(played[i] == (int16_t)(7 + i));
     } else if (scenario == NO_FIRST) {
         assert(result == ESP_ERR_TIMEOUT && !writes && ticks >= VOICE_FIRST_AUDIO_TIMEOUT_MS);
     } else if (scenario == STALL) {
@@ -566,7 +574,19 @@ static void test_capture(void) {
     assert(event_bits == VOICE_BIT_CAPTURE && capture_state.endpoint_heard_speech);
     detect_endpoint(frames, FOLLOWUP_SAMPLES);
     assert(event_bits == VOICE_BIT_LOCAL_EOS);
-    puts("PASS local VAD: speech pre-roll in order and endpoint only after speech");
+
+    event_bits = VOICE_BIT_CAPTURE;
+    capture_state.endpoint_heard_speech = false;
+    unsigned wake_frames = VOICE_WAKE_MIN_CAPTURE_MS / FOLLOWUP_FRAME_MS;
+    capture_state.endpoint_holdoff_frames = wake_frames;
+    vad_trigger_frame = vad_frames + 1; /* The wake word's last samples count as speech. */
+    for (unsigned i = 1; i < wake_frames; i++) {
+        detect_endpoint(frames, FOLLOWUP_SAMPLES);
+        assert(event_bits == VOICE_BIT_CAPTURE);
+    }
+    detect_endpoint(frames, FOLLOWUP_SAMPLES);
+    assert(event_bits == VOICE_BIT_LOCAL_EOS);
+    puts("PASS local VAD: ordered pre-roll, speech endpoint and minimum capture after wake");
 }
 
 static void test_weather_priority(void) {

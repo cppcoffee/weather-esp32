@@ -29,6 +29,9 @@ void ui_draw_hourly(const weather_t *weather, const sensor_reading_t *sensor);
 void ui_set_forecast_stamp(const forecast_stamp_t *stamp);
 // Redraw only the footer status corner; attempt is used by UI_STATUS_RETRY.
 void ui_draw_status(ui_status_t status, unsigned attempt);
+// Update the application status snapshot and redraw only the status corner if visible
+// and the displayed text changed. Reset and setup screens take precedence.
+bool ui_update_status(ui_status_t status, unsigned attempt);
 // Update the clock and calendar-dependent forecast labels on a weather page.
 // The caller serializes drawing/refreshes and refreshes the panel only when true.
 bool ui_update_clock(void);

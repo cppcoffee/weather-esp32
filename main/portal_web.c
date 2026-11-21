@@ -357,6 +357,8 @@ esp_err_t portal_web_start(void)
     xEventGroupClearBits(portal_events(), CREDS_SAVED);
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    // Rendering the scanned SSIDs and escaped OTA URL can exhaust HTTPD's default 4 KiB stack.
+    cfg.stack_size = 8 * 1024;
     cfg.uri_match_fn = httpd_uri_match_wildcard; // 默认是精确匹配，"/*" 需要通配匹配器
     esp_err_t err = httpd_start(&portal_server, &cfg);
     if (err != ESP_OK) {

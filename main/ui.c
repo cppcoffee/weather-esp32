@@ -29,7 +29,7 @@
 #define CLOCK_LEFT 230
 
 static struct {
-    char text[10];
+    char text[6];
     bool visible;
     bool local_time;
 } clock_display;
@@ -240,29 +240,42 @@ static const char *selected_status(char *buf, size_t size)
 {
     if (status_display.voice_known) {
         switch (status_display.voice.state) {
-        case VOICE_STATE_DISABLED:
-            return "语音不可用";
         case VOICE_STATE_CONNECTING:
             return "语音连接";
-        case VOICE_STATE_NEED_SETUP:
-            return "设置语音";
         case VOICE_STATE_ACTIVATION:
             return "等待激活";
-        case VOICE_STATE_READY:
-            if (status_display.application != UI_STATUS_CONNECTING && status_display.application != UI_STATUS_FETCHING
-                && status_display.application != UI_STATUS_SYNCING)
-            {
-                return "待唤醒";
-            }
-            break;
         case VOICE_STATE_LISTENING:
             return "正在聆听";
+        case VOICE_STATE_FOLLOWUP:
+            return "等待追问";
         case VOICE_STATE_WAITING:
             return "等待回答";
         case VOICE_STATE_SPEAKING:
             return "正在说话";
+        default:
+            break;
+        }
+    }
+    if (status_display.application == UI_STATUS_CONNECTING || status_display.application == UI_STATUS_FETCHING
+        || status_display.application == UI_STATUS_RETRY)
+    {
+        return status_text(status_display.application, status_display.attempt, buf, size);
+    }
+    if (status_display.voice_known) {
+        switch (status_display.voice.state) {
+        case VOICE_STATE_DISABLED:
+            return "语音不可用";
+        case VOICE_STATE_OFFLINE:
+            return "无网络";
+        case VOICE_STATE_NEED_SETUP:
+            return "设置语音";
         case VOICE_STATE_ERROR:
             return "语音失败";
+        case VOICE_STATE_READY:
+            if (status_display.application != UI_STATUS_SYNCING) {
+                return "待唤醒";
+            }
+            break;
         default:
             break;
         }
@@ -276,16 +289,6 @@ static void draw_status(void)
     const char *text = selected_status(buf, sizeof(buf));
     epd_fill_rect(STATUS_LEFT, 110, PANEL_H - STATUS_LEFT, EPD_H - 110, EPD_WHITE);
     int width = epd_text_w(&font_mid, text);
-    if (forecast_display.stamp_set && clock_display.local_time && forecast_display.stamp.fetched_at != 0) {
-        char updated[6];
-        struct tm local;
-        if (localtime_r(&forecast_display.stamp.fetched_at, &local)
-            && strftime(updated, sizeof(updated), "%H:%M", &local) > 0
-            && epd_text_w(&font_small, updated) + width + 4 <= STATUS_MAX_W)
-        {
-            epd_text(STATUS_LEFT, 124, &font_small, updated);
-        }
-    }
     if (*text && width <= STATUS_MAX_W) {
         epd_text(STATUS_RIGHT - width, 124, &font_mid, text);
     }
@@ -298,6 +301,22 @@ void ui_draw_status(ui_status_t status, unsigned attempt)
     draw_status();
 }
 
+bool ui_update_status(ui_status_t status, unsigned attempt)
+{
+    char old_status[24], buf[24];
+    snprintf(old_status, sizeof(old_status), "%s", selected_status(buf, sizeof(buf)));
+    status_display.application = status;
+    status_display.attempt = attempt;
+    if (!clock_display.visible) {
+        return false;
+    }
+    if (strcmp(old_status, selected_status(buf, sizeof(buf))) == 0) {
+        return false;
+    }
+    draw_status();
+    return true;
+}
+
 static bool clock_is_known(time_t now)
 {
     return now >= NET_MIN_SYNCED_EPOCH && net_time_is_synced();
@@ -307,9 +326,8 @@ static bool render_clock(time_t now)
 {
     char buf[sizeof(clock_display.text)] = "--:--";
     struct tm tm;
-    if (clock_is_known(now)) {
-        struct tm *converted = clock_display.local_time ? localtime_r(&now, &tm) : gmtime_r(&now, &tm);
-        if (!converted || strftime(buf, sizeof(buf), clock_display.local_time ? "%H:%M" : "UTC %H:%M", &tm) == 0) {
+    if (clock_display.local_time && clock_is_known(now)) {
+        if (!localtime_r(&now, &tm) || strftime(buf, sizeof(buf), "%H:%M", &tm) == 0) {
             strcpy(buf, "--:--");
         }
     }

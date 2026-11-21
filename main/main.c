@@ -4,6 +4,7 @@
 #include "epd.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -54,6 +55,15 @@ struct app_state {
 static const char *log_tag = "app";
 static SemaphoreHandle_t display_lock;
 static QueueHandle_t button_event_queue;
+static TaskHandle_t clock_task_handle;
+
+static void notify_clock_task(void)
+{
+    TaskHandle_t handle = clock_task_handle;
+    if (handle != NULL) {
+        xTaskNotifyGive(handle);
+    }
+}
 
 static void button_task(void *arg)
 {
@@ -104,17 +114,17 @@ static void draw_page(const struct app_state *app)
 }
 
 // Show the current action before a blocking step, so the footer says what the device is
-// waiting for instead of looking stuck.
+// waiting for instead of looking stuck. Corner-only updates always use partial refresh.
 static void set_status(struct app_state *app, ui_status_t status, unsigned attempt, bool show_now)
 {
+    xSemaphoreTake(display_lock, portMAX_DELAY);
     app->status = status;
     app->status_attempt = attempt;
     if (show_now) {
-        xSemaphoreTake(display_lock, portMAX_DELAY);
         ui_draw_status(status, attempt);
-        epd_refresh();
-        xSemaphoreGive(display_lock);
+        epd_refresh_partial();
     }
+    xSemaphoreGive(display_lock);
 }
 
 // Page switches have their own refresh count.
@@ -145,11 +155,17 @@ static void clock_task(void *arg)
 {
     struct app_state *app = arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
         voice_feedback_t feedback = voice_feedback_get();
         xSemaphoreTake(display_lock, portMAX_DELAY);
-        bool changed = ui_update_voice(&feedback);
-        changed = ui_update_clock() || changed;
+        bool status_changed = false;
+        if (app->status == UI_STATUS_SYNCING && net_time_is_synced()) {
+            app->status = UI_STATUS_UPDATED;
+            app->status_attempt = 0;
+            status_changed = ui_update_status(app->status, app->status_attempt);
+        }
+        bool voice_changed = ui_update_voice(&feedback);
+        bool clock_changed = ui_update_clock();
         bool switched = false;
         button_event_t event;
         if (app->network_busy && !app->deferred_hold && xQueueReceive(button_event_queue, &event, 0) == pdTRUE) {
@@ -162,8 +178,10 @@ static void clock_task(void *arg)
         }
         if (switched) {
             epd_refresh_page_switch();
-        } else if (changed) {
+        } else if (clock_changed) {
             epd_refresh();
+        } else if (voice_changed || status_changed) {
+            epd_refresh_partial();
         }
         xSemaphoreGive(display_lock);
     }
@@ -192,6 +210,8 @@ static bool button_service(struct app_state *app)
         ESP_LOGW(log_tag, "button held: erasing stored credentials");
         voice_net_pause();
         xSemaphoreTake(display_lock, portMAX_DELAY);
+        app->status = UI_STATUS_CONNECTING;
+        app->status_attempt = 0;
         ui_draw_resetting();
         epd_refresh();
         xSemaphoreGive(display_lock);
@@ -240,6 +260,9 @@ static void run_connect_phase(struct app_state *app)
         }
     }
 
+    if (app->connect_attempt > 0) {
+        set_status(app, UI_STATUS_CONNECTING, 0, true);
+    }
     set_network_busy(app, true);
     bool connected = net_try_stored(CONNECT_TIMEOUT_MS);
     set_network_busy(app, false);
@@ -256,6 +279,7 @@ static void run_connect_phase(struct app_state *app)
 
     if (!net_has_stored()) {
         voice_net_pause();
+        set_status(app, UI_STATUS_CONNECTING, 0, false);
         show_portal();
         net_portal();
         xQueueReset(button_event_queue);
@@ -263,14 +287,28 @@ static void run_connect_phase(struct app_state *app)
         return;
     }
 
-    // Keep the title honest while the AP is unreachable; the body stays as placeholder.
+    // Keep the title and status corner honest while the AP is unreachable; the body stays as placeholder.
     unsigned delay_s = retry_seconds(++app->connect_attempt);
     ESP_LOGW(log_tag, "connect failed, retry #%u in %us", app->connect_attempt, delay_s);
     xSemaphoreTake(display_lock, portMAX_DELAY);
+    app->status = UI_STATUS_RETRY;
+    app->status_attempt = app->connect_attempt;
     ui_draw_retry(app->connect_attempt, delay_s);
+    ui_draw_status(app->status, app->status_attempt);
     epd_refresh();
     xSemaphoreGive(display_lock);
     (void)wait_serviced(delay_s * 1000, app);
+}
+
+// ES8311 sometimes NACKs I2C at boot. Retrying only 150 ms later leaves voice dead for the
+// whole session, so try again once the network is up and keep trying on later updates.
+static void start_voice(void)
+{
+    static bool started;
+    if (started || audio_init() != ESP_OK || voice_init() != ESP_OK) {
+        return;
+    }
+    started = true;
 }
 
 static void run_weather_phase(struct app_state *app)
@@ -303,7 +341,7 @@ static void run_weather_phase(struct app_state *app)
         app->retry_attempt = 0;
         app->retry_delay = 0;
         app->shown = app->w;
-        set_status(app, UI_STATUS_UPDATED, 0, false);
+        set_status(app, net_time_is_synced() ? UI_STATUS_UPDATED : UI_STATUS_SYNCING, 0, false);
     } else {
         app->retrying = true;
         app->retry_delay = retry_seconds(++app->retry_attempt);
@@ -314,6 +352,7 @@ static void run_weather_phase(struct app_state *app)
 
     app->stamp = device_mcp_publish(app->have_weather ? &app->shown : NULL, &app->sensor, app->retrying, updated);
     voice_weather_end();
+    start_voice();
     voice_net_ready();
     present(app);
     if (wait_serviced(wait_s * 1000u, app)) {
@@ -322,9 +361,34 @@ static void run_weather_phase(struct app_state *app)
     }
 }
 
+// A panic or watchdog reset otherwise looks the same as a power cycle on the panel.
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    static const char *const names[] = {
+        [ESP_RST_UNKNOWN] = "unknown",
+        [ESP_RST_POWERON] = "poweron",
+        [ESP_RST_EXT] = "external",
+        [ESP_RST_SW] = "software",
+        [ESP_RST_PANIC] = "panic",
+        [ESP_RST_INT_WDT] = "int_wdt",
+        [ESP_RST_TASK_WDT] = "task_wdt",
+        [ESP_RST_WDT] = "wdt",
+        [ESP_RST_DEEPSLEEP] = "deepsleep",
+        [ESP_RST_BROWNOUT] = "brownout",
+        [ESP_RST_SDIO] = "sdio",
+        [ESP_RST_USB] = "usb",
+        [ESP_RST_JTAG] = "jtag",
+        [ESP_RST_EFUSE] = "efuse",
+        [ESP_RST_PWR_GLITCH] = "pwr_glitch",
+        [ESP_RST_CPU_LOCKUP] = "cpu_lockup",
+    };
+    return (size_t)reason < sizeof(names) / sizeof(names[0]) && names[reason] ? names[reason] : "?";
+}
+
 void app_main(void)
 {
-    ESP_LOGI(log_tag, "boot");
+    ESP_LOGI(log_tag, "boot: reset %s, free heap %u", reset_reason_name(esp_reset_reason()),
+             (unsigned)esp_get_free_heap_size());
     display_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(display_lock != NULL ? ESP_OK : ESP_ERR_NO_MEM);
     button_event_queue = xQueueCreate(8, sizeof(button_event_t));
@@ -332,6 +396,10 @@ void app_main(void)
     epd_init();
     net_init();
     esp_err_t audio_err = audio_init();
+    if (audio_err == ESP_FAIL) {
+        vTaskDelay(pdMS_TO_TICKS(150));
+        audio_err = audio_init();
+    }
     if (audio_err != ESP_OK) {
         ESP_LOGW(log_tag, "audio unavailable: %s", esp_err_to_name(audio_err));
     }
@@ -355,7 +423,10 @@ void app_main(void)
     draw_page(&app);
     epd_refresh_full();
     xSemaphoreGive(display_lock);
-    ESP_ERROR_CHECK(xTaskCreate(clock_task, "clock", 4096, &app, 1, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(clock_task, "clock", 4096, &app, 1, &clock_task_handle) == pdPASS ? ESP_OK
+                                                                                                  : ESP_ERR_NO_MEM);
+    voice_feedback_set_observer(notify_clock_task);
+    notify_clock_task();
 
     for (;;) {
         switch (app.phase) {

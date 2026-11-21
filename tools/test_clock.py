@@ -28,7 +28,9 @@ HARNESS = r'''
 #include "driver/spi_master.h"
 #include "device_mcp.h"
 #include "button.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include "epd.h"
 #include "esp_err.h"
 #include "ui.h"
@@ -48,8 +50,10 @@ static atomic_int pin_level = 1;
 static atomic_bool synced;
 static atomic_llong wall_time = 1735689540LL; /* 2024-12-31 23:59:00 UTC */
 static atomic_llong uptime;
-static unsigned generation, completed, frames;
-static bool allow_forecast_pixels, allow_hourly_pixels, allow_page_switch;
+static unsigned generation, completed, frames, pending_notifies, notify_done;
+static unsigned full_refreshes, partial_refreshes;
+static int dc_level = 1, last_cmd;
+static bool allow_forecast_pixels, allow_hourly_pixels, allow_page_switch, allow_status_pixels;
 static unsigned forecast_pixels;
 static bool ready, blocked, stopping, allow_weather_return, erased, reprovisioned;
 enum { FRAME_BYTES = PANEL_W / 8 * PANEL_H };
@@ -125,34 +129,68 @@ static void sample_button(int level, unsigned n) {
     while (sample_done != sample_target) pthread_cond_wait(&changed, &gate);
     pthread_mutex_unlock(&gate);
 }
-int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle) {
+int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, TaskHandle_t *handle) {
     assert(stack >= 2048);
     if (!strcmp(name, "button")) {
         button_entry = entry;
         assert(!pthread_create(&button_thread, NULL, button_start, arg));
+        if (handle) *handle = (TaskHandle_t)&button_thread;
         return 1;
     }
     assert(!strcmp(name, "clock"));
     clock_entry = entry;
+    if (handle) *handle = (TaskHandle_t)&clock_thread;
     assert(!pthread_create(&clock_thread, NULL, clock_start, arg));
     return 1;
 }
-void vTaskDelay(unsigned ms) {
-    if (!clock_worker || ms < 1000) return; /* Boot/button and panel-settling delays. */
-    assert(ms == 1000 && !display_held);
-    static unsigned seen;
+int xTaskNotifyGive(TaskHandle_t task) {
+    assert(task == (TaskHandle_t)&clock_thread);
     pthread_mutex_lock(&gate);
-    ready = true; completed = seen; pthread_cond_broadcast(&changed);
-    while (seen == generation && !stopping) pthread_cond_wait(&changed, &gate);
+    pending_notifies++;
+    pthread_cond_broadcast(&changed);
+    pthread_mutex_unlock(&gate);
+    return 1;
+}
+unsigned long ulTaskNotifyTake(int clear_on_exit, unsigned timeout) {
+    assert(clock_worker && clear_on_exit == pdTRUE && timeout == 1000 && !display_held);
+    static unsigned seen, seen_notify;
+    pthread_mutex_lock(&gate);
+    ready = true;
+    completed = seen;
+    notify_done = seen_notify;
+    pthread_cond_broadcast(&changed);
+    while (seen == generation && seen_notify == pending_notifies && !stopping) {
+        pthread_cond_wait(&changed, &gate);
+    }
     bool stop = stopping;
+    unsigned long count = pending_notifies - seen_notify;
+    seen_notify = pending_notifies;
     seen = generation;
     pthread_mutex_unlock(&gate);
     if (stop) pthread_exit(NULL);
+    return count;
+}
+void vTaskDelay(unsigned ms) {
+    assert(!clock_worker || ms < 1000); /* Boot/button and panel-settling delays only. */
 }
 int gpio_config(const gpio_config_t *cfg) { return 0; }
-int gpio_set_level(int pin, int level) { return 0; }
+int gpio_set_level(int pin, int level) {
+    if (pin == EPD_DC) dc_level = level;
+    return 0;
+}
 int gpio_get_level(int pin) { return pin == 4 ? atomic_load(&pin_level) : 0; } /* Idle button, idle EPD BUSY. */
 int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *transaction) {
+    if (transaction->length == 8) {
+        const unsigned char *p = transaction->tx_buffer;
+        if (!dc_level) {
+            last_cmd = p[0];
+        } else if (last_cmd == 0x22) {
+            pthread_mutex_lock(&gate);
+            if (p[0] == 0xC7) full_refreshes++;
+            else if (p[0] == 0x0F) partial_refreshes++;
+            pthread_mutex_unlock(&gate);
+        }
+    }
     if (transaction->length == FRAME_BYTES * 8) {
         assert(display_held);
         pthread_mutex_lock(&gate);
@@ -162,9 +200,8 @@ int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *tran
     return 0;
 }
 esp_err_t audio_init(void) { return ESP_OK; }
-esp_err_t voice_init(void) { return ESP_OK; }
-voice_feedback_t voice_feedback_get(void) {
-    return (voice_feedback_t){.state = VOICE_STATE_WAIT_NETWORK};
+esp_err_t voice_init(void) {
+    return voice_feedback_publish(VOICE_STATE_WAIT_NETWORK, NULL) ? ESP_OK : ESP_FAIL;
 }
 void voice_net_ready(void) {}
 void voice_net_pause(void) {}
@@ -210,11 +247,38 @@ static void advance(long seconds, bool expect_refresh) {
         int px = 127 - y, index = x * 16 + (px >> 3), mask = 0x80 >> (px & 7);
         if ((before[index] ^ frame[index]) & mask) {
             bool clock_pixel = x >= 230 && y < 22;
+            bool status_pixel = x >= 200 && y >= 110;
             bool forecast_pixel = (x >= 110 && x < 230 && y < 22)
                                   || (x >= 18 && x < 70 && y > 22 && y < 46);
-            assert(clock_pixel || (allow_forecast_pixels && forecast_pixel) || (allow_hourly_pixels && y > 22 && y < 108)
-                   || allow_page_switch);
+            assert(clock_pixel || (allow_status_pixels && status_pixel)
+                   || (allow_forecast_pixels && forecast_pixel)
+                   || (allow_hourly_pixels && y > 22 && y < 108) || allow_page_switch);
             forecast_pixels += !clock_pixel;
+            pixels++;
+        }
+    }
+    assert((pixels != 0) == expect_refresh);
+    pthread_mutex_unlock(&gate);
+}
+
+static void publish_status(voice_state_t state, const char *code, bool expect_refresh) {
+    unsigned char before[FRAME_BYTES];
+    pthread_mutex_lock(&gate);
+    memcpy(before, frame, sizeof(before));
+    unsigned previous_frames = frames, previous_full = full_refreshes, previous_partial = partial_refreshes;
+    unsigned target = pending_notifies + 1;
+    pthread_mutex_unlock(&gate);
+    assert(voice_feedback_publish(state, code));
+    pthread_mutex_lock(&gate);
+    while (notify_done < target) pthread_cond_wait(&changed, &gate);
+    assert(frames == previous_frames + (expect_refresh ? 1 : 0));
+    assert(full_refreshes == previous_full); /* Voice status updates must never trigger a full flash. */
+    assert(partial_refreshes == previous_partial + (expect_refresh ? 1 : 0));
+    unsigned pixels = 0;
+    for (int x = 0; x < 296; x++) for (int y = 0; y < 128; y++) {
+        int px = 127 - y, index = x * 16 + (px >> 3), mask = 0x80 >> (px & 7);
+        if ((before[index] ^ frame[index]) & mask) {
+            assert(x >= 200 && y >= 110);
             pixels++;
         }
     }
@@ -234,7 +298,7 @@ int main(void) {
     setenv("TZ", "UTC0", 1); tzset();
     assert(!pthread_create(&app_thread, NULL, app_start, NULL));
     pthread_mutex_lock(&gate);
-    while (!ready || !blocked) pthread_cond_wait(&changed, &gate);
+    while (!ready || !blocked || notify_done != pending_notifies) pthread_cond_wait(&changed, &gate);
     pthread_mutex_unlock(&gate);
     sample_button(0, 8); sample_button(1, 3);
     assert(queued_count == 1 && queued[0] == BUTTON_TAP);
@@ -249,12 +313,22 @@ int main(void) {
     assert(queued_count == 1 && queued[0] == BUTTON_HOLD); /* Continues while HTTP blocks. */
     advance(59, false); /* No refresh while the clock is unsynchronized. */
     atomic_store(&synced, true);
-    advance(0, true);  /* UTC becomes visible while the HTTP request is still blocked. */
-    advance(1, true); /* Midnight: 23:59 -> 00:00, with no weather response. */
+    advance(0, false); /* SNTP alone cannot tell us the local time zone. */
+    weather_t weather = {.ok = true, .utc_offset = 8 * 3600};
+    sensor_reading_t sensor = {0};
     unsigned char updated[FRAME_BYTES];
     xSemaphoreTake(&display, 0);
+    setenv("TZ", "XXX-8", 1); tzset();
+    ui_draw_hourly(&weather, &sensor); ui_draw_status(UI_STATUS_FETCHING, 0); epd_refresh();
     memcpy(updated, frame, sizeof(updated));
-    weather_t weather = {0}; sensor_reading_t sensor = {0};
+    epd_fill_rect(230, 0, PANEL_H - 230, 22, EPD_WHITE);
+    epd_text(292 - epd_text_w(&font_clock, "07:59"), 16, &font_clock, "07:59");
+    epd_refresh();
+    assert(!memcmp(updated, frame, sizeof(frame))); /* 23:59 UTC is 07:59 local. */
+    xSemaphoreGive(&display);
+    advance(1, true); /* Local time rolls to 08:00 while HTTP is blocked. */
+    xSemaphoreTake(&display, 0);
+    memcpy(updated, frame, sizeof(updated));
     ui_draw_hourly(&weather, &sensor); ui_draw_status(UI_STATUS_FETCHING, 0); epd_refresh();
     assert(!memcmp(updated, frame, sizeof(frame))); /* Old digits were completely erased. */
     xSemaphoreGive(&display);
@@ -283,8 +357,9 @@ int main(void) {
 
     /* With a real calendar date on screen, midnight changes only annotations. */
     xSemaphoreTake(&display, 0);
+    setenv("TZ", "UTC0", 1); tzset();
+    weather.utc_offset = 0;
     atomic_store(&wall_time, 1735689540LL);
-    weather.ok = true;
     strcpy(weather.city, "Test");
     strcpy(weather.days[0].date, "2024-12-31");
     ui_draw_weather(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
@@ -292,12 +367,8 @@ int main(void) {
     forecast_stamp_t stamp = {.fetched_at = time(NULL)};
     ui_set_forecast_stamp(&stamp);
     ui_draw_weather(&weather, &sensor); ui_draw_status(UI_STATUS_UPDATED, 0); epd_refresh();
-    /* A known fetch adds the update timestamp to the footer and nowhere else. */
-    assert(memcmp(updated, frame, sizeof(updated)) != 0);
-    for (int x = 0; x < 296; x++) for (int y = 0; y < 128; y++) {
-        int px = 127 - y, index = x * 16 + (px >> 3), mask = 0x80 >> (px & 7);
-        if ((updated[index] ^ frame[index]) & mask) assert(x >= 200 && y >= 110);
-    }
+    /* The fetch timestamp affects freshness, but is not printed in the footer. */
+    assert(!memcmp(updated, frame, sizeof(updated)));
     xSemaphoreGive(&display);
     allow_forecast_pixels = true;
     atomic_store(&uptime, 1800000000LL);
@@ -346,6 +417,17 @@ int main(void) {
     advance(3600, true);
     assert_hour_column(updated, 64, 8);
 
+    /* Ten rapid voice status changes wake clock_task immediately and stay strictly partial. */
+    const voice_state_t rapid[] = {
+        VOICE_STATE_CONNECTING, VOICE_STATE_READY, VOICE_STATE_LISTENING, VOICE_STATE_WAITING,
+        VOICE_STATE_SPEAKING, VOICE_STATE_FOLLOWUP, VOICE_STATE_LISTENING, VOICE_STATE_WAITING,
+        VOICE_STATE_SPEAKING, VOICE_STATE_OFFLINE, VOICE_STATE_ERROR, VOICE_STATE_READY,
+    };
+    for (unsigned i = 0; i < sizeof(rapid) / sizeof(rapid[0]); i++) {
+        publish_status(rapid[i], NULL, true);
+    }
+    publish_status(VOICE_STATE_WAIT_NETWORK, NULL, true);
+
     assert(!erased && !reprovisioned); /* WiFi credentials stay intact during HTTP I/O. */
     pthread_mutex_lock(&gate);
     allow_weather_return = true; pthread_cond_broadcast(&changed);
@@ -356,7 +438,7 @@ int main(void) {
     stopping = true; pthread_cond_broadcast(&changed);
     pthread_mutex_unlock(&gate);
     assert(!pthread_join(clock_thread, NULL)); assert(!pthread_join(button_thread, NULL));
-    puts("PASS clock: blocked HTTP taps and hold, UTC fallback, midnight, clock corrections, retry, setup/resume, forecast expiry and hourly rollover including repeated hours");
+    puts("PASS clock: blocked HTTP taps and hold, local time and missing zone, midnight, clock corrections, retry, setup/resume, forecast expiry, hourly rollover and immediate partial voice status updates");
 }
 '''
 
@@ -375,9 +457,17 @@ def main():
             path.parent.mkdir(parents=True, exist_ok=True)
             if name == "esp_timer.h":
                 contents = "#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n"
+            elif name == "freertos/FreeRTOS.h":
+                contents += (
+                    "#include <assert.h>\n#include <pthread.h>\n"
+                    "typedef pthread_mutex_t portMUX_TYPE;\n"
+                    "#define portMUX_INITIALIZER_UNLOCKED PTHREAD_MUTEX_INITIALIZER\n"
+                    "#define portENTER_CRITICAL(lock) assert(!pthread_mutex_lock(lock))\n"
+                    "#define portEXIT_CRITICAL(lock) assert(!pthread_mutex_unlock(lock))\n"
+                )
             path.write_text(contents)
         (work / "clock.c").write_text(HARNESS)
-        sources = ["main.c", "button.c", "ui.c", "epd.c", "fonts_aa.c", "font_clock.c", "font_icons.c"]
+        sources = ["main.c", "button.c", "ui.c", "epd.c", "voice_feedback.c", "fonts_aa.c", "font_clock.c", "font_icons.c"]
         flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"] if args.sanitize else []
         subprocess.run([
             compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",

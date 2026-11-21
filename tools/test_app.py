@@ -106,6 +106,7 @@ WEATHER_URL = (
 HEADERS = {
     "esp_err.h": """#pragma once
 #define ESP_OK 0
+#define ESP_FAIL -1
 #define ESP_ERR_NO_MEM -4
 #define ESP_ERR_NOT_SUPPORTED -2
 #define ESP_ERR_INVALID_STATE -3
@@ -115,9 +116,20 @@ static inline const char *esp_err_to_name(esp_err_t err) { (void)err; return "st
     "esp_log.h": """#pragma once
 #include <assert.h>
 #define ESP_ERROR_CHECK(x) assert((x) == 0)
-#define ESP_LOGI(tag, ...) ((void)(tag))
-#define ESP_LOGW(tag, ...) ((void)(tag))
-#define ESP_LOGE(tag, ...) ((void)(tag))
+/* Evaluate the arguments like the real macro, so -Wunused-function still sees them. */
+static inline void esp_log_stub(const char *fmt, ...) { (void)fmt; }
+#define ESP_LOGI(tag, ...) ((void)(tag), esp_log_stub(__VA_ARGS__))
+#define ESP_LOGW(tag, ...) ((void)(tag), esp_log_stub(__VA_ARGS__))
+#define ESP_LOGE(tag, ...) ((void)(tag), esp_log_stub(__VA_ARGS__))
+""",
+    "esp_system.h": """#pragma once
+#include <stddef.h>
+typedef enum { ESP_RST_UNKNOWN, ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW, ESP_RST_PANIC,
+    ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT, ESP_RST_DEEPSLEEP, ESP_RST_BROWNOUT,
+    ESP_RST_SDIO, ESP_RST_USB, ESP_RST_JTAG, ESP_RST_EFUSE, ESP_RST_PWR_GLITCH,
+    ESP_RST_CPU_LOCKUP } esp_reset_reason_t;
+static inline esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
+static inline unsigned esp_get_free_heap_size(void) { return 0; }
 """,
     "esp_timer.h": """#pragma once
 #include <stdint.h>
@@ -131,10 +143,13 @@ static inline int64_t esp_timer_get_time(void) { return 0; }
 typedef unsigned TickType_t;
 """,
     "freertos/task.h": """#pragma once
+typedef void *TaskHandle_t;
 void vTaskDelay(unsigned ms);
 unsigned xTaskGetTickCount(void);
 void xTaskDelayUntil(unsigned *last, unsigned ms);
-int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle);
+int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, TaskHandle_t *handle);
+unsigned long ulTaskNotifyTake(int clear_on_exit, unsigned timeout);
+int xTaskNotifyGive(TaskHandle_t task);
 """,
     "freertos/queue.h": """#pragma once
 #include <stddef.h>
@@ -284,7 +299,9 @@ HARNESS = r'''
 #include "ui.h"
 #include "device_mcp.h"
 #include "button.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include "voice_feedback.h"
 #include "fixtures.h"
 
@@ -301,9 +318,14 @@ int xSemaphoreTake(void *semaphore, unsigned timeout) {
 int xSemaphoreGive(void *semaphore) {
     assert(semaphore && display_locked); display_locked = false; return 1;
 }
-int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, void *handle) {
-    assert(entry && (!strcmp(name, "clock") || !strcmp(name, "button")) && stack >= 2048); return 1;
+int xTaskCreate(void (*entry)(void *), const char *name, unsigned stack, void *arg, unsigned priority, TaskHandle_t *handle) {
+    assert(entry && (!strcmp(name, "clock") || !strcmp(name, "button")) && stack >= 2048);
+    if (handle) *handle = (TaskHandle_t)1;
+    return 1;
 }
+unsigned long ulTaskNotifyTake(int clear_on_exit, unsigned timeout) { (void)clear_on_exit; (void)timeout; abort(); }
+int xTaskNotifyGive(TaskHandle_t task) { assert(task == (TaskHandle_t)1); return 1; }
+void voice_feedback_set_observer(void (*observer)(void)) { (void)observer; }
 unsigned xTaskGetTickCount(void) { abort(); }
 void xTaskDelayUntil(unsigned *last, unsigned ms) { abort(); }
 void *xQueueCreate(unsigned cap, size_t size) { assert(cap == 8 && size == sizeof(button_event_t)); return (void *)2; }
@@ -362,7 +384,7 @@ static unsigned long expected_wait_ms(void) {
 int gpio_config(const gpio_config_t *cfg) { (void)cfg; return 0; }
 static int dc_level = 1, last_cmd;
 static unsigned switch_count;
-static bool expect_switch_refresh;
+static bool expect_switch_refresh, expect_status_partial;
 int gpio_set_level(int pin, int level) {
     if (pin == EPD_DC) dc_level = level;
     return 0;
@@ -522,10 +544,13 @@ static void check_app_frame(unsigned char *fb) {
         if (8 + epd_text_w(&font_mid, heading) > 230)
             snprintf(heading, sizeof(heading), "无网络 #%u", attempt);
         epd_text(8, 16, &font_mid, heading);
-        time_t now = time(NULL);
-        struct tm tm;
-        if (have_weather) localtime_r(&now, &tm); else gmtime_r(&now, &tm);
-        strftime(heading, sizeof(heading), have_weather ? "%H:%M" : "UTC %H:%M", &tm);
+        strcpy(heading, "--:--");
+        if (have_weather) {
+            time_t now = time(NULL);
+            struct tm tm;
+            localtime_r(&now, &tm);
+            strftime(heading, sizeof(heading), "%H:%M", &tm);
+        }
         epd_text(292 - epd_text_w(&font_clock, heading), 16, &font_clock, heading);
     }
     ui_draw_status(success ? UI_STATUS_UPDATED : UI_STATUS_RETRY, attempt);
@@ -576,6 +601,12 @@ int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *t) {
         const unsigned char *p = t->tx_buffer;
         if (!dc_level) {
             last_cmd = p[0];
+        } else if (last_cmd == 0x22 && expect_status_partial) {
+            expect_status_partial = false;
+            if (p[0] != 0x0F) {
+                fprintf(stderr, "status-only refresh used update sequence 0x%02X; expected 0x0F (partial)\n", p[0]);
+                exit(2);
+            }
         } else if (last_cmd == 0x22 && expect_switch_refresh) {
             expect_switch_refresh = false;
             unsigned expected = switch_count % 8 == 0 ? 0xC7 : 0xC0;
@@ -592,6 +623,7 @@ int spi_device_polling_transmit(spi_device_handle_t spi, spi_transaction_t *t) {
         bool status = status_only_frame(p);
         if (status) {
             puts("status");
+            expect_status_partial = true;
             memcpy(last_frame, p, FRAME_BYTES);
             return 0;
         }
@@ -940,9 +972,6 @@ int main(int argc, char **argv) {
                 snprintf(text, sizeof(text), "%02u:%02u", hour, minute);
                 int width = epd_text_w(&font_clock, text);
                 assert(width > 0 && 292 - width >= 250);
-                char utc[10];
-                snprintf(utc, sizeof(utc), "UTC %s", text);
-                assert(292 - epd_text_w(&font_clock, utc) >= 230);
             }
         }
         printf("clock:1440:%u:%u\n", ink[0], ink[1]);
@@ -1787,7 +1816,7 @@ def check_ui(executable, work, source):
         else:
             require(city == ("Chengdu" if available else "无数据"),
                     f"ui: unexpected normal/no-forecast city: {city!r}")
-        clock_text = clock if available else f"UTC {clock}"
+        clock_text = clock if available else "--:--"
         require(any(e["text"] == clock_text and e["font"] == "clock" and e["y"] == 16 and
                     e["x"] + e["width"] == 292 and e["x"] >= 230 and
                     230 <= e["bounds"][0] <= e["bounds"][2] < 292 and
@@ -2261,11 +2290,15 @@ def validate(trace, case, label, success_frames=None):
     expected = ["cycle:0", "net_init", "frame", "boot_wait:5000"]
     expected += ["connect", "frame", "portal"] * portals
     for failure in range(connect_failures):
+        if failure:
+            expected.append("status")  # footer status: connecting
         expected.append("connect")
-        # A failed attempt repaints the title with the retry counter, so the screen is
-        # never left sitting on the placeholder without a hint.
+        # A failed attempt repaints the title and status corner with the retry counter, so the
+        # screen is never left sitting on the placeholder without a hint.
         expected.append("frame")
         expected.append(f"connect_wait:{retry_seconds(failure + 1) * 1000}")
+    if connect_failures:
+        expected.append("status")  # footer status: connecting
     expected.append("connect")
     # Which cycle drew each captured frame; boot/portal/press frames are not update frames.
     frame_cycles = [None] * (1 + portals + connect_failures)
@@ -2437,7 +2470,7 @@ def main():
         if voice_audio:
             try:
                 check_voice_audio(voice_audio, work)
-                print("PASS voice_audio: left-channel downmix, stereo upmix", flush=True)
+                print("PASS voice_audio: left-channel downmix, stereo upmix, bounded uplink gain", flush=True)
             except (AssertionError, ValueError, subprocess.SubprocessError) as error:
                 failure(error, "current/voice_audio")
         ui_count = 0

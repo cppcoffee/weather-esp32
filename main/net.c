@@ -208,3 +208,11 @@ int net_http_get(const char *url, char *buf, size_t cap)
     }
     return total > 0 ? total : -1;
 }
+
+void net_set_wifi_low_latency(bool enable)
+{
+    esp_err_t err = esp_wifi_set_ps(enable ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+    if (err != ESP_OK) {
+        ESP_LOGW(log_tag, "wifi ps(%s) failed: %s", enable ? "none" : "min_modem", esp_err_to_name(err));
+    }
+}

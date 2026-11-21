@@ -4,11 +4,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <errno.h>
 #include <esp_check.h>
 #include <esp_log.h>
+#include <esp_transport.h>
+#include <esp_transport_ssl.h>
+#include <esp_transport_tcp.h>
+#include <esp_transport_ws.h>
 #include <esp_websocket_client.h>
 #include <esp_crt_bundle.h>
+#include <http_parser.h>
 #include <limits.h>
+#include <lwip/sockets.h>
+#include <strings.h>
 
 #include "esp_xiaozhi_keystore.h"
 #include "esp_xiaozhi_board.h"
@@ -20,10 +28,13 @@ typedef struct esp_xiaozhi_websocket_s {
     char token[ESP_XIAOZHI_WEBSOCKET_MAX_STRING_SIZE];
     char protocol_version[16];
     char headers[ESP_XIAOZHI_WEBSOCKET_MAX_HEADER_SIZE];
+    char ws_path[ESP_XIAOZHI_WEBSOCKET_MAX_STRING_SIZE];
     bool websocket_connected;
     bool client_started;
 
     esp_websocket_client_handle_t websocket_client;
+    esp_transport_handle_t base_transport;
+    esp_transport_handle_t ws_transport;
     esp_xiaozhi_transport_handle_t transport_handle; /*!< Passed to callbacks so chat can resolve by transport handle */
     esp_xiaozhi_transport_callbacks_t callbacks;
 
@@ -35,6 +46,89 @@ static const char *TAG = "ESP_XIAOZHI_WEBSOCKET";
 
 #define WEBSOCKET_BUFFER_SIZE    4096
 #define WEBSOCKET_SEND_BUDGET_MS 5000
+#define WEBSOCKET_TASK_STACK     6144
+#define WEBSOCKET_TASK_PRIO      6
+#define WEBSOCKET_TASK_CORE      0
+
+static void esp_xiaozhi_websocket_destroy_transport(esp_xiaozhi_websocket_t *websocket)
+{
+    if (websocket->ws_transport) {
+        esp_transport_destroy(websocket->ws_transport);
+        websocket->ws_transport = NULL;
+    }
+    if (websocket->base_transport) {
+        esp_transport_destroy(websocket->base_transport);
+        websocket->base_transport = NULL;
+    }
+}
+
+static esp_transport_handle_t esp_xiaozhi_websocket_create_transport(esp_xiaozhi_websocket_t *websocket)
+{
+    struct http_parser_url puri;
+    http_parser_url_init(&puri);
+    if (http_parser_parse_url(websocket->url, strlen(websocket->url), 0, &puri) != 0) {
+        return NULL;
+    }
+    if (puri.field_data[UF_SCHEMA].len == 0) {
+        return NULL;
+    }
+    const char *scheme = websocket->url + puri.field_data[UF_SCHEMA].off;
+    size_t scheme_len = puri.field_data[UF_SCHEMA].len;
+    bool is_wss = (scheme_len == 3 && strncasecmp(scheme, "wss", 3) == 0);
+    bool is_ws = (scheme_len == 2 && strncasecmp(scheme, "ws", 2) == 0);
+    if (!is_ws && !is_wss) {
+        return NULL;
+    }
+
+    int path_len = puri.field_data[UF_PATH].len;
+    int query_len = puri.field_data[UF_QUERY].len;
+    const char *path = websocket->url + puri.field_data[UF_PATH].off;
+    const char *query = websocket->url + puri.field_data[UF_QUERY].off;
+    int written = 0;
+    if (path_len > 0 && query_len > 0) {
+        written = snprintf(websocket->ws_path, sizeof(websocket->ws_path), "%.*s?%.*s", path_len, path, query_len, query);
+    } else if (path_len > 0) {
+        written = snprintf(websocket->ws_path, sizeof(websocket->ws_path), "%.*s", path_len, path);
+    } else if (query_len > 0) {
+        written = snprintf(websocket->ws_path, sizeof(websocket->ws_path), "/?%.*s", query_len, query);
+    } else {
+        written = snprintf(websocket->ws_path, sizeof(websocket->ws_path), "/");
+    }
+    if (written <= 0 || (size_t)written >= sizeof(websocket->ws_path)) {
+        return NULL;
+    }
+
+    esp_transport_handle_t base = is_wss ? esp_transport_ssl_init() : esp_transport_tcp_init();
+    if (!base) {
+        return NULL;
+    }
+    int default_port = is_wss ? 443 : 80;
+    esp_transport_set_default_port(base, default_port);
+    if (is_wss) {
+        esp_transport_ssl_crt_bundle_attach(base, esp_crt_bundle_attach);
+    }
+
+    esp_transport_handle_t ws = esp_transport_ws_init(base);
+    if (!ws) {
+        esp_transport_destroy(base);
+        return NULL;
+    }
+    esp_transport_set_default_port(ws, default_port);
+    const esp_transport_ws_config_t ws_cfg = {
+        .ws_path = websocket->ws_path,
+        .headers = websocket->headers,
+        .propagate_control_frames = true,
+    };
+    if (esp_transport_ws_set_config(ws, &ws_cfg) != ESP_OK) {
+        esp_transport_destroy(ws);
+        esp_transport_destroy(base);
+        return NULL;
+    }
+
+    websocket->base_transport = base;
+    websocket->ws_transport = ws;
+    return ws;
+}
 
 static TickType_t esp_xiaozhi_websocket_send_timeout(size_t len)
 {
@@ -96,6 +190,15 @@ static void esp_xiaozhi_websocket_event(void *handler_args, esp_event_base_t bas
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGD(TAG, "WEBSOCKET_EVENT_CONNECTED");
+        if (websocket->base_transport) {
+            int fd = esp_transport_get_socket(websocket->base_transport);
+            if (fd >= 0) {
+                int one = 1;
+                if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
+                    ESP_LOGW(TAG, "Failed to set TCP_NODELAY on fd=%d (errno=%d)", fd, errno);
+                }
+            }
+        }
         websocket->websocket_connected = true;
         if (websocket->callbacks.on_connected_callback) {
             websocket->callbacks.on_connected_callback(websocket->transport_handle);
@@ -228,6 +331,7 @@ esp_err_t esp_xiaozhi_websocket_deinit(esp_xiaozhi_websocket_handle_t handle)
         ESP_RETURN_ON_ERROR(esp_websocket_client_destroy(websocket->websocket_client), TAG, "Failed to destroy client");
         websocket->websocket_client = NULL;
     }
+    esp_xiaozhi_websocket_destroy_transport(websocket);
     esp_xiaozhi_payload_clear(&websocket->payload);
 
     free(websocket);
@@ -255,6 +359,14 @@ esp_err_t esp_xiaozhi_websocket_start(esp_xiaozhi_websocket_handle_t handle)
     snprintf(websocket->protocol_version, sizeof(websocket->protocol_version), "%d", protocol_version);
     esp_xiaozhi_websocket_build_headers(websocket);
 
+    if (websocket->websocket_client) {
+        ESP_RETURN_ON_ERROR(esp_xiaozhi_websocket_stop(handle), TAG, "Failed to stop previous client");
+        ESP_RETURN_ON_ERROR(esp_websocket_client_destroy(websocket->websocket_client), TAG,
+                            "Failed to destroy previous client");
+        websocket->websocket_client = NULL;
+    }
+    esp_xiaozhi_websocket_destroy_transport(websocket);
+
     esp_websocket_client_config_t websocket_cfg = {
         .uri = websocket->url,
         .headers = websocket->headers,
@@ -264,20 +376,28 @@ esp_err_t esp_xiaozhi_websocket_start(esp_xiaozhi_websocket_handle_t handle)
         .reconnect_timeout_ms = 5000,
         .network_timeout_ms = WEBSOCKET_SEND_BUDGET_MS,
         .buffer_size = WEBSOCKET_BUFFER_SIZE,
+        .task_stack = WEBSOCKET_TASK_STACK,
+        .task_prio = WEBSOCKET_TASK_PRIO,
+        .task_core_id_set = true,
+        .task_core_id = WEBSOCKET_TASK_CORE,
+        .ext_transport = esp_xiaozhi_websocket_create_transport(websocket),
     };
 
-    if (websocket->websocket_client) {
-        ESP_RETURN_ON_ERROR(esp_xiaozhi_websocket_stop(handle), TAG, "Failed to stop previous client");
-        ESP_RETURN_ON_ERROR(esp_websocket_client_destroy(websocket->websocket_client), TAG,
-                            "Failed to destroy previous client");
-        websocket->websocket_client = NULL;
+    websocket->websocket_client = esp_websocket_client_init(&websocket_cfg);
+    if (!websocket->websocket_client) {
+        esp_xiaozhi_websocket_destroy_transport(websocket);
+        ESP_LOGE(TAG, "Failed to initialize websocket client");
+        return ESP_ERR_NO_MEM;
     }
 
-    websocket->websocket_client = esp_websocket_client_init(&websocket_cfg);
-    ESP_RETURN_ON_FALSE(websocket->websocket_client, ESP_ERR_NO_MEM, TAG, "Failed to initialize websocket client");
-
     ret = esp_websocket_register_events(websocket->websocket_client, WEBSOCKET_EVENT_ANY, esp_xiaozhi_websocket_event, websocket);
-    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Failed to register websocket events: %s", esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register websocket events: %s", esp_err_to_name(ret));
+        esp_websocket_client_destroy(websocket->websocket_client);
+        websocket->websocket_client = NULL;
+        esp_xiaozhi_websocket_destroy_transport(websocket);
+        return ret;
+    }
 
     websocket->client_started = true;
     ret = esp_websocket_client_start(websocket->websocket_client);
@@ -286,6 +406,7 @@ esp_err_t esp_xiaozhi_websocket_start(esp_xiaozhi_websocket_handle_t handle)
         ESP_LOGE(TAG, "Failed to start websocket client: %s", esp_err_to_name(ret));
         esp_websocket_client_destroy(websocket->websocket_client);
         websocket->websocket_client = NULL;
+        esp_xiaozhi_websocket_destroy_transport(websocket);
         return ret;
     }
 

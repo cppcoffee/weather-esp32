@@ -6,13 +6,13 @@ ESP32-S3 + 2.9" 墨水屏（SSD1680，可见 296×128）天气面板，纯 ESP-I
 
 | 屏幕 | ESP32-S3 | | 音频（ES8311 + NS415B） | ESP32-S3 |
 |---|---|---|---|---|
-| SCK | GPIO9 | | 功放 EN | GPIO2 |
-| SDA (MOSI) | GPIO10 | | I²S DOUT | GPIO47 |
-| RST | GPIO11 | | I²S WS | GPIO48 |
-| DC | GPIO12 | | I²S DIN（麦克风） | GPIO38 |
-| CS1 | GPIO13 | | I²S BCLK | GPIO39 |
-| BUSY | GPIO14 | | I²S MCLK | GPIO40 |
-| VCC | 3V3 | | I²C SCL / SDA | GPIO41 / GPIO42 |
+| SCK | GPIO38 | | 功放 EN | GPIO15 |
+| SDA (MOSI) | GPIO39 | | I²S DOUT | GPIO16 |
+| RST | GPIO40 | | I²S WS | GPIO17 |
+| DC | GPIO41 | | I²S DIN（麦克风） | GPIO18 |
+| CS1 | GPIO42 | | I²S BCLK | GPIO9 |
+| BUSY | GPIO21 | | I²S MCLK | GPIO10 |
+| VCC | 3V3 | | I²C SCL / SDA | GPIO11 / GPIO12 |
 
 改引脚只动 `main/epd.h` 和 `main/audio.h` 顶部的 `#define`。屏幕用 3.3V；ES8311 与 NS415B 电源按模块规格，必须与 ESP32 共地。Octal PSRAM 占用 GPIO33–37，GPIO43/44 留给外接 UART，GPIO19/20 保留 USB-JTAG。
 
@@ -43,12 +43,12 @@ idf.py -p 实际串口 monitor    # 需在真实终端运行
 
 - **短按**切页（按天 / 未来 10 小时）。
 - 说 **“小鹿小鹿”** 唤醒：本地 WakeNet 命中后才开麦上传，空闲时不上传音频。
-- 一轮问答：检测到开口后约 660 ms 静默结束录音，最长 15 秒。
+- 一轮问答：唤醒后至少录 600 毫秒，之后约 300 毫秒静默即结束录音，最长 15 秒。
 - **免唤醒追问默认开启**：回复播完后约 6 秒内可直接说下一句，设备先在本地确认开口再上传；窗口内不说话则回到待唤醒。
 - 播放中说“小鹿小鹿”可打断（需要 AEC 初始化成功）。
 - 说 **“退下”/“退下吧”/“再见”/“拜拜”** 结束会话：服务端下发 `goodbye` 并断开，设备释放 WebSocket/MCP/Opus，只留本地唤醒；下次唤醒重新走 OTA 建连。
 
-屏幕右下角显示语音状态（连接、待唤醒、聆听、等待回答、说话、失败），激活码显示在顶部。
+屏幕右下角显示语音状态（连接、聆听、等待回答、说话、失败）。空闲时显示天气状态，激活码显示在顶部。
 
 ## 语音能问什么（MCP）
 
@@ -60,7 +60,7 @@ idf.py -p 实际串口 monitor    # 需在真实终端运行
 | `self.get_weather_forecast` | 与屏幕同源的最近成功快照（5 天 + 21 小时），含抓取时间、缓存年龄、`stale`/`retrying` |
 | `self.get_sensor_reading` | 本地温湿度；**当前未接传感器驱动**，返回 `available=false` |
 | `self.get_device_status` | 扬声器当前音量 |
-| `self.audio_speaker.set_volume` | 音量 0–100，写入 NVS，重启恢复（首次默认 60） |
+| `self.audio_speaker.set_volume` | 音量 0–100，写入 NVS，重启恢复（首次默认 80） |
 
 **没有接入温湿度传感器**，被问到时应答“没有可用的传感器读数”，不要报模拟值。语音识别文本与回答会发到所配云服务，不是纯本地处理。
 
