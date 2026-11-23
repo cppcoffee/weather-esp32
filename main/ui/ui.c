@@ -28,7 +28,13 @@
 #define HOUR_COL_W  28
 #define HOUR_GRID_X ((PANEL_H - HOUR_COLS * HOUR_COL_W) / 2)
 
-#define CLOCK_LEFT 230
+#define CLOCK_LEFT    230
+#define BATTERY_X     269
+#define BATTERY_Y     6
+#define BATTERY_W     19
+#define BATTERY_H     11
+#define BATTERY_NUB_W 2
+#define BATTERY_NUB_H 5
 
 static struct {
     char text[6];
@@ -36,6 +42,12 @@ static struct {
     bool local_time;
     int  utc_offset;
 } clock_display;
+
+static struct {
+    int  bars;
+    bool charging;
+    bool valid;
+} battery_display;
 
 static struct {
     char temp[24];
@@ -401,6 +413,102 @@ local_time_tm(time_t now, struct tm *tm)
 #endif
 }
 
+static int
+battery_bars_for_status(const battery_status_t *battery)
+{
+    if (!battery || !battery->valid) {
+        return 0;
+    }
+    if (battery->usb_present && !battery->charging) {
+        return 4;
+    }
+    if (battery->percent >= 75) {
+        return 4;
+    }
+    if (battery->percent >= 50) {
+        return 3;
+    }
+    if (battery->percent >= 25) {
+        return 2;
+    }
+    if (battery->percent >= 10) {
+        return 1;
+    }
+    return 0;
+}
+
+static void
+draw_battery(void)
+{
+    static const uint8_t bolt_rows[7] = {
+        0x06, // ..##.
+        0x0C, // .##..
+        0x1F, // #####
+        0x0E, // .###.
+        0x1F, // #####
+        0x06, // ..##.
+        0x0C, // .##..
+    };
+
+    epd_fill_rect(BATTERY_X, 0, PANEL_H - BATTERY_X, 22, EPD_WHITE);
+    epd_fill_rect(BATTERY_X, BATTERY_Y, BATTERY_W, BATTERY_H, EPD_BLACK);
+    epd_fill_rect(BATTERY_X + 1, BATTERY_Y + 1, BATTERY_W - 2, BATTERY_H - 2, EPD_WHITE);
+    epd_fill_rect(BATTERY_X + BATTERY_W, BATTERY_Y + (BATTERY_H - BATTERY_NUB_H) / 2, BATTERY_NUB_W, BATTERY_NUB_H,
+                  EPD_BLACK);
+
+    for (int i = 0; i < battery_display.bars && i < 4; i++) {
+        epd_fill_rect(BATTERY_X + 2 + i * 4, BATTERY_Y + 2, 3, BATTERY_H - 4, EPD_BLACK);
+    }
+
+    if (battery_display.charging) {
+        int bx = BATTERY_X + (BATTERY_W - 5) / 2;
+        int by = BATTERY_Y + 2;
+        for (int r = 0; r < 7; r++) {
+            for (int c = 0; c < 5; c++) {
+                if ((bolt_rows[r] & (1u << (4 - c))) == 0) {
+                    continue;
+                }
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int px = bx + c + dx;
+                        int py = by + r + dy;
+                        if (px > BATTERY_X && px < BATTERY_X + BATTERY_W - 1 && py > BATTERY_Y
+                            && py < BATTERY_Y + BATTERY_H - 1)
+                        {
+                            epd_pixel(px, py, EPD_WHITE);
+                        }
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < 7; r++) {
+            for (int c = 0; c < 5; c++) {
+                if (bolt_rows[r] & (1u << (4 - c))) {
+                    epd_pixel(bx + c, by + r, EPD_BLACK);
+                }
+            }
+        }
+    }
+}
+
+bool
+ui_update_battery(const battery_status_t *battery)
+{
+    int  bars = battery_bars_for_status(battery);
+    bool charging = battery && battery->charging;
+    bool valid = battery && battery->valid;
+    bool changed =
+        bars != battery_display.bars || charging != battery_display.charging || valid != battery_display.valid;
+    battery_display.bars = bars;
+    battery_display.charging = charging;
+    battery_display.valid = valid;
+    if (!clock_display.visible || !changed) {
+        return false;
+    }
+    draw_battery();
+    return true;
+}
+
 static bool
 render_clock(time_t now)
 {
@@ -414,8 +522,8 @@ render_clock(time_t now)
     if (strcmp(buf, clock_display.text) == 0) {
         return false;
     }
-    epd_fill_rect(CLOCK_LEFT, 0, PANEL_H - CLOCK_LEFT, 22, EPD_WHITE);
-    epd_text(EPD_W - 8 - epd_text_w(&font_clock, buf), 16, &font_clock, buf);
+    epd_fill_rect(CLOCK_LEFT, 0, BATTERY_X - CLOCK_LEFT, 22, EPD_WHITE);
+    epd_text(BATTERY_X - 5 - epd_text_w(&font_clock, buf), 16, &font_clock, buf);
     memcpy(clock_display.text, buf, sizeof(clock_display.text));
     return true;
 }
@@ -460,6 +568,7 @@ render_header(void)
     clock_display.visible = true;
     clock_display.text[0] = '\0';
     (void)render_clock(time(NULL));
+    draw_battery();
 }
 
 static void

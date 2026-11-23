@@ -11,6 +11,14 @@ typedef struct {
     bool  valid;
 } sensor_reading_t;
 
+typedef struct {
+    int  voltage_mv;
+    int  percent;
+    bool usb_present;
+    bool charging;
+    bool valid;
+} battery_status_t;
+
 // What the device is doing right now, shown in the footer's right corner.
 typedef enum {
     UI_STATUS_NONE,
@@ -49,6 +57,9 @@ bool ui_update_voice(const voice_feedback_t *feedback);
 // changed. Reset and setup screens take precedence. Caller serializes and
 // refreshes.
 bool ui_update_sensor(const sensor_reading_t *sensor);
+// Update the battery snapshot and redraw the top-right battery icon if visible
+// and the displayed bars or charging state changed.
+bool ui_update_battery(const battery_status_t *battery);
 // Replace only the title; attempt is the next retry number (1 after the first
 // failure).
 void ui_draw_retry(unsigned attempt, unsigned retry_seconds);

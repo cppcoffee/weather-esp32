@@ -15,6 +15,7 @@ ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气与 AI 语音面板（ESP
 | 传感器（AHT20+BMP280，可选） | `SDA=6` `SCL=7` `VCC=3V3`（固定地址 `AHT20=0x38`、`BMP280=0x77`，改地址见 `main/sensor.h`） |
 | 按键 | `GPIO4`（切页 / 长按 5 秒重置配网）、`GPIO5`（语音唤醒 / 关闭对话），均接微动开关到 `GND`（内部上拉） |
 | 唤醒指示灯（绿色 LED） | `GPIO47`（高电平点亮，串联限流电阻接 `GND`；唤醒亮、退出灭） |
+| 电池与充电检测 | `VBAT_ADC=1`（`ADC1_CH0`，100k/100k 分压）、`PGOOD=13`（USB 接入低有效）、`CHRG=14`（`ETA6002 STAT` 经反相：充电中高、充满低） |
 
 - 避开预留引脚：`GPIO33–37`（Octal PSRAM）、`GPIO19/20`（USB-JTAG）、`GPIO43/44`（外接 UART 日志）。
 - 如需调整引脚或切换硬件 AEC，修改 `main/ui/epd.h`、`main/voice/audio.h`（`AUDIO_USE_ES7210_AEC` 置 `1` 启用 ES7210 硬件回采 AEC + 全双工 `realtime` 直接说话打断，ES7210 复用上述 I2C/MCLK/BCLK/WS 并接 `DIN`，`MIC1` 接麦克风、`MIC3` 接功放输出分压回采）、`main/voice/voice.h`（`VOICE_LED_GPIO`）、`main/sensor.h`、`main/button.h` 顶部 `#define`。

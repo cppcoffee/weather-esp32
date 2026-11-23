@@ -1,4 +1,5 @@
 #include "audio.h"
+#include "battery.h"
 #include "button.h"
 #include "button_gpio.h"
 #include "device_mcp.h"
@@ -45,6 +46,7 @@ _Static_assert(VOICE_LED_GPIO != BUTTON_GPIO && VOICE_LED_GPIO != VOICE_BUTTON_G
 #define RETRY_MIN_S        5
 #define RETRY_MAX_S        60
 #define SENSOR_POLL_US     (10LL * 60 * 1000000)
+#define BATTERY_ADC_US     (60LL * 1000000)
 
 enum app_view {
     VIEW_DAILY,
@@ -63,6 +65,7 @@ struct app_state {
                             // on failure
     forecast_stamp_t stamp;
     sensor_reading_t sensor;
+    battery_status_t battery;
     bool             have_weather;
     bool             retrying;
     unsigned         retry_attempt;
@@ -251,6 +254,9 @@ clock_task(void *arg)
 {
     struct app_state *app = arg;
     int64_t           last_sensor_us = esp_timer_get_time();
+    int64_t           last_battery_adc_us = last_sensor_us;
+    bool              last_usb = app->battery.usb_present;
+    bool              last_charging = app->battery.charging;
 
     for (;;) {
         (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
@@ -264,6 +270,22 @@ clock_task(void *arg)
             device_mcp_publish_sensor(&sampled);
             sensor_polled = true;
         }
+
+        battery_status_t sampled_battery = {0};
+        bool             sample_adc = (now_us - last_battery_adc_us >= BATTERY_ADC_US);
+        (void)battery_read(&sampled_battery, sample_adc);
+        if (sampled_battery.usb_present != last_usb || sampled_battery.charging != last_charging) {
+            last_usb = sampled_battery.usb_present;
+            last_charging = sampled_battery.charging;
+            if (!sample_adc) {
+                (void)battery_read(&sampled_battery, true);
+                sample_adc = true;
+            }
+        }
+        if (sample_adc) {
+            last_battery_adc_us = now_us;
+        }
+        device_mcp_publish_battery(&sampled_battery);
 
         xSemaphoreTake(display_lock, portMAX_DELAY);
 
@@ -281,6 +303,8 @@ clock_task(void *arg)
             sensor_changed = ui_update_sensor(&app->sensor);
         }
 
+        app->battery = sampled_battery;
+        bool            battery_changed = ui_update_battery(&app->battery);
         bool            voice_changed = ui_update_voice(&feedback);
         bool            clock_changed = ui_update_clock();
         bool            switched = false;
@@ -294,7 +318,7 @@ clock_task(void *arg)
             }
         }
 
-        if (!switched && (clock_changed || voice_changed || status_changed || sensor_changed)) {
+        if (!switched && (clock_changed || voice_changed || status_changed || sensor_changed || battery_changed)) {
             epd_refresh();
         }
 
@@ -574,6 +598,9 @@ app_main(void)
     if (sensor_init() != ESP_OK) {
         ESP_LOGW(log_tag, "local sensor unavailable");
     }
+    if (battery_init() != ESP_OK) {
+        ESP_LOGW(log_tag, "battery monitor unavailable");
+    }
 
     device_mcp_set_sensor_model(sensor_name());
 
@@ -623,10 +650,13 @@ app_main(void)
 
     (void)sensor_read(&app.sensor);
     device_mcp_publish_sensor(&app.sensor);
+    (void)battery_read(&app.battery, true);
+    device_mcp_publish_battery(&app.battery);
 
     // Paint a placeholder while the device starts networking and fetches the
     // first forecast.
     xSemaphoreTake(display_lock, portMAX_DELAY);
+    (void)ui_update_battery(&app.battery);
     draw_page(&app);
     epd_refresh();
     xSemaphoreGive(display_lock);

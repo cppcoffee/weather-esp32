@@ -15,6 +15,9 @@ forecast_stamp_t device_mcp_publish_forecast(const weather_t *weather, const for
 // together.
 void device_mcp_publish_sensor(const sensor_reading_t *sensor);
 
+// Publish the latest battery voltage, percentage, and USB/charging status.
+void device_mcp_publish_battery(const battery_status_t *battery);
+
 // Record the detected local sensor chip summary (e.g. "AHT20+BMP280").
 void device_mcp_set_sensor_model(const char *model);
 

@@ -1,4 +1,5 @@
 idf_component_register(SRCS "main.c"
+                            "battery.c"
                             "device_mcp.c"
                             "sensor.c"
                             "voice/audio.c"
@@ -22,7 +23,7 @@ idf_component_register(SRCS "main.c"
                             "weather/weather_json.c"
                        INCLUDE_DIRS "." "net" "ui" "voice" "weather"
                        EMBED_TXTFILES "web/index.html"
-                       REQUIRES esp_codec_dev esp_xiaozhi mcp-c-sdk espressif__cjson espressif__button k0i05__esp_ahtxx k0i05__esp_bmp280 esp_driver_i2c esp_driver_i2s esp_driver_spi esp_driver_gpio esp_timer esp_wifi esp_netif esp_event esp_http_client esp_http_server esp-tls mbedtls nvs_flash dns_server http_parser
+                       REQUIRES esp_adc esp_codec_dev esp_xiaozhi mcp-c-sdk espressif__cjson espressif__button k0i05__esp_ahtxx k0i05__esp_bmp280 esp_driver_i2c esp_driver_i2s esp_driver_spi esp_driver_gpio esp_timer esp_wifi esp_netif esp_event esp_http_client esp_http_server esp-tls mbedtls nvs_flash dns_server http_parser
                        PRIV_REQUIRES esp-sr)
 
 # Opus comes from the namespace-prefixed managed component; require it by its real name.

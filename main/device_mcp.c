@@ -35,6 +35,7 @@ struct sensor_snapshot {
 struct device_snapshot {
     weather_t              weather;
     struct sensor_snapshot sensor;
+    battery_status_t       battery;
     forecast_stamp_t       stamp;
     char                   sensor_model[32];
     char                   display_page[16];
@@ -105,6 +106,18 @@ device_mcp_publish_sensor(const sensor_reading_t *sensor)
             }
         }
     }
+    portEXIT_CRITICAL(&snapshot_lock);
+}
+
+void
+device_mcp_publish_battery(const battery_status_t *battery)
+{
+    battery_status_t sample = {0};
+    if (battery) {
+        sample = *battery;
+    }
+    portENTER_CRITICAL(&snapshot_lock);
+    published_snapshot.battery = sample;
     portEXIT_CRITICAL(&snapshot_lock);
 }
 
@@ -388,9 +401,17 @@ get_device_status(const esp_mcp_property_list_t *properties, esp_mcp_tool_result
     }
     cJSON *json = cJSON_CreateObject();
     cJSON *speaker = json ? cJSON_AddObjectToObject(json, "audio_speaker") : NULL;
+    cJSON *battery = json ? cJSON_AddObjectToObject(json, "battery") : NULL;
     cJSON *wifi = json ? cJSON_AddObjectToObject(json, "wifi") : NULL;
     cJSON *memory = json ? cJSON_AddObjectToObject(json, "memory") : NULL;
-    bool ok = speaker && wifi && memory && cJSON_AddNumberToObject(speaker, "volume", volume)
+    bool ok = speaker && battery && wifi && memory && cJSON_AddNumberToObject(speaker, "volume", volume)
+              && cJSON_AddBoolToObject(battery, "available", copy.battery.valid)
+              && (copy.battery.valid ? cJSON_AddNumberToObject(battery, "voltage_mv", copy.battery.voltage_mv)
+                                     : cJSON_AddNullToObject(battery, "voltage_mv"))
+              && (copy.battery.valid ? cJSON_AddNumberToObject(battery, "percent", copy.battery.percent)
+                                     : cJSON_AddNullToObject(battery, "percent"))
+              && cJSON_AddBoolToObject(battery, "usb_powered", copy.battery.usb_present)
+              && cJSON_AddBoolToObject(battery, "charging", copy.battery.charging)
               && add_timestamp(json, "read_at", net_synchronized_time(), 0)
               && cJSON_AddNumberToObject(json, "uptime_seconds", (double)(int64_t)uptime_s)
               && cJSON_AddStringToObject(json, "display_page", copy.display_page[0] ? copy.display_page : "placeholder")
