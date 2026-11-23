@@ -9,6 +9,9 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,13 +28,14 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          . "${IDF_PATH:-/opt/esp/idf}/export.sh"
+          source "$IDF_PATH/export.sh"
           idf.py build
           idf.py merge-bin
 
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
+          if-no-files-found: error
           path: |
             build/merged-binary.bin
             build/weather_esp32.bin

@@ -7,6 +7,11 @@ on:
 permissions:
   contents: write
 
+# 同一 tag 的两次发布不能排队抢同一批附件
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,7 +28,7 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          . "${IDF_PATH:-/opt/esp/idf}/export.sh"
+          source "$IDF_PATH/export.sh"
           idf.py build
           idf.py merge-bin
 
@@ -39,6 +44,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
+          if-no-files-found: error
           path: dist/*
 
   release:
