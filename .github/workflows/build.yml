@@ -21,9 +21,13 @@ jobs:
           path: managed_components
           key: components-v6.0.2-${{ hashFiles('dependencies.lock') }}
 
-      - run: idf.py build
-
-      - run: idf.py merge-bin
+      # container 覆盖了镜像 entrypoint，idf.py 不在 PATH，每个用到它的 step 都要 source export.sh
+      - name: Build
+        shell: bash
+        run: |
+          . "${IDF_PATH:-/opt/esp/idf}/export.sh"
+          idf.py build
+          idf.py merge-bin
 
       - uses: actions/upload-artifact@v4
         with:
