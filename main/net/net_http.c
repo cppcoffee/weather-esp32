@@ -6,7 +6,8 @@
 
 static const char *log_tag = "net_http";
 
-int net_http_get(const char *url, char *buf, size_t cap)
+int
+net_http_get(const char *url, char *buf, size_t cap)
 {
     if (!url || !buf || cap == 0) {
         return -1;

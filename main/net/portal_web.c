@@ -25,9 +25,10 @@ static const char *log_tag = "portal_web";
 extern const char portal_index[] asm("_binary_index_html_start");
 
 static EventGroupHandle_t portal_event_group;
-static httpd_handle_t portal_server;
+static httpd_handle_t     portal_server;
 
-static EventGroupHandle_t portal_events(void)
+static EventGroupHandle_t
+portal_events(void)
 {
     if (!portal_event_group) {
         portal_event_group = xEventGroupCreate();
@@ -35,8 +36,10 @@ static EventGroupHandle_t portal_events(void)
     return portal_event_group;
 }
 
-// 扫周边热点。扫描要求 WiFi 处于 STA/APSTA 模式，所以配网时开的是 APSTA（STA 不连）。
-static cJSON *scan_aps_json(const char *own_ssid)
+// 扫周边热点。扫描要求 WiFi 处于 STA/APSTA 模式，所以配网时开的是 APSTA（STA
+// 不连）。
+static cJSON *
+scan_aps_json(const char *own_ssid)
 {
     cJSON *list = cJSON_CreateArray();
     if (!list) {
@@ -85,7 +88,8 @@ static cJSON *scan_aps_json(const char *own_ssid)
 
 // ESP-IDF extracts the complete encoded field. Apply the destination limit
 // after decoding, since each original byte can occupy three encoded bytes.
-static bool form_field(const char *body, const char *name, char *out, size_t cap)
+static bool
+form_field(const char *body, const char *name, char *out, size_t cap)
 {
     char encoded[3 * (VOICE_URL_CAP - 1) + 1];
     out[0] = '\0';
@@ -116,22 +120,25 @@ static bool form_field(const char *body, const char *name, char *out, size_t cap
     return true;
 }
 
-static esp_err_t any_get(httpd_req_t *req)
+static esp_err_t
+any_get(httpd_req_t *req)
 {
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "http://" NET_AP_URL "/");
     return httpd_resp_send(req, NULL, 0);
 }
 
-static esp_err_t root_get(httpd_req_t *req)
+static esp_err_t
+root_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, portal_index, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t state_get(httpd_req_t *req)
+static esp_err_t
+state_get(httpd_req_t *req)
 {
-    const char *own = net_ap_ssid();
+    const char      *own = net_ap_ssid();
     voice_settings_t settings = {0};
     if (voice_settings_load(&settings) != ESP_OK) {
         ESP_LOGW(log_tag, "invalid saved voice settings; showing empty fields");
@@ -164,19 +171,22 @@ static esp_err_t state_get(httpd_req_t *req)
 }
 
 // title/msg are application-owned literals, never form input.
-static esp_err_t reply(httpd_req_t *req, const char *title, const char *msg, bool ok)
+static esp_err_t
+reply(httpd_req_t *req, const char *title, const char *msg, bool ok)
 {
     if (!ok) {
         httpd_resp_set_status(req, "400 Bad Request");
     }
     char html[768];
-    int n = snprintf(html, sizeof(html),
-                     "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
-                     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>%s</title>"
-                     "<style>body{margin:0;padding:3rem 1.25rem;font:16px/1.6 system-ui,sans-serif;max-width:25rem;"
-                     "margin:auto}h1{margin:0 0 1rem;font-size:1.75rem}</style></head>"
-                     "<body><h1>%s</h1><p>%s</p></body></html>",
-                     title, title, msg);
+    int  n = snprintf(html, sizeof(html),
+                      "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+                      "<meta name=\"viewport\" "
+                      "content=\"width=device-width,initial-scale=1\"><title>%s</title>"
+                      "<style>body{margin:0;padding:3rem 1.25rem;font:16px/1.6 "
+                      "system-ui,sans-serif;max-width:25rem;"
+                      "margin:auto}h1{margin:0 0 1rem;font-size:1.75rem}</style></head>"
+                      "<body><h1>%s</h1><p>%s</p></body></html>",
+                      title, title, msg);
     if (n < 0 || (size_t)n >= sizeof(html)) {
         return httpd_resp_send_500(req);
     }
@@ -184,7 +194,8 @@ static esp_err_t reply(httpd_req_t *req, const char *title, const char *msg, boo
     return httpd_resp_send(req, html, n);
 }
 
-static esp_err_t save_post(httpd_req_t *req)
+static esp_err_t
+save_post(httpd_req_t *req)
 {
     enum {
         BODY_CAP = 4096
@@ -208,7 +219,7 @@ static esp_err_t save_post(httpd_req_t *req)
     }
     body[total] = '\0';
 
-    char ssid[33], manual[33], pass[65];
+    char             ssid[33], manual[33], pass[65];
     voice_settings_t settings = {.followup = 1};
     bool valid = !memchr(body, 0, total) && form_field(body, "ssid", ssid, sizeof(ssid))
                  && form_field(body, "ssid2", manual, sizeof(manual)) && form_field(body, "pass", pass, sizeof(pass))
@@ -225,7 +236,10 @@ static esp_err_t save_post(httpd_req_t *req)
     }
 
     if (voice_settings_validate(&settings) != ESP_OK) {
-        return reply(req, "语音地址无效", "请填写服务信息地址（OTA），例如 http://PC局域网IP:8000/xiaozhi/ota/", false);
+        return reply(req, "语音地址无效",
+                     "请填写服务信息地址（OTA），例如 "
+                     "http://PC局域网IP:8000/xiaozhi/ota/",
+                     false);
     }
 
     nvs_handle_t h;
@@ -257,7 +271,8 @@ static esp_err_t save_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-esp_err_t portal_web_start(void)
+esp_err_t
+portal_web_start(void)
 {
     xEventGroupClearBits(portal_events(), CREDS_SAVED);
 
@@ -285,12 +300,14 @@ esp_err_t portal_web_start(void)
     return err;
 }
 
-void portal_web_wait(void)
+void
+portal_web_wait(void)
 {
     xEventGroupWaitBits(portal_events(), CREDS_SAVED, pdTRUE, pdTRUE, portMAX_DELAY);
 }
 
-void portal_web_stop(void)
+void
+portal_web_stop(void)
 {
     if (!portal_server) {
         return;

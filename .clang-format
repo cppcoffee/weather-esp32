@@ -4,13 +4,17 @@ ContinuationIndentWidth: 4
 ColumnLimit: 120
 TabWidth: 4
 UseTab: Never
+PointerAlignment: Right
+AlwaysBreakAfterReturnType: AllDefinitions
 BreakBeforeBraces: Custom
 BraceWrapping:
     AfterFunction: true
     AfterControlStatement: MultiLine
 BreakBeforeBinaryOperators: NonAssignment
 SpaceBeforeParens: ControlStatements
-SeparateDefinitionBlocks: Always
+MaxEmptyLinesToKeep: 2
+SeparateDefinitionBlocks: Leave
+AlignConsecutiveDeclarations: Consecutive
 AlignConsecutiveMacros: Consecutive
 AllowShortEnumsOnASingleLine: false
 AllowShortFunctionsOnASingleLine: None

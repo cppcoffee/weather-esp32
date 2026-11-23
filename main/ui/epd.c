@@ -29,17 +29,18 @@ static const uint8_t ws_20_30[FULL_WAVEFORM_BYTES] = {
     [154] = 0x17, [155] = 0x41, [157] = 0x32, [158] = 0x36,
 };
 
-// Partial updates only use the first 153 bytes, so the unused register tail is omitted.
+// Partial updates only use the first 153 bytes, so the unused register tail is
+// omitted.
 static const uint8_t ws_partial[LUT_BYTES] = {
     [1] = 0x40,  [12] = 0x80, [13] = 0x80,  [24] = 0x40,  [25] = 0x40,  [37] = 0x80,  [60] = 0x0A,  [66] = 0x02,
     [67] = 0x01, [74] = 0x01, [144] = 0x22, [145] = 0x22, [146] = 0x22, [147] = 0x22, [148] = 0x22, [149] = 0x22,
 };
 
-static uint8_t framebuffer[FB_SIZE];
-static uint8_t displayed[FB_SIZE];
+static uint8_t             framebuffer[FB_SIZE];
+static uint8_t             displayed[FB_SIZE];
 static spi_device_handle_t panel_spi;
-static unsigned page_switches;
-static bool displayed_valid;
+static unsigned            page_switches;
+static bool                displayed_valid;
 
 struct ram_window {
     unsigned x_start, x_end; // byte addresses in a controller row
@@ -48,33 +49,39 @@ struct ram_window {
 
 static const struct ram_window full_window = {0, ROW_BYTES - 1, 0, PANEL_H - 1};
 
-static void tx(const uint8_t *buf, size_t n)
+static void
+tx(const uint8_t *buf, size_t n)
 {
     spi_transaction_t t = {.length = n * 8, .tx_buffer = buf};
     ESP_ERROR_CHECK(spi_device_polling_transmit(panel_spi, &t));
 }
 
-static void cmd(uint8_t c)
+static void
+cmd(uint8_t c)
 {
     gpio_set_level(EPD_DC, 0);
     tx(&c, 1);
 }
 
-static void data(const uint8_t *d, size_t n)
+static void
+data(const uint8_t *d, size_t n)
 {
     gpio_set_level(EPD_DC, 1);
     tx(d, n);
 }
 
-static void cmd1(uint8_t c, uint8_t d)
+static void
+cmd1(uint8_t c, uint8_t d)
 {
     cmd(c);
     data(&d, 1);
 }
 
 // SSD1680: BUSY high while busy, low when idle.
-// Use at least 10 ms (1 tick at CONFIG_FREERTOS_HZ=100) so polling sleeps instead of spinning.
-static bool wait_idle(const char *what, uint32_t timeout_ms)
+// Use at least 10 ms (1 tick at CONFIG_FREERTOS_HZ=100) so polling sleeps
+// instead of spinning.
+static bool
+wait_idle(const char *what, uint32_t timeout_ms)
 {
     vTaskDelay(pdMS_TO_TICKS(10)); // BUSY needs a moment to assert
     if (gpio_get_level(EPD_BUSY) == 0) {
@@ -92,7 +99,8 @@ static bool wait_idle(const char *what, uint32_t timeout_ms)
     return true;
 }
 
-static void panel_reset(void)
+static void
+panel_reset(void)
 {
     gpio_set_level(EPD_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -103,7 +111,8 @@ static void panel_reset(void)
     wait_idle("reset", 2000);
 }
 
-static void set_window(const struct ram_window *window)
+static void
+set_window(const struct ram_window *window)
 {
     cmd(0x44); // RAM X start/end (in bytes)
     data((const uint8_t[]){window->x_start, window->x_end}, 2);
@@ -114,7 +123,8 @@ static void set_window(const struct ram_window *window)
     data((const uint8_t[]){window->y_start & 0xFF, window->y_start >> 8}, 2);
 }
 
-static void write_frame(uint8_t ram, const struct ram_window *window)
+static void
+write_frame(uint8_t ram, const struct ram_window *window)
 {
     set_window(window);
     cmd(ram);
@@ -128,7 +138,8 @@ static void write_frame(uint8_t ram, const struct ram_window *window)
     }
 }
 
-static void full_lut(void)
+static void
+full_lut(void)
 {
     cmd(0x32); // waveform LUT
     data(ws_20_30, LUT_BYTES);
@@ -140,9 +151,11 @@ static void full_lut(void)
     cmd1(0x2C, ws_20_30[158]);
 }
 
-// Registers needed by both waveforms. Hardware reset does not clear the visible image,
-// but it does drop the gate-line/data-entry setup, so re-apply it every time.
-static void panel_config(bool soft_reset)
+// Registers needed by both waveforms. Hardware reset does not clear the visible
+// image, but it does drop the gate-line/data-entry setup, so re-apply it every
+// time.
+static void
+panel_config(bool soft_reset)
 {
     panel_reset();
     if (soft_reset) {
@@ -157,7 +170,8 @@ static void panel_config(bool soft_reset)
     wait_idle("config", 2000);
 }
 
-static bool refresh_full(void)
+static bool
+refresh_full(void)
 {
     panel_config(true);
     cmd1(0x3C, 0x05); // border waveform
@@ -172,7 +186,8 @@ static bool refresh_full(void)
 // At boot the glass can retain an image independently of RAM. Seed the previous
 // image with the inverse of the target so the partial LUT drives every pixel
 // toward its intended color.
-static void seed_partial_reference(void)
+static void
+seed_partial_reference(void)
 {
     uint8_t rows[ROW_BYTES * 8];
     set_window(&full_window);
@@ -186,7 +201,8 @@ static void seed_partial_reference(void)
     }
 }
 
-static bool refresh_partial(const struct ram_window *window)
+static bool
+refresh_partial(const struct ram_window *window)
 {
     panel_config(false);
     cmd1(0x3C, 0x80);
@@ -194,7 +210,8 @@ static bool refresh_partial(const struct ram_window *window)
     data(ws_partial, LUT_BYTES);
     wait_idle("partial lut", 2000);
     cmd(0x37);
-    // Disable RAM ping-pong. Both banks must keep the last image outside this window.
+    // Disable RAM ping-pong. Both banks must keep the last image outside this
+    // window.
     data((const uint8_t[10]){0}, 10);
     cmd1(0x22, 0xC0);
     cmd(0x20);
@@ -214,7 +231,8 @@ static bool refresh_partial(const struct ram_window *window)
     return true;
 }
 
-void epd_init(void)
+void
+epd_init(void)
 {
     gpio_config_t out = {
         .pin_bit_mask = (1ULL << EPD_RST) | (1ULL << EPD_DC),
@@ -250,19 +268,21 @@ void epd_init(void)
     displayed_valid = false;
 }
 
-void epd_clear(int color)
+void
+epd_clear(int color)
 {
     memset(framebuffer, color == EPD_BLACK ? 0x00 : 0xFF, sizeof(framebuffer));
 }
 
-void epd_pixel(int x, int y, int color)
+void
+epd_pixel(int x, int y, int color)
 {
     if (x < 0 || x >= PANEL_H || y < 0 || y >= EPD_H) {
         return;
     }
-    int px = EPD_H - 1 - y; // logical (x, y) -> panel RAM (px, py)
-    int py = x;
-    uint8_t m = 0x80 >> (px & 7);
+    int      px = EPD_H - 1 - y; // logical (x, y) -> panel RAM (px, py)
+    int      py = x;
+    uint8_t  m = 0x80 >> (px & 7);
     uint8_t *p = &framebuffer[py * ROW_BYTES + (px >> 3)];
     if (color == EPD_BLACK) {
         *p &= ~m;
@@ -271,28 +291,31 @@ void epd_pixel(int x, int y, int color)
     }
 }
 
-void epd_hline(int x, int y, int w, int color)
+void
+epd_hline(int x, int y, int w, int color)
 {
     for (int i = 0; i < w; i++) {
         epd_pixel(x + i, y, color);
     }
 }
 
-void epd_fill_rect(int x, int y, int w, int h, int color)
+void
+epd_fill_rect(int x, int y, int w, int h, int color)
 {
     for (int j = 0; j < h; j++) {
         epd_hline(x, y + j, w, color);
     }
 }
 
-// Glyphs are already 1bpp and grid-fitted when the font was generated, so printing is a plain bit blit.
-// Next codepoint of a UTF-8 string. Unknown/invalid bytes come back as-is and simply miss
-// the font's table.
-static uint32_t utf8_next(const char **ps)
+// Glyphs are already 1bpp and grid-fitted when the font was generated, so
+// printing is a plain bit blit. Next codepoint of a UTF-8 string.
+// Unknown/invalid bytes come back as-is and simply miss the font's table.
+static uint32_t
+utf8_next(const char **ps)
 {
     const uint8_t *s = (const uint8_t *)*ps;
-    uint32_t c = *s++;
-    int n = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+    uint32_t       c = *s++;
+    int            n = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
     c &= n == 3 ? 0x07 : n == 2 ? 0x0F : n == 1 ? 0x1F : 0x7F;
     for (int i = 0; i < n && (*s & 0xC0) == 0x80; i++) {
         c = (c << 6) | (*s++ & 0x3F);
@@ -301,7 +324,8 @@ static uint32_t utf8_next(const char **ps)
     return c;
 }
 
-static const aaglyph *glyph_of(const aafont *f, uint32_t c)
+static const aaglyph *
+glyph_of(const aafont *f, uint32_t c)
 {
     for (uint16_t i = 0; i < f->n; i++) {
         if (f->cps[i] == c) {
@@ -311,16 +335,17 @@ static const aaglyph *glyph_of(const aafont *f, uint32_t c)
     return NULL;
 }
 
-void epd_text(int x, int y_base, const aafont *f, const char *s)
+void
+epd_text(int x, int y_base, const aafont *f, const char *s)
 {
     while (*s) {
         const aaglyph *g = glyph_of(f, utf8_next(&s));
         if (!g) {
             continue;
         }
-        int gx = x + g->xoff, gy = y_base + g->yoff;
+        int            gx = x + g->xoff, gy = y_base + g->yoff;
         const uint8_t *p = f->data + g->offset;
-        int stride = (g->w + 7) / 8;
+        int            stride = (g->w + 7) / 8;
         for (int row = 0; row < g->h; row++) {
             for (int col = 0; col < g->w; col++) {
                 if (p[row * stride + (col >> 3)] & (0x80 >> (col & 7))) {
@@ -332,7 +357,8 @@ void epd_text(int x, int y_base, const aafont *f, const char *s)
     }
 }
 
-int epd_text_w(const aafont *f, const char *s)
+int
+epd_text_w(const aafont *f, const char *s)
 {
     int w = 0;
     while (*s) {
@@ -344,7 +370,8 @@ int epd_text_w(const aafont *f, const char *s)
     return w;
 }
 
-void epd_refresh(void)
+void
+epd_refresh(void)
 {
     struct ram_window window = full_window;
     if (displayed_valid) {
@@ -377,7 +404,8 @@ void epd_refresh(void)
     }
 }
 
-void epd_refresh_page_switch(void)
+void
+epd_refresh_page_switch(void)
 {
     if (++page_switches < PAGE_SWITCH_FULL_EVERY) {
         epd_refresh();

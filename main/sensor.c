@@ -19,9 +19,10 @@ _Static_assert(!SENSOR_PIN_OVERLAPS_PSRAM(SENSOR_I2C_SDA_GPIO) && !SENSOR_PIN_OV
                "Sensor I2C wiring overlaps GPIO33-37 reserved for octal PSRAM");
 #endif
 _Static_assert(SENSOR_I2C_SDA_GPIO != SENSOR_I2C_SCL_GPIO && SENSOR_I2C_SDA_GPIO != BUTTON_GPIO
-                   && SENSOR_I2C_SCL_GPIO != BUTTON_GPIO && SENSOR_I2C_SDA_GPIO != AUDIO_I2C_SDA_GPIO
-                   && SENSOR_I2C_SDA_GPIO != AUDIO_I2C_SCL_GPIO && SENSOR_I2C_SCL_GPIO != AUDIO_I2C_SDA_GPIO
-                   && SENSOR_I2C_SCL_GPIO != AUDIO_I2C_SCL_GPIO,
+                   && SENSOR_I2C_SCL_GPIO != BUTTON_GPIO && SENSOR_I2C_SDA_GPIO != VOICE_BUTTON_GPIO
+                   && SENSOR_I2C_SCL_GPIO != VOICE_BUTTON_GPIO && VOICE_BUTTON_GPIO != BUTTON_GPIO
+                   && SENSOR_I2C_SDA_GPIO != AUDIO_I2C_SDA_GPIO && SENSOR_I2C_SDA_GPIO != AUDIO_I2C_SCL_GPIO
+                   && SENSOR_I2C_SCL_GPIO != AUDIO_I2C_SDA_GPIO && SENSOR_I2C_SCL_GPIO != AUDIO_I2C_SCL_GPIO,
                "Sensor I2C pins overlap button or audio pins");
 
 #define SENSOR_I2C_PORT           I2C_NUM_1
@@ -30,29 +31,33 @@ _Static_assert(SENSOR_I2C_SDA_GPIO != SENSOR_I2C_SCL_GPIO && SENSOR_I2C_SDA_GPIO
 static const char *log_tag = "sensor";
 
 static struct {
-    bool initialized;
+    bool                    initialized;
     i2c_master_bus_handle_t bus;
-    ahtxx_handle_t aht20;
-    bmp280_handle_t bmp280;
-    char name[24];
+    ahtxx_handle_t          aht20;
+    bmp280_handle_t         bmp280;
+    char                    name[24];
 } state = {.name = "none"};
 
-static bool valid_temp(float t)
+static bool
+valid_temp(float t)
 {
     return isfinite(t) && t >= -40.0f && t <= 85.0f;
 }
 
-static bool valid_humidity(float h)
+static bool
+valid_humidity(float h)
 {
     return isfinite(h) && h >= 0.0f && h <= 100.0f;
 }
 
-static bool valid_pressure(float p)
+static bool
+valid_pressure(float p)
 {
     return isfinite(p) && p >= 300.0f && p <= 1100.0f;
 }
 
-esp_err_t sensor_init(void)
+esp_err_t
+sensor_init(void)
 {
     if (state.initialized) {
         return (state.aht20 || state.bmp280) ? ESP_OK : ESP_ERR_NOT_FOUND;
@@ -104,7 +109,8 @@ esp_err_t sensor_init(void)
     return ESP_OK;
 }
 
-bool sensor_read(sensor_reading_t *out)
+bool
+sensor_read(sensor_reading_t *out)
 {
     if (out == NULL) {
         return false;
@@ -115,12 +121,13 @@ bool sensor_read(sensor_reading_t *out)
     }
 
     float aht_t = NAN, aht_h = NAN;
-    bool aht_ok = state.aht20 && ahtxx_get_measurement(state.aht20, &aht_t, &aht_h) == ESP_OK;
+    bool  aht_ok = state.aht20 && ahtxx_get_measurement(state.aht20, &aht_t, &aht_h) == ESP_OK;
 
     float bmp_t = NAN, bmp_p_pa = NAN;
-    bool bmp_ok = false;
+    bool  bmp_ok = false;
     if (state.bmp280 && bmp280_set_power_mode(state.bmp280, BMP280_POWER_MODE_FORCED) == ESP_OK) {
-        // Wait for 1x forced conversion (~6.4 ms max) before polling status/data registers.
+        // Wait for 1x forced conversion (~6.4 ms max) before polling
+        // status/data registers.
         vTaskDelay(pdMS_TO_TICKS(SENSOR_BMP280_FORCED_WAIT));
         bmp_ok = bmp280_get_measurements(state.bmp280, &bmp_t, &bmp_p_pa) == ESP_OK;
     }
@@ -141,7 +148,8 @@ bool sensor_read(sensor_reading_t *out)
     return true;
 }
 
-const char *sensor_name(void)
+const char *
+sensor_name(void)
 {
     return state.name;
 }

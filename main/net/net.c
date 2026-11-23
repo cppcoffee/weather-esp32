@@ -15,14 +15,14 @@
 #include "nvs_flash.h"
 #include "voice.h"
 
-static const char *log_tag = "net";
+static const char        *log_tag = "net";
 static EventGroupHandle_t sta_events; // 仅 GOT_IP；配网握手由 portal_web.c 管理
 static esp_timer_handle_t reconnect_timer;
 // The default event loop owns the retry state and all connection attempts.
-static bool sta_active;
+static bool     sta_active;
 static unsigned quick_retries;
 static unsigned backoff_s;
-static int64_t reconnect_at_us;
+static int64_t  reconnect_at_us;
 #define GOT_IP        BIT0
 #define QUICK_RETRIES 2
 #define BACKOFF_MIN_S 5u
@@ -37,29 +37,33 @@ enum {
 
 static void save_channel(void);
 
-static bool sta_mode(void)
+static bool
+sta_mode(void)
 {
     wifi_mode_t mode;
     return esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_STA;
 }
 
-static void cancel_reconnect(void)
+static void
+cancel_reconnect(void)
 {
     (void)esp_timer_stop(reconnect_timer);
     reconnect_at_us = 0;
 }
 
-static void reset_reconnect(void)
+static void
+reset_reconnect(void)
 {
     cancel_reconnect();
     quick_retries = 0;
     backoff_s = BACKOFF_MIN_S;
 }
 
-static void schedule_reconnect(void)
+static void
+schedule_reconnect(void)
 {
     unsigned delay_s = backoff_s;
-    int64_t delay_us = (int64_t)delay_s * 1000000;
+    int64_t  delay_us = (int64_t)delay_s * 1000000;
     reconnect_at_us = esp_timer_get_time() + delay_us;
     esp_err_t err = esp_timer_start_once(reconnect_timer, delay_us);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -69,7 +73,8 @@ static void schedule_reconnect(void)
     ESP_LOGI(log_tag, "WiFi reconnect in %u s", delay_s);
 }
 
-static void connect_sta(void)
+static void
+connect_sta(void)
 {
     if (sta_active && sta_mode()) {
         esp_err_t err = esp_wifi_connect();
@@ -80,21 +85,25 @@ static void connect_sta(void)
     }
 }
 
-static void reconnect_due(void *arg)
+static void
+reconnect_due(void *arg)
 {
     (void)arg;
-    // Don't lose a retry to a temporarily full event queue or block other esp_timer callbacks.
+    // Don't lose a retry to a temporarily full event queue or block other
+    // esp_timer callbacks.
     if (esp_event_post(NET_EVENTS, RECONNECT_DUE, NULL, 0, 0) != ESP_OK) {
         (void)esp_timer_start_once(reconnect_timer, 100000);
     }
 }
 
-void net_request_reconnect(void)
+void
+net_request_reconnect(void)
 {
     (void)esp_event_post(NET_EVENTS, RECONNECT_REQUEST, NULL, 0, 0);
 }
 
-static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+static void
+on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     (void)data;
@@ -139,7 +148,8 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
 }
 
-void net_init(void)
+void
+net_init(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
@@ -157,7 +167,8 @@ void net_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, NULL, NULL));
 }
 
-void net_forget_creds(void)
+void
+net_forget_creds(void)
 {
     nvs_handle_t h;
     if (nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) {
@@ -178,14 +189,15 @@ void net_forget_creds(void)
     ESP_LOGW(log_tag, "stored credentials erased");
 }
 
-static bool load_creds(char *ssid, size_t ssid_len, char *pass, size_t pass_len, uint8_t *channel)
+static bool
+load_creds(char *ssid, size_t ssid_len, char *pass, size_t pass_len, uint8_t *channel)
 {
     nvs_handle_t h;
     if (nvs_open("wifi", NVS_READONLY, &h) != ESP_OK) {
         return false;
     }
     size_t sl = ssid_len, pl = pass_len;
-    bool ok = nvs_get_str(h, "ssid", ssid, &sl) == ESP_OK && sl > 1 && nvs_get_str(h, "pass", pass, &pl) == ESP_OK;
+    bool   ok = nvs_get_str(h, "ssid", ssid, &sl) == ESP_OK && sl > 1 && nvs_get_str(h, "pass", pass, &pl) == ESP_OK;
     if (ok && channel) {
         uint8_t saved = 0;
         if (nvs_get_u8(h, "channel", &saved) == ESP_OK && saved <= 14) {
@@ -196,15 +208,16 @@ static bool load_creds(char *ssid, size_t ssid_len, char *pass, size_t pass_len,
     return ok;
 }
 
-static void save_channel(void)
+static void
+save_channel(void)
 {
     wifi_ap_record_t ap;
-    nvs_handle_t h;
+    nvs_handle_t     h;
     if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK || ap.primary == 0 || nvs_open("wifi", NVS_READWRITE, &h) != ESP_OK) {
         return;
     }
-    char ssid[33];
-    size_t len = sizeof(ssid);
+    char    ssid[33];
+    size_t  len = sizeof(ssid);
     uint8_t channel = 0;
     (void)nvs_get_u8(h, "channel", &channel);
     if (channel != ap.primary && nvs_get_str(h, "ssid", ssid, &len) == ESP_OK
@@ -215,9 +228,10 @@ static void save_channel(void)
     nvs_close(h);
 }
 
-bool net_try_stored(int timeout_ms)
+bool
+net_try_stored(int timeout_ms)
 {
-    char ssid[33] = {0}, pass[65] = {0};
+    char    ssid[33] = {0}, pass[65] = {0};
     uint8_t channel = 0;
     if (!load_creds(ssid, sizeof(ssid), pass, sizeof(pass), &channel)) {
         ESP_LOGW(log_tag, "no stored credentials");
@@ -243,18 +257,21 @@ bool net_try_stored(int timeout_ms)
     return false;
 }
 
-bool net_has_stored(void)
+bool
+net_has_stored(void)
 {
     char ssid[33], pass[65];
     return load_creds(ssid, sizeof(ssid), pass, sizeof(pass), NULL);
 }
 
-bool net_has_ip(void)
+bool
+net_has_ip(void)
 {
     return sta_events && (xEventGroupGetBits(sta_events) & GOT_IP);
 }
 
-void net_set_wifi_low_latency(bool enable)
+void
+net_set_wifi_low_latency(bool enable)
 {
     if (!sta_mode()) {
         return;
@@ -265,7 +282,8 @@ void net_set_wifi_low_latency(bool enable)
     }
 }
 
-void net_get_status(net_status_t *out)
+void
+net_get_status(net_status_t *out)
 {
     if (!out) {
         return;

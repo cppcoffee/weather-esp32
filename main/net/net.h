@@ -15,7 +15,7 @@ void net_set_wifi_low_latency(bool enable); // 语音通话期关闭 Wi-Fi 省�
 typedef struct {
     bool connected;
     char ssid[33];
-    int rssi;
+    int  rssi;
 } net_status_t;
 
 void net_get_status(net_status_t *out); // 读取当前 Wi-Fi 连接状态、SSID 与 RSSI

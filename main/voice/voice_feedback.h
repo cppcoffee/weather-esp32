@@ -22,15 +22,17 @@ typedef enum {
 
 typedef struct {
     voice_state_t state;
-    char activation_code[VOICE_ACTIVATION_CODE_MAX + 1];
+    char          activation_code[VOICE_ACTIVATION_CODE_MAX + 1];
 } voice_feedback_t;
 
 // Copies the code before returning. Activation requires 1..16 printable ASCII
-// characters without spaces; other states require NULL. Invalid input changes nothing.
-// A pending code survives connection retries/outages/errors until another state replaces it.
-bool voice_feedback_publish(voice_state_t state, const char *activation_code);
+// characters without spaces; other states require NULL. Invalid input changes
+// nothing. A pending code survives connection retries/outages/errors until
+// another state replaces it.
+bool             voice_feedback_publish(voice_state_t state, const char *activation_code);
 voice_feedback_t voice_feedback_get(void);
-// Optional callback invoked outside the critical section when the published snapshot changes.
+// Optional callback invoked outside the critical section when the published
+// snapshot changes.
 void voice_feedback_set_observer(void (*observer)(void));
 
 #endif

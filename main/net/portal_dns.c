@@ -10,7 +10,8 @@
 
 static dns_server_handle_t dns_server;
 
-void portal_dns_start(void)
+void
+portal_dns_start(void)
 {
     if (!dns_server) {
         static dns_server_config_t config = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
@@ -18,7 +19,8 @@ void portal_dns_start(void)
     }
 }
 
-void portal_dns_stop(void)
+void
+portal_dns_stop(void)
 {
     if (dns_server) {
         stop_dns_server(dns_server);

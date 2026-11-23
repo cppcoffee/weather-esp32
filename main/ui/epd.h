@@ -1,6 +1,6 @@
-// 2.9" e-paper, SSD1680. Panel RAM is 128x296 portrait; drawing uses landscape coords.
-// EPD_W stays 300 for the existing layout, but only x 0..295 exist on the glass; the
-// last four logical columns are clipped in epd_pixel().
+// 2.9" e-paper, SSD1680. Panel RAM is 128x296 portrait; drawing uses landscape
+// coords. EPD_W stays 300 for the existing layout, but only x 0..295 exist on
+// the glass; the last four logical columns are clipped in epd_pixel().
 #ifndef __EPD_H__
 #define __EPD_H__
 
@@ -31,11 +31,13 @@ void epd_pixel(int x, int y, int color);
 void epd_hline(int x, int y, int w, int color);
 
 void epd_fill_rect(int x, int y, int w, int h, int color);
-void epd_text(int x, int y_baseline, const aafont *f, const char *s); // y = baseline
-int epd_text_w(const aafont *f, const char *s);
+void epd_text(int x, int y_baseline, const aafont *f,
+              const char *s); // y = baseline
+int  epd_text_w(const aafont *f, const char *s);
 // Update the changed region with the partial waveform.
 void epd_refresh(void);
-// Only page switches advance the cadence. Every eighth switch uses the full waveform.
+// Only page switches advance the cadence. Every eighth switch uses the full
+// waveform.
 void epd_refresh_page_switch(void);
 
 #endif

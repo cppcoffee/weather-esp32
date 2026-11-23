@@ -7,18 +7,20 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
-static bool blocked_ipv4(uint32_t address)
+static bool
+blocked_ipv4(uint32_t address)
 {
     address = ntohl(address);
     return address == 0 || (address >> 24) == 127;
 }
 
-static bool allowed_host(const char *url, const struct http_parser_url *parsed)
+static bool
+allowed_host(const char *url, const struct http_parser_url *parsed)
 {
     size_t offset = parsed->field_data[UF_HOST].off;
     size_t length = parsed->field_data[UF_HOST].len;
-    bool ipv6_literal = offset > 0 && url[offset - 1] == '[';
-    char host[VOICE_URL_CAP];
+    bool   ipv6_literal = offset > 0 && url[offset - 1] == '[';
+    char   host[VOICE_URL_CAP];
     memcpy(host, url + offset, length);
     host[length] = '\0';
 
@@ -35,7 +37,8 @@ static bool allowed_host(const char *url, const struct http_parser_url *parsed)
 
     struct in_addr ipv4;
     if (!ipv6_literal && inet_aton(host, &ipv4) == 1) {
-        // Reject non-canonical IPv4 spellings (octal, hex, short or integer forms).
+        // Reject non-canonical IPv4 spellings (octal, hex, short or integer
+        // forms).
         char canonical[INET_ADDRSTRLEN];
         if (!inet_ntop(AF_INET, &ipv4, canonical, sizeof(canonical)) || strcmp(host, canonical) != 0) {
             return false;
@@ -46,7 +49,7 @@ static bool allowed_host(const char *url, const struct http_parser_url *parsed)
         static const uint8_t zero[16] = {0};
         static const uint8_t loopback[16] = {[15] = 1};
         static const uint8_t v4_mapped_prefix[12] = {[10] = 0xff, [11] = 0xff};
-        struct in6_addr ipv6;
+        struct in6_addr      ipv6;
         if (inet_pton(AF_INET6, host, &ipv6) != 1 || memcmp(&ipv6, zero, sizeof(zero)) == 0
             || memcmp(&ipv6, loopback, sizeof(loopback)) == 0)
         {
@@ -61,15 +64,17 @@ static bool allowed_host(const char *url, const struct http_parser_url *parsed)
     return true;
 }
 
-static bool field_equals(const char *url, const struct http_parser_url *parsed, enum http_parser_url_fields field,
-                         const char *expected)
+static bool
+field_equals(const char *url, const struct http_parser_url *parsed, enum http_parser_url_fields field,
+             const char *expected)
 {
     size_t length = strlen(expected);
     return parsed->field_data[field].len == length
            && memcmp(url + parsed->field_data[field].off, expected, length) == 0;
 }
 
-static bool valid_url(const char *url)
+static bool
+valid_url(const char *url)
 {
     size_t length = strlen(url);
     for (size_t i = 0; i < length; ++i) {
@@ -98,7 +103,8 @@ static bool valid_url(const char *url)
     return allowed_host(url, &parsed);
 }
 
-esp_err_t voice_settings_validate(const voice_settings_t *settings)
+esp_err_t
+voice_settings_validate(const voice_settings_t *settings)
 {
     if (!settings || settings->followup > 1 || !memchr(settings->info_url, '\0', VOICE_URL_CAP)) {
         return ESP_ERR_INVALID_ARG;
@@ -110,19 +116,21 @@ esp_err_t voice_settings_validate(const voice_settings_t *settings)
 }
 
 // Keep the legacy settings field enabled for compatibility with older firmware.
-static void voice_settings_defaults(voice_settings_t *settings)
+static void
+voice_settings_defaults(voice_settings_t *settings)
 {
     memset(settings, 0, sizeof(*settings));
     settings->followup = 1;
 }
 
-esp_err_t voice_settings_load(voice_settings_t *settings)
+esp_err_t
+voice_settings_load(voice_settings_t *settings)
 {
     if (!settings) {
         return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(VOICE_SETTINGS_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t    err = nvs_open(VOICE_SETTINGS_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         voice_settings_defaults(settings);
         return ESP_OK;
@@ -132,7 +140,7 @@ esp_err_t voice_settings_load(voice_settings_t *settings)
     }
 
     voice_settings_t loaded = {0};
-    size_t length = sizeof(loaded);
+    size_t           length = sizeof(loaded);
     err = nvs_get_blob(handle, VOICE_SETTINGS_KEY, &loaded, &length);
     nvs_close(handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
@@ -142,7 +150,8 @@ esp_err_t voice_settings_load(voice_settings_t *settings)
     if (err != ESP_OK) {
         return err;
     }
-    // The previous blob contained just the URL; keep follow-up on for those devices too.
+    // The previous blob contained just the URL; keep follow-up on for those
+    // devices too.
     if (length == sizeof(loaded.info_url)) {
         loaded.followup = 1;
     } else if (length != sizeof(loaded)) {
@@ -155,7 +164,8 @@ esp_err_t voice_settings_load(voice_settings_t *settings)
     return err;
 }
 
-esp_err_t voice_settings_store(nvs_handle_t handle, const voice_settings_t *settings)
+esp_err_t
+voice_settings_store(nvs_handle_t handle, const voice_settings_t *settings)
 {
     esp_err_t err = voice_settings_validate(settings);
     if (err != ESP_OK) {

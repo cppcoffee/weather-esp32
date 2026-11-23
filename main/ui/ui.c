@@ -15,8 +15,9 @@
 #define COL_W  52
 #define GRID_X ((PANEL_H - WEATHER_DAYS * COL_W) / 2)
 
-// Row anchors shared by both pages. DATE_BASE leaves the 16px CJK date clear of the
-// header rule at y=22; the icons start below the date and end above the temperature.
+// Row anchors shared by both pages. DATE_BASE leaves the 16px CJK date clear of
+// the header rule at y=22; the icons start below the date and end above the
+// temperature.
 #define DATE_BASE   42
 #define ICON_TOP    46
 #define TEMP_BASE   89
@@ -33,7 +34,7 @@ static struct {
     char text[6];
     bool visible;
     bool local_time;
-    int utc_offset;
+    int  utc_offset;
 } clock_display;
 
 static struct {
@@ -45,9 +46,9 @@ static struct {
 
 static struct {
     voice_feedback_t voice;
-    bool voice_known;
-    ui_status_t application;
-    unsigned attempt;
+    bool             voice_known;
+    ui_status_t      application;
+    unsigned         attempt;
 } status_display;
 
 static struct {
@@ -58,19 +59,19 @@ static struct {
 } weather_header;
 
 static struct {
-    bool daily_page;
-    char first_date[11];
-    bool first_is_today;
-    bool stale;
-    bool stamp_set;
+    bool             daily_page;
+    char             first_date[11];
+    bool             first_is_today;
+    bool             stale;
+    bool             stamp_set;
     forecast_stamp_t stamp;
 } forecast_display;
 
 static struct {
     weather_hour_t cache[WEATHER_HOURS];
-    bool available;
-    bool discontinuous;
-    int start;
+    bool           available;
+    bool           discontinuous;
+    int            start;
 } hourly_display;
 
 static bool date_label(const char date[11], char label[6]);
@@ -79,7 +80,8 @@ static void draw_hourly_cells(void);
 
 _Static_assert(WEATHER_HOURS >= HOUR_COLS, "hourly strip needs 10 hours");
 
-static void text_center(int cx, int y_base, const aafont *f, const char *s)
+static void
+text_center(int cx, int y_base, const aafont *f, const char *s)
 {
     epd_text(cx - epd_text_w(f, s) / 2, y_base, f, s);
 }
@@ -99,7 +101,8 @@ enum weather_icon {
     ICON_HAIL,
 };
 
-static enum weather_icon icon_for_code(int code)
+static enum weather_icon
+icon_for_code(int code)
 {
     // WMO ranges have gaps: undefined codes must stay unknown.
     switch (code) {
@@ -147,12 +150,14 @@ static enum weather_icon icon_for_code(int code)
     }
 }
 
-static int rounded_probability(float value)
+static int
+rounded_probability(float value)
 {
     return isfinite(value) && value >= 0 && value <= 100 ? (int)roundf(value) : -1;
 }
 
-static const char *today_hint(const weather_t *w)
+static const char *
+today_hint(const weather_t *w)
 {
     if (!w || !w->ok) {
         return "预报待更新";
@@ -174,9 +179,10 @@ static const char *today_hint(const weather_t *w)
     }
 }
 
-static void draw_city(const char *city)
+static void
+draw_city(const char *city)
 {
-    char label[sizeof(weather_header.city) + 4];
+    char   label[sizeof(weather_header.city) + 4];
     size_t length = strnlen(city, sizeof(weather_header.city));
     memcpy(label, city, length);
     label[length] = '\0';
@@ -193,7 +199,8 @@ static void draw_city(const char *city)
     epd_text(8, 16, &font_mid, label);
 }
 
-static bool format_number(char *buf, size_t size, float value, int decimals)
+static bool
+format_number(char *buf, size_t size, float value, int decimals)
 {
     if (!isfinite(value)) {
         return false;
@@ -202,7 +209,8 @@ static bool format_number(char *buf, size_t size, float value, int decimals)
     return n >= 0 && (size_t)n < size;
 }
 
-// Compact footer sensor slots (font_mid, baseline 124), strictly clear of STATUS_LEFT (200).
+// Compact footer sensor slots (font_mid, baseline 124), strictly clear of
+// STATUS_LEFT (200).
 #define SENSOR_TEMP_X     8
 #define SENSOR_TEMP_W     56
 #define SENSOR_HUMIDITY_X 68
@@ -210,11 +218,12 @@ static bool format_number(char *buf, size_t size, float value, int decimals)
 #define SENSOR_PRESSURE_X 124
 #define SENSOR_PRESSURE_W 72
 
-static void format_sensor_field(char *out, size_t cap, int max_width, float value, bool valid, int decimals,
-                                const char *unit, const char *unknown)
+static void
+format_sensor_field(char *out, size_t cap, int max_width, float value, bool valid, int decimals, const char *unit,
+                    const char *unknown)
 {
-    char buf[48];
-    int n = valid && isfinite(value) ? snprintf(buf, sizeof(buf), "%.*f%s", decimals, (double)value, unit) : -1;
+    char        buf[48];
+    int         n = valid && isfinite(value) ? snprintf(buf, sizeof(buf), "%.*f%s", decimals, (double)value, unit) : -1;
     const char *text =
         n >= 0 && (size_t)n < cap && (size_t)n < sizeof(buf) && epd_text_w(&font_mid, buf) <= max_width ? buf : unknown;
     size_t len = strnlen(text, cap - 1);
@@ -222,7 +231,8 @@ static void format_sensor_field(char *out, size_t cap, int max_width, float valu
     out[len] = '\0';
 }
 
-static void format_sensor_fields(const sensor_reading_t *sensor, char temp[24], char humidity[16], char pressure[24])
+static void
+format_sensor_fields(const sensor_reading_t *sensor, char temp[24], char humidity[16], char pressure[24])
 {
     bool valid = sensor && sensor->valid;
     format_sensor_field(temp, 24, SENSOR_TEMP_W, valid ? sensor->temperature_c : NAN, valid, 1, "°C", "--.-°C");
@@ -236,7 +246,8 @@ static void format_sensor_fields(const sensor_reading_t *sensor, char temp[24], 
                         pressure_valid, 1, "kPa", "---.-kPa");
 }
 
-static void draw_sensor(const sensor_reading_t *sensor)
+static void
+draw_sensor(const sensor_reading_t *sensor)
 {
     format_sensor_fields(sensor, sensor_display.temp, sensor_display.humidity, sensor_display.pressure);
     sensor_display.drawn = true;
@@ -250,7 +261,8 @@ static void draw_sensor(const sensor_reading_t *sensor)
 #define STATUS_RIGHT (PANEL_H - 6)
 #define STATUS_MAX_W (STATUS_RIGHT - STATUS_LEFT)
 
-bool ui_update_sensor(const sensor_reading_t *sensor)
+bool
+ui_update_sensor(const sensor_reading_t *sensor)
 {
     char temp[24], humidity[16], pressure[24];
     format_sensor_fields(sensor, temp, humidity, pressure);
@@ -267,7 +279,8 @@ bool ui_update_sensor(const sensor_reading_t *sensor)
     return true;
 }
 
-static const char *status_text(ui_status_t status, unsigned attempt, char *buf, size_t size)
+static const char *
+status_text(ui_status_t status, unsigned attempt, char *buf, size_t size)
 {
     switch (status) {
     case UI_STATUS_CONNECTING:
@@ -286,7 +299,8 @@ static const char *status_text(ui_status_t status, unsigned attempt, char *buf, 
     }
 }
 
-static const char *selected_status(char *buf, size_t size)
+static const char *
+selected_status(char *buf, size_t size)
 {
     if (status_display.voice_known) {
         switch (status_display.voice.state) {
@@ -333,9 +347,10 @@ static const char *selected_status(char *buf, size_t size)
     return status_text(status_display.application, status_display.attempt, buf, size);
 }
 
-static void draw_status(void)
+static void
+draw_status(void)
 {
-    char buf[24];
+    char        buf[24];
     const char *text = selected_status(buf, sizeof(buf));
     epd_fill_rect(STATUS_LEFT, 110, PANEL_H - STATUS_LEFT, EPD_H - 110, EPD_WHITE);
     int width = epd_text_w(&font_mid, text);
@@ -344,14 +359,16 @@ static void draw_status(void)
     }
 }
 
-void ui_draw_status(ui_status_t status, unsigned attempt)
+void
+ui_draw_status(ui_status_t status, unsigned attempt)
 {
     status_display.application = status;
     status_display.attempt = attempt;
     draw_status();
 }
 
-bool ui_update_status(ui_status_t status, unsigned attempt)
+bool
+ui_update_status(ui_status_t status, unsigned attempt)
 {
     char old_status[24], buf[24];
     snprintf(old_status, sizeof(old_status), "%s", selected_status(buf, sizeof(buf)));
@@ -367,12 +384,14 @@ bool ui_update_status(ui_status_t status, unsigned attempt)
     return true;
 }
 
-static bool clock_is_known(time_t now)
+static bool
+clock_is_known(time_t now)
 {
     return now >= NET_MIN_SYNCED_EPOCH && net_time_is_synced();
 }
 
-static bool local_time_tm(time_t now, struct tm *tm)
+static bool
+local_time_tm(time_t now, struct tm *tm)
 {
 #ifdef ESP_PLATFORM
     time_t local = now + clock_display.utc_offset;
@@ -382,9 +401,10 @@ static bool local_time_tm(time_t now, struct tm *tm)
 #endif
 }
 
-static bool render_clock(time_t now)
+static bool
+render_clock(time_t now)
 {
-    char buf[sizeof(clock_display.text)] = "--:--";
+    char      buf[sizeof(clock_display.text)] = "--:--";
     struct tm tm;
     if (clock_display.local_time && clock_is_known(now)) {
         if (!local_time_tm(now, &tm) || strftime(buf, sizeof(buf), "%H:%M", &tm) == 0) {
@@ -400,13 +420,14 @@ static bool render_clock(time_t now)
     return true;
 }
 
-static void update_forecast_date(time_t now)
+static void
+update_forecast_date(time_t now)
 {
     forecast_display.first_is_today = false;
     forecast_display.stale =
         forecast_display.stamp_set && forecast_is_stale(forecast_display.stamp, esp_timer_get_time());
     struct tm local;
-    char today[11];
+    char      today[11];
     if (clock_display.local_time && forecast_display.first_date[0] && clock_is_known(now) && local_time_tm(now, &local)
         && strftime(today, sizeof(today), "%Y-%m-%d", &local) > 0)
     {
@@ -416,7 +437,8 @@ static void update_forecast_date(time_t now)
     }
 }
 
-static void render_header(void)
+static void
+render_header(void)
 {
     epd_fill_rect(0, 0, EPD_W, 22, EPD_WHITE);
     if (status_display.voice_known && status_display.voice.state == VOICE_STATE_ACTIVATION) {
@@ -440,7 +462,8 @@ static void render_header(void)
     (void)render_clock(time(NULL));
 }
 
-static void draw_header(const weather_t *w, const char *label)
+static void
+draw_header(const weather_t *w, const char *label)
 {
     const char *city = w && w->ok ? w->city : "无数据";
     snprintf(weather_header.city, sizeof(weather_header.city), "%.*s", (int)sizeof(weather_header.city) - 1, city);
@@ -461,7 +484,8 @@ static void draw_header(const weather_t *w, const char *label)
     epd_hline(6, 22, EPD_W - 12, EPD_BLACK);
 }
 
-void ui_set_forecast_stamp(const forecast_stamp_t *stamp)
+void
+ui_set_forecast_stamp(const forecast_stamp_t *stamp)
 {
     forecast_display.stamp_set = stamp != NULL;
     if (forecast_display.stamp_set) {
@@ -469,12 +493,14 @@ void ui_set_forecast_stamp(const forecast_stamp_t *stamp)
     }
 }
 
-static int date_key(const struct tm *local)
+static int
+date_key(const struct tm *local)
 {
     return (local->tm_year + 1900) * 10000 + (local->tm_mon + 1) * 100 + local->tm_mday;
 }
 
-static int select_hourly_start(time_t now)
+static int
+select_hourly_start(time_t now)
 {
     struct tm local;
     if (!hourly_display.available || !clock_display.local_time || !clock_is_known(now)
@@ -482,7 +508,7 @@ static int select_hourly_start(time_t now)
     {
         return 0;
     }
-    int date = date_key(&local);
+    int     date = date_key(&local);
     int64_t current = (int64_t)date * 24 + local.tm_hour;
     // Keep repeated or skipped DST hours in API order when the fetch timestamp
     // anchors the first row. The device only has the last reported UTC offset.
@@ -505,14 +531,15 @@ static int select_hourly_start(time_t now)
     return WEATHER_HOURS;
 }
 
-bool ui_update_clock(void)
+bool
+ui_update_clock(void)
 {
     if (!clock_display.visible) {
         return false;
     }
     time_t now = time(NULL);
-    bool was_today = forecast_display.first_is_today;
-    bool was_stale = forecast_display.stale;
+    bool   was_today = forecast_display.first_is_today;
+    bool   was_stale = forecast_display.stale;
     update_forecast_date(now);
     bool date_changed = forecast_display.daily_page && was_today != forecast_display.first_is_today;
     bool hours_changed = false;
@@ -540,7 +567,8 @@ bool ui_update_clock(void)
     return render_clock(now) || date_changed || hours_changed;
 }
 
-bool ui_update_voice(const voice_feedback_t *feedback)
+bool
+ui_update_voice(const voice_feedback_t *feedback)
 {
     if (feedback == NULL) {
         return false;
@@ -568,7 +596,8 @@ bool ui_update_voice(const voice_feedback_t *feedback)
 }
 
 // The generated glyph metrics center visible ink within each fixed icon cell.
-static void draw_icon(int cx, int code, const aafont *font)
+static void
+draw_icon(int cx, int code, const aafont *font)
 {
     static const char *const glyphs[] = {
         [ICON_SUN] = WI_SUN,
@@ -592,7 +621,8 @@ static void draw_icon(int cx, int code, const aafont *font)
     text_center(cx, ICON_TOP + font->line_height, font, glyphs[icon]);
 }
 
-static bool date_label(const char date[11], char label[6])
+static bool
+date_label(const char date[11], char label[6])
 {
     if (date[4] != '-' || date[7] != '-' || date[10] != '\0') {
         return false;
@@ -611,23 +641,26 @@ static bool date_label(const char date[11], char label[6])
     return true;
 }
 
-static void draw_first_date(void)
+static void
+draw_first_date(void)
 {
-    char date[6];
+    char        date[6];
     const char *label = date_label(forecast_display.first_date, date) ? date : "--/--";
     text_center(GRID_X + COL_W / 2, DATE_BASE, forecast_display.first_is_today ? &font_mid : &font_small,
                 forecast_display.first_is_today ? "今天" : label);
 }
 
-static void forecast_range(int cx, const weather_day_t *day)
+static void
+forecast_range(int cx, const weather_day_t *day)
 {
-    char low[48], high[48], buf[100];
+    char        low[48], high[48], buf[100];
     const char *text = "--";
     if (day && day->tmin <= day->tmax && format_number(low, sizeof(low), day->tmin, 0)
         && format_number(high, sizeof(high), day->tmax, 0))
     {
-        // "12°-25°" is 53px at 16px and does not fit the 48px cap, but 47px at 14px: the
-        // range row uses font_temp so both values keep their degree sign and the dash.
+        // "12°-25°" is 53px at 16px and does not fit the 48px cap, but 47px at
+        // 14px: the range row uses font_temp so both values keep their degree
+        // sign and the dash.
         snprintf(buf, sizeof(buf), "%s°-%s°", low, high);
         text = buf;
     }
@@ -642,7 +675,8 @@ static void forecast_range(int cx, const weather_day_t *day)
     text_center(cx, TEMP_BASE, font, text);
 }
 
-void ui_draw_weather(const weather_t *w, const sensor_reading_t *sensor)
+void
+ui_draw_weather(const weather_t *w, const sensor_reading_t *sensor)
 {
     char buf[32];
     bool have_weather = w && w->ok;
@@ -653,7 +687,7 @@ void ui_draw_weather(const weather_t *w, const sensor_reading_t *sensor)
     draw_first_date();
 
     for (int i = 0; i < WEATHER_DAYS; i++) {
-        int cx = GRID_X + COL_W / 2 + i * COL_W;
+        int  cx = GRID_X + COL_W / 2 + i * COL_W;
         char date[6];
         if (i > 0) {
             bool known_date = have_weather && date_label(w->days[i].date, date);
@@ -671,11 +705,12 @@ void ui_draw_weather(const weather_t *w, const sensor_reading_t *sensor)
     draw_sensor(sensor);
 }
 
-static void draw_hourly_cells(void)
+static void
+draw_hourly_cells(void)
 {
     char buf[32];
     for (int i = 0; i < HOUR_COLS; i++) {
-        int index = hourly_display.start + i;
+        int                   index = hourly_display.start + i;
         const weather_hour_t *hour =
             hourly_display.available && index < WEATHER_HOURS ? &hourly_display.cache[index] : NULL;
         int cx = HOUR_GRID_X + HOUR_COL_W / 2 + i * HOUR_COL_W;
@@ -687,12 +722,13 @@ static void draw_hourly_cells(void)
         text_center(cx, DATE_BASE, &font_small, buf);
         draw_icon(cx, hour ? hour->code : -1, &font_icon);
 
-        char temp[sizeof buf];
-        const char *text = "--";
+        char          temp[sizeof buf];
+        const char   *text = "--";
         const aafont *font = &font_temp;
         if (hour && format_number(temp, sizeof(temp), hour->temperature_c, 0)) {
-            // Append the degree sign in place: a plain snprintf("%s°") makes the compiler
-            // prove a truncation that cannot happen with a rounded integer.
+            // Append the degree sign in place: a plain snprintf("%s°") makes
+            // the compiler prove a truncation that cannot happen with a rounded
+            // integer.
             size_t digits = strlen(temp);
             if (digits + sizeof("°") <= sizeof(temp)) {
                 memcpy(temp + digits, "°", sizeof("°"));
@@ -711,7 +747,8 @@ static void draw_hourly_cells(void)
         int probability = hour ? rounded_probability(hour->precip_probability) : -1;
         if (probability >= 0) {
             snprintf(buf, sizeof(buf), "%d%%", probability);
-            // 100% is wider than a 26px column; drop the sign rather than overlap.
+            // 100% is wider than a 26px column; drop the sign rather than
+            // overlap.
             if (epd_text_w(&font_small, buf) > HOUR_COL_W - 2) {
                 snprintf(buf, sizeof(buf), "%d", probability);
             }
@@ -720,7 +757,8 @@ static void draw_hourly_cells(void)
     }
 }
 
-void ui_draw_hourly(const weather_t *w, const sensor_reading_t *sensor)
+void
+ui_draw_hourly(const weather_t *w, const sensor_reading_t *sensor)
 {
     epd_clear(EPD_WHITE);
     forecast_display.daily_page = false;
@@ -744,7 +782,8 @@ void ui_draw_hourly(const weather_t *w, const sensor_reading_t *sensor)
     draw_sensor(sensor);
 }
 
-void ui_draw_retry(unsigned attempt, unsigned retry_seconds)
+void
+ui_draw_retry(unsigned attempt, unsigned retry_seconds)
 {
     snprintf(weather_header.retry_title, sizeof(weather_header.retry_title), "无网络 %us后重试 #%u", retry_seconds,
              attempt);
@@ -759,14 +798,16 @@ void ui_draw_retry(unsigned attempt, unsigned retry_seconds)
     render_header();
 }
 
-void ui_draw_resetting(void)
+void
+ui_draw_resetting(void)
 {
     clock_display.visible = false;
     epd_clear(EPD_WHITE);
     text_center(PANEL_H / 2, PANEL_W / 2 + 6, &font_mid, "WiFi 重置中");
 }
 
-void ui_draw_portal_hint(void)
+void
+ui_draw_portal_hint(void)
 {
     clock_display.visible = false;
     epd_clear(EPD_WHITE);

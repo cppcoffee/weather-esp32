@@ -1,4 +1,5 @@
-// Generated from Roboto Variable Bold with PIL; 1bpp glyphs, FreeType mono rasterizer.
+// Generated from Roboto Variable Bold with PIL; 1bpp glyphs, FreeType mono
+// rasterizer.
 #include "fonts_aa.h"
 
 static const uint8_t font_clock_data[] = {

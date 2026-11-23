@@ -23,37 +23,38 @@
 
 struct pressure_point {
     int64_t uptime_us;
-    float pressure_hpa;
+    float   pressure_hpa;
 };
 
 struct sensor_snapshot {
     sensor_reading_t reading;
-    time_t sampled_at;
-    int64_t sampled_uptime_us;
+    time_t           sampled_at;
+    int64_t          sampled_uptime_us;
 };
 
 struct device_snapshot {
-    weather_t weather;
+    weather_t              weather;
     struct sensor_snapshot sensor;
-    forecast_stamp_t stamp;
-    char sensor_model[32];
-    char display_page[16];
-    struct pressure_point pressure_history[PRESSURE_HISTORY_CAP];
-    size_t pressure_count;
-    size_t pressure_head;
+    forecast_stamp_t       stamp;
+    char                   sensor_model[32];
+    char                   display_page[16];
+    struct pressure_point  pressure_history[PRESSURE_HISTORY_CAP];
+    size_t                 pressure_count;
+    size_t                 pressure_head;
 };
 
 struct device_tool_spec {
-    const char *name;
-    const char *description;
+    const char                *name;
+    const char                *description;
     esp_mcp_tool_callback_ex_t callback;
-    bool volume_arg;
+    bool                       volume_arg;
 };
 
 static struct device_snapshot published_snapshot;
-static portMUX_TYPE snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE           snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 
-forecast_stamp_t device_mcp_publish_forecast(const weather_t *weather, const forecast_stamp_t *fetched, bool retrying)
+forecast_stamp_t
+device_mcp_publish_forecast(const weather_t *weather, const forecast_stamp_t *fetched, bool retrying)
 {
     portENTER_CRITICAL(&snapshot_lock);
     if (fetched && weather && weather->ok) {
@@ -69,10 +70,11 @@ forecast_stamp_t device_mcp_publish_forecast(const weather_t *weather, const for
     return stamp;
 }
 
-void device_mcp_publish_sensor(const sensor_reading_t *sensor)
+void
+device_mcp_publish_sensor(const sensor_reading_t *sensor)
 {
     struct sensor_snapshot sample = {0};
-    int64_t now_us = esp_timer_get_time();
+    int64_t                now_us = esp_timer_get_time();
     if (sensor) {
         sample.reading = *sensor;
         if (sensor->valid) {
@@ -106,7 +108,8 @@ void device_mcp_publish_sensor(const sensor_reading_t *sensor)
     portEXIT_CRITICAL(&snapshot_lock);
 }
 
-void device_mcp_set_sensor_model(const char *model)
+void
+device_mcp_set_sensor_model(const char *model)
 {
     portENTER_CRITICAL(&snapshot_lock);
     snprintf(published_snapshot.sensor_model, sizeof(published_snapshot.sensor_model), "%s",
@@ -114,7 +117,8 @@ void device_mcp_set_sensor_model(const char *model)
     portEXIT_CRITICAL(&snapshot_lock);
 }
 
-void device_mcp_publish_display_page(const char *page)
+void
+device_mcp_publish_display_page(const char *page)
 {
     portENTER_CRITICAL(&snapshot_lock);
     snprintf(published_snapshot.display_page, sizeof(published_snapshot.display_page), "%s",
@@ -122,7 +126,8 @@ void device_mcp_publish_display_page(const char *page)
     portEXIT_CRITICAL(&snapshot_lock);
 }
 
-static struct device_snapshot snapshot(void)
+static struct device_snapshot
+snapshot(void)
 {
     struct device_snapshot copy;
     // Never allocate JSON or wait for network/audio while holding this lock.
@@ -132,7 +137,8 @@ static struct device_snapshot snapshot(void)
     return copy;
 }
 
-static esp_err_t send_json(esp_mcp_tool_result_t *result, cJSON *json, bool complete)
+static esp_err_t
+send_json(esp_mcp_tool_result_t *result, cJSON *json, bool complete)
 {
     char *text = complete ? cJSON_PrintUnformatted(json) : NULL;
     cJSON_Delete(json);
@@ -144,21 +150,23 @@ static esp_err_t send_json(esp_mcp_tool_result_t *result, cJSON *json, bool comp
     return err;
 }
 
-static bool timezone_known(const weather_t *weather)
+static bool
+timezone_known(const weather_t *weather)
 {
     int offset = weather->utc_offset;
     return (weather->ok || weather->tz_known) && offset >= -14 * 3600 && offset <= 14 * 3600 && offset % 60 == 0;
 }
 
-static bool format_local_time(char iso[40], time_t timestamp, int offset)
+static bool
+format_local_time(char iso[40], time_t timestamp, int offset)
 {
     if (!timestamp) {
         return false;
     }
     // Use an explicit offset to avoid racing global TZ updates.
-    time_t local = timestamp + offset;
+    time_t    local = timestamp + offset;
     struct tm tm;
-    char date[24];
+    char      date[24];
     if (!gmtime_r(&local, &tm) || !strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &tm)) {
         return false;
     }
@@ -166,26 +174,28 @@ static bool format_local_time(char iso[40], time_t timestamp, int offset)
     return true;
 }
 
-static bool add_timestamp(cJSON *json, const char *key, time_t timestamp, int offset)
+static bool
+add_timestamp(cJSON *json, const char *key, time_t timestamp, int offset)
 {
     char iso[40];
     return format_local_time(iso, timestamp, offset) ? cJSON_AddStringToObject(json, key, iso) != NULL
                                                      : cJSON_AddNullToObject(json, key) != NULL;
 }
 
-static esp_err_t get_time(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
+static esp_err_t
+get_time(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
     (void)properties;
     struct device_snapshot copy = snapshot();
-    time_t now = net_synchronized_time();
-    int offset = copy.weather.utc_offset;
-    bool tz_known = timezone_known(&copy.weather);
-    char iso[40];
-    bool synchronized = tz_known && format_local_time(iso, now, offset);
-    cJSON *json = cJSON_CreateObject();
-    bool ok = json && cJSON_AddBoolToObject(json, "synchronized", synchronized)
-              && cJSON_AddStringToObject(json, "source", "device_clock_sntp")
-              && cJSON_AddBoolToObject(json, "timezone_known", tz_known);
+    time_t                 now = net_synchronized_time();
+    int                    offset = copy.weather.utc_offset;
+    bool                   tz_known = timezone_known(&copy.weather);
+    char                   iso[40];
+    bool                   synchronized = tz_known && format_local_time(iso, now, offset);
+    cJSON                 *json = cJSON_CreateObject();
+    bool                   ok = json && cJSON_AddBoolToObject(json, "synchronized", synchronized)
+                                && cJSON_AddStringToObject(json, "source", "device_clock_sntp")
+                                && cJSON_AddBoolToObject(json, "timezone_known", tz_known);
     if (ok && synchronized) {
         ok = cJSON_AddStringToObject(json, "local_time", iso) && cJSON_AddNumberToObject(json, "unix_time", (double)now)
              && cJSON_AddNumberToObject(json, "utc_offset_seconds", offset);
@@ -196,31 +206,33 @@ static esp_err_t get_time(const esp_mcp_property_list_t *properties, esp_mcp_too
     return send_json(result, json, ok);
 }
 
-static double round2(double value)
+static double
+round2(double value)
 {
-    // Strip 32-bit float -> double promotion noise (e.g. 11.7f -> 11.699999809265137)
-    // so MCP tool JSON stays compact for LLM prefill.
+    // Strip 32-bit float -> double promotion noise (e.g. 11.7f
+    // -> 11.699999809265137) so MCP tool JSON stays compact for LLM prefill.
     return round(value * 100.0) / 100.0;
 }
 
-static esp_err_t get_sensor(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
+static esp_err_t
+get_sensor(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
     (void)properties;
     struct device_snapshot copy = snapshot();
-    sensor_reading_t sensor = copy.sensor.reading;
-    int64_t now_us = esp_timer_get_time();
+    sensor_reading_t       sensor = copy.sensor.reading;
+    int64_t                now_us = esp_timer_get_time();
     bool available = sensor.valid && isfinite(sensor.temperature_c) && isfinite(sensor.humidity_percent)
                      && sensor.humidity_percent >= 0 && sensor.humidity_percent <= 100;
     bool pressure_ok =
         available && isfinite(sensor.pressure_hpa) && sensor.pressure_hpa >= 300 && sensor.pressure_hpa <= 1100;
     cJSON *json = cJSON_CreateObject();
-    bool ok = json && cJSON_AddBoolToObject(json, "available", available)
-              && cJSON_AddStringToObject(json, "source", "local_sensor")
-              && cJSON_AddStringToObject(json, "sensor_model", copy.sensor_model[0] ? copy.sensor_model : "unknown");
+    bool   ok = json && cJSON_AddBoolToObject(json, "available", available)
+                && cJSON_AddStringToObject(json, "source", "local_sensor")
+                && cJSON_AddStringToObject(json, "sensor_model", copy.sensor_model[0] ? copy.sensor_model : "unknown");
     if (ok && available) {
-        int offset = timezone_known(&copy.weather) ? copy.weather.utc_offset : 0;
+        int     offset = timezone_known(&copy.weather) ? copy.weather.utc_offset : 0;
         int64_t elapsed_us = now_us - copy.sensor.sampled_uptime_us;
-        double age = elapsed_us > 0 ? (double)elapsed_us / 1000000.0 : 0;
+        double  age = elapsed_us > 0 ? (double)elapsed_us / 1000000.0 : 0;
         ok = cJSON_AddNumberToObject(json, "temperature_c", round2(sensor.temperature_c))
              && cJSON_AddNumberToObject(json, "humidity_percent", round2(sensor.humidity_percent))
              && (pressure_ok ? cJSON_AddNumberToObject(json, "pressure_hpa", round2(sensor.pressure_hpa))
@@ -239,9 +251,9 @@ static esp_err_t get_sensor(const esp_mcp_property_list_t *properties, esp_mcp_t
                 }
             }
             if (ref && now_us - ref->uptime_us >= PRESSURE_MIN_SPAN_US) {
-                double delta = round2((double)sensor.pressure_hpa - (double)ref->pressure_hpa);
+                double      delta = round2((double)sensor.pressure_hpa - (double)ref->pressure_hpa);
                 const char *trend = delta >= 1.0 ? "rising" : (delta <= -1.0 ? "falling" : "steady");
-                int window_min = (int)((now_us - ref->uptime_us) / 60000000LL);
+                int         window_min = (int)((now_us - ref->uptime_us) / 60000000LL);
                 ok = cJSON_AddNumberToObject(json, "pressure_delta_hpa", delta)
                      && cJSON_AddStringToObject(json, "pressure_trend", trend)
                      && cJSON_AddNumberToObject(json, "pressure_trend_window_minutes", window_min);
@@ -255,7 +267,8 @@ static esp_err_t get_sensor(const esp_mcp_property_list_t *properties, esp_mcp_t
     return send_json(result, json, ok);
 }
 
-static cJSON *day_json(const weather_day_t *day)
+static cJSON *
+day_json(const weather_day_t *day)
 {
     cJSON *json = cJSON_CreateObject();
     if (!json || !cJSON_AddStringToObject(json, "date", day->date)
@@ -273,7 +286,8 @@ static cJSON *day_json(const weather_day_t *day)
     return json;
 }
 
-static cJSON *hour_json(const weather_hour_t *hour)
+static cJSON *
+hour_json(const weather_hour_t *hour)
 {
     cJSON *json = cJSON_CreateObject();
     if (!json || !cJSON_AddNumberToObject(json, "hour", hour->hour)
@@ -295,19 +309,20 @@ static cJSON *hour_json(const weather_hour_t *hour)
     return json;
 }
 
-static esp_err_t get_forecast(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
+static esp_err_t
+get_forecast(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
     (void)properties;
     struct device_snapshot copy = snapshot();
-    int64_t uptime = esp_timer_get_time();
-    int64_t elapsed_us = uptime - copy.stamp.fetched_uptime_us;
-    double age = elapsed_us > 0 ? (double)elapsed_us / 1000000.0 : 0;
-    bool fetched_at_known = copy.stamp.fetched_at != 0;
-    bool stale = forecast_is_stale(copy.stamp, uptime);
-    cJSON *json = cJSON_CreateObject();
-    bool ok = json && cJSON_AddBoolToObject(json, "available", copy.weather.ok)
-              && cJSON_AddStringToObject(json, "source", "Open-Meteo_cached_forecast")
-              && cJSON_AddBoolToObject(json, "retrying", copy.stamp.retrying);
+    int64_t                uptime = esp_timer_get_time();
+    int64_t                elapsed_us = uptime - copy.stamp.fetched_uptime_us;
+    double                 age = elapsed_us > 0 ? (double)elapsed_us / 1000000.0 : 0;
+    bool                   fetched_at_known = copy.stamp.fetched_at != 0;
+    bool                   stale = forecast_is_stale(copy.stamp, uptime);
+    cJSON                 *json = cJSON_CreateObject();
+    bool                   ok = json && cJSON_AddBoolToObject(json, "available", copy.weather.ok)
+                                && cJSON_AddStringToObject(json, "source", "Open-Meteo_cached_forecast")
+                                && cJSON_AddBoolToObject(json, "retrying", copy.stamp.retrying);
     if (!copy.weather.ok) {
         ok = ok && cJSON_AddStringToObject(json, "reason", "forecast_not_available");
         return send_json(result, json, ok);
@@ -355,16 +370,17 @@ static esp_err_t get_forecast(const esp_mcp_property_list_t *properties, esp_mcp
     return send_json(result, json, ok);
 }
 
-static esp_err_t get_device_status(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
+static esp_err_t
+get_device_status(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
     (void)properties;
-    int volume;
+    int       volume;
     esp_err_t err = audio_get_volume(&volume);
     if (err != ESP_OK) {
         return err;
     }
     struct device_snapshot copy = snapshot();
-    net_status_t net = {0};
+    net_status_t           net = {0};
     net_get_status(&net);
     double uptime_s = (double)esp_timer_get_time() / 1000000.0;
     if (uptime_s < 0) {
@@ -387,41 +403,50 @@ static esp_err_t get_device_status(const esp_mcp_property_list_t *properties, es
     return send_json(result, json, ok);
 }
 
-static esp_err_t set_volume(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
+static esp_err_t
+set_volume(const esp_mcp_property_list_t *properties, esp_mcp_tool_result_t *result)
 {
-    int volume = esp_mcp_property_list_get_property_int(properties, "volume");
+    int       volume = esp_mcp_property_list_get_property_int(properties, "volume");
     esp_err_t err = audio_set_volume(volume);
     if (err != ESP_OK) {
         return err;
     }
     cJSON *json = cJSON_CreateObject();
-    bool ok = json && cJSON_AddNumberToObject(json, "volume", volume) && cJSON_AddBoolToObject(json, "saved", true)
-              && add_timestamp(json, "applied_at", net_synchronized_time(), 0);
+    bool   ok = json && cJSON_AddNumberToObject(json, "volume", volume) && cJSON_AddBoolToObject(json, "saved", true)
+                && add_timestamp(json, "applied_at", net_synchronized_time(), 0);
     return send_json(result, json, ok);
 }
 
 static const struct device_tool_spec device_tools[] = {
     {"self.get_current_time", "Read device local time; synchronized=false means time is unavailable.", get_time, false},
     {"self.get_weather_forecast",
-     "Read cached five-day/21-hour forecast (auto-refreshed every 1800s / 30min) plus current conditions, UV index, "
-     "and sunrise/sunset; no network. age: monotonic seconds; weather_code: WMO, unmapped=unknown. "
-     "precip_probability: forecast percent, not observed rain. Hours: API order at fetch, each with local date "
-     "(YYYY-MM-DD) and hour. A repeated local hour may appear twice near a clock change.",
+     "Read cached five-day/21-hour forecast (auto-refreshed every 1800s / "
+     "30min) plus current conditions, UV index, "
+     "and sunrise/sunset; no network. age: monotonic seconds; weather_code: "
+     "WMO, unmapped=unknown. "
+     "precip_probability: forecast percent, not observed rain. Hours: API "
+     "order at fetch, each with local date "
+     "(YYYY-MM-DD) and hour. A repeated local hour may appear twice near a "
+     "clock change.",
      get_forecast, false},
     {"self.get_sensor_reading",
-     "Read device temperature, humidity, barometric pressure (hPa), sensor_model, sampled_at, sample_age_seconds, "
+     "Read device temperature, humidity, barometric pressure (hPa), "
+     "sensor_model, sampled_at, sample_age_seconds, "
      "and up to 3h pressure trend; available=false means no valid reading.",
      get_sensor, false},
     {"self.get_device_status",
-     "Read speaker volume (0–100), read_at, display_page, uptime_seconds, sensor_model, WiFi SSID/RSSI, and free "
+     "Read speaker volume (0–100), read_at, display_page, uptime_seconds, "
+     "sensor_model, WiFi SSID/RSSI, and free "
      "memory.",
      get_device_status, false},
     {"self.audio_speaker.set_volume",
-     "Set the speaker volume (integer 0–100). Returns volume and saved=true after applying and saving for reboot.",
+     "Set the speaker volume (integer 0–100). Returns volume and saved=true "
+     "after applying and saving for reboot.",
      set_volume, true},
 };
 
-esp_err_t device_mcp_register(esp_mcp_t *mcp)
+esp_err_t
+device_mcp_register(esp_mcp_t *mcp)
 {
     if (!mcp) {
         return ESP_ERR_INVALID_ARG;
@@ -433,12 +458,12 @@ esp_err_t device_mcp_register(esp_mcp_t *mcp)
         if (!tool) {
             return ESP_ERR_NO_MEM;
         }
-        bool volume_arg = spec->volume_arg;
-        esp_err_t err = esp_mcp_tool_set_annotations_json(
-            tool,
-            volume_arg
-                ? "{\"readOnlyHint\":false,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}"
-                : "{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}");
+        bool      volume_arg = spec->volume_arg;
+        esp_err_t err =
+            esp_mcp_tool_set_annotations_json(tool, volume_arg ? "{\"readOnlyHint\":false,\"destructiveHint\":false,"
+                                                                 "\"idempotentHint\":true,\"openWorldHint\":false}"
+                                                               : "{\"readOnlyHint\":true,\"destructiveHint\":false,"
+                                                                 "\"idempotentHint\":true,\"openWorldHint\":false}");
         if (err == ESP_OK && volume_arg) {
             esp_mcp_property_t *property = esp_mcp_property_create_with_range("volume", 0, 100);
             err = property ? esp_mcp_tool_add_property(tool, property) : ESP_ERR_NO_MEM;

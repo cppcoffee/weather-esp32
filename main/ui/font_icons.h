@@ -1,5 +1,6 @@
-// Weather Icons by Erik Flowers, Lukas Bischoff (v1 Art); 1bpp subsets, SIL OFL 1.1.
-// Source and complete license: third_party/weather-icons/{README.md,OFL.txt}.
+// Weather Icons by Erik Flowers, Lukas Bischoff (v1 Art); 1bpp subsets, SIL
+// OFL 1.1. Source and complete license:
+// third_party/weather-icons/{README.md,OFL.txt}.
 #ifndef __FONT_ICONS_H__
 #define __FONT_ICONS_H__
 

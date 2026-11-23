@@ -11,12 +11,13 @@ ESP32-S3 + 2.9" 墨水屏（SSD1680，296×128）天气与 AI 语音面板（ESP
 | 模块 | 接线（GPIO） |
 |---|---|
 | 墨水屏（SSD1680） | `SCK=38` `SDA(MOSI)=39` `RST=40` `DC=41` `CS1=42` `BUSY=21` `VCC=3V3` |
-| 音频（ES8311 + NS415B） | `PA_EN=15` `DOUT=16` `WS=17` `DIN=18` `BCLK=9` `MCLK=10` `SCL=11` `SDA=12` |
-| 传感器（AHT20+BMP280，可选） | `SDA=5` `SCL=6` `VCC=3V3`（固定地址 `AHT20=0x38`、`BMP280=0x77`，改地址见 `main/sensor.h`） |
-| 按键 | `GPIO4` 接微动开关到 `GND`（内部上拉） |
+| 音频（ES8311 + NS4150B，可选加 ES7210 AEC） | `PA_EN=15` `DOUT=16` `WS=17` `DIN=18` `BCLK=9` `MCLK=10` `SCL=11` `SDA=12` |
+| 传感器（AHT20+BMP280，可选） | `SDA=6` `SCL=7` `VCC=3V3`（固定地址 `AHT20=0x38`、`BMP280=0x77`，改地址见 `main/sensor.h`） |
+| 按键 | `GPIO4`（切页 / 长按 5 秒重置配网）、`GPIO5`（语音唤醒 / 关闭对话），均接微动开关到 `GND`（内部上拉） |
+| 唤醒指示灯（绿色 LED） | `GPIO47`（高电平点亮，串联限流电阻接 `GND`；唤醒亮、退出灭） |
 
 - 避开预留引脚：`GPIO33–37`（Octal PSRAM）、`GPIO19/20`（USB-JTAG）、`GPIO43/44`（外接 UART 日志）。
-- 如需调整引脚，修改 `main/epd.h`、`main/audio.h`、`main/sensor.h`、`main/button.h` 顶部 `#define`。
+- 如需调整引脚或切换硬件 AEC，修改 `main/ui/epd.h`、`main/voice/audio.h`（`AUDIO_USE_ES7210_AEC` 置 `1` 启用 ES7210 硬件回采 AEC + 全双工 `realtime` 直接说话打断，ES7210 复用上述 I2C/MCLK/BCLK/WS 并接 `DIN`，`MIC1` 接麦克风、`MIC3` 接功放输出分压回采）、`main/voice/voice.h`（`VOICE_LED_GPIO`）、`main/sensor.h`、`main/button.h` 顶部 `#define`。
 
 ## 编译与部署
 
@@ -43,7 +44,7 @@ idf.py -p <串口> monitor    # 需交互式终端；也可接 USB-TTL 到 GPIO4
 
 ## 日常使用
 
-- **按键**：短按切换「5 天预报 / 未来 10 小时」；长按 5 秒重新配网。
+- **按键**：`GPIO4` 短按切换「5 天预报 / 未来 10 小时」、长按 5 秒重新配网；`GPIO5` 短按直接唤醒或关闭语音对话。
 - **语音问答**：说 **“小鹿小鹿”** 唤醒；播完后约 6 秒内可直接追问，播放中再说唤醒词可打断；说“退下 / 再见 / 拜拜”或静默超时后结束会话并回到待机。
 - **自动更新**：联网后按 IP 定位拉取天气（每 30 分钟）并 SNTP 校时；本地传感器每 10 分钟采样一次（未接入时显示 `--`）。语音助手支持查询时间、天气、本地温湿度气压、设备状态及调音量。
 

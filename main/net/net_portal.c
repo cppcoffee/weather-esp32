@@ -12,9 +12,10 @@
 #include "lwip/ip4_addr.h"
 
 static const char *log_tag = "net";
-static char portal_ssid[24];
+static char        portal_ssid[24];
 
-const char *net_ap_ssid(void)
+const char *
+net_ap_ssid(void)
 {
     // 后缀取 MAC 后三字节：手上几块板子同时上电时热点名字不会撞。
     // 开放热点（无密码）：手机连上会提示「不安全」，但免去输密码。
@@ -26,11 +27,13 @@ const char *net_ap_ssid(void)
     return portal_ssid;
 }
 
-void net_portal(void)
+void
+net_portal(void)
 {
-    // Stop the previous station before starting the independent APSTA scan path.
+    // Stop the previous station before starting the independent APSTA scan
+    // path.
     ESP_ERROR_CHECK(esp_wifi_stop());
-    const char *name = net_ap_ssid();
+    const char   *name = net_ap_ssid();
     wifi_config_t ap = {.ap = {
                             .channel = 1,
                             .max_connection = 2,
@@ -38,13 +41,14 @@ void net_portal(void)
                         }};
     snprintf((char *)ap.ap.ssid, sizeof(ap.ap.ssid), "%s", name);
     ap.ap.ssid_len = strlen(name);
-    // Re-provisioning re-enters this function in the same boot; WIFI_AP_DEF may only be
-    // created once, and esp_netif_new() asserts on a duplicate key.
+    // Re-provisioning re-enters this function in the same boot; WIFI_AP_DEF may
+    // only be created once, and esp_netif_new() asserts on a duplicate key.
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (ap_netif == NULL) {
         ap_netif = esp_netif_create_default_wifi_ap();
     }
-    // Static AP address: 192.168.1.1/24 with the DHCP server handing out 192.168.1.x.
+    // Static AP address: 192.168.1.1/24 with the DHCP server handing out
+    // 192.168.1.x.
     esp_netif_ip_info_t ip = {0};
     IP4_ADDR(&ip.ip, 192, 168, 1, 1);
     IP4_ADDR(&ip.gw, 192, 168, 1, 1);
